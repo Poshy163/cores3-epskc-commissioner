@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Standalone Thread 1.4 ePSKc commissioner for the M5Stack CoreS3.
  *
  * Console commands:
@@ -292,7 +292,7 @@ static int cmd_camtest(int argc, char **argv)
     }
     printf("camera started: %dx%d\n", qrscan_width(), qrscan_height());
     printf("heap integrity after start: %s\n",
-           heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
 
     char payload[256];
     int decoded = 0, frames = 0;
@@ -314,11 +314,11 @@ static int cmd_camtest(int argc, char **argv)
     }
     printf("frames=%d decoded=%d\n", frames, decoded);
     printf("heap integrity after loop : %s\n",
-           heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
     qrscan_dump_ascii();
     qrscan_stop();
     printf("heap integrity after stop : %s\n",
-           heap_caps_check_integrity_all(true) ? "OK" : "CORRUPT");
+           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
     printf(">>> camera OK <<<\n");
     return 0;
 }
