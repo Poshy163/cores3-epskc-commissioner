@@ -1,0 +1,99 @@
+CONFIG_IDF_TARGET="esp32s3"
+
+# CoreS3: 16 MB flash, native USB-Serial-JTAG console.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# PSRAM on this board is QUAD, not octal. Declaring it octal panics at boot with
+# "PSRAM chip is not connected, or wrong PSRAM line mode". Probed and confirmed:
+# 8 MB found, memory test OK, ~8.38 MB usable.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Push Wi-Fi/lwIP buffers into PSRAM. Without this they compete with the
+# OpenThread stack for internal RAM and UDP sends start failing with
+# MBEDTLS_ERR_NET_SEND_FAILED (-0x004E) long before any crypto runs.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# Camera + quirc + LVGL + mbedTLS outgrew the 1.5 MB default app partition.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# EC-JPAKE is the whole point: off by default, and DTLS needs turning on too.
+CONFIG_MBEDTLS_ECJPAKE_C=y
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
+CONFIG_MBEDTLS_CCM_C=y
+CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
+
+# Roomier stacks/buffers than the defaults; DTLS handshakes are stack-hungry.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+CONFIG_LWIP_IPV6=y
+
+# OpenThread host stack driving the on-board ESP32-H2 over spinel/UART, so the
+# device can actually attach to the network whose credentials it retrieved.
+# MTD rather than FTD: it only needs to join as a child, and FTD costs more RAM
+# than this board has spare.
+CONFIG_OPENTHREAD_ENABLED=y
+# FTD, not MTD: the spinel/RCP callbacks IDF's radio port calls
+# (SetCompatibilityErrorCallback, SetCoprocessorResetFailureCallback) are only
+# declared under the FTD/spinel config headers, so MTD fails to compile against
+# a radio co-processor. A host driving an RCP is a full Thread device anyway.
+CONFIG_OPENTHREAD_FTD=y
+CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+# 1024 buffers is a 128 KB pool -- far more than a joining end device needs,
+# and this board has no internal RAM to spare for it.
+CONFIG_OPENTHREAD_NUM_MESSAGE_BUFFERS=128
+CONFIG_OPENTHREAD_CLI=n
+CONFIG_OPENTHREAD_DIAG=n
+# Quieten the stack: at INFO it logs every MLE advertisement on the mesh, which
+# buries everything else in the serial output.
+CONFIG_OPENTHREAD_LOG_LEVEL_DYNAMIC=n
+CONFIG_OPENTHREAD_LOG_LEVEL_NOTE=y
+CONFIG_MBEDTLS_HKDF_C=y
+CONFIG_VFS_SUPPORT_SELECT=y
+
+# Border Router. This is what publishes _meshcop._udp over Wi-Fi and makes the
+# device appear alongside the other border routers in Home Assistant, rather
+# than joining as an invisible child. Settings mirror M5Stack's own BR config.
+CONFIG_OPENTHREAD_BORDER_ROUTER=y
+CONFIG_MDNS_MULTIPLE_INSTANCE=y
+CONFIG_LWIP_IPV6_FORWARD=y
+CONFIG_LWIP_IPV6_NUM_ADDRESSES=12
+CONFIG_LWIP_MULTICAST_PING=y
+CONFIG_LWIP_NETIF_STATUS_CALLBACK=y
+CONFIG_LWIP_HOOK_IP6_ROUTE_DEFAULT=y
+CONFIG_LWIP_HOOK_ND6_GET_GW_DEFAULT=y
+CONFIG_LWIP_HOOK_IP6_INPUT_CUSTOM=y
+CONFIG_LWIP_IPV6_AUTOCONFIG=y
+CONFIG_LWIP_HOOK_IP6_SELECT_SRC_ADDR_CUSTOM=y
+CONFIG_LWIP_FORCE_ROUTER_FORWARDING=y
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+# Heavy work is deferred off `sys_evt` to its own task rather than relying on
+# this figure -- an event handler is the wrong place for stack-hungry init.
+
+# LVGL fonts used by the status screen.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+
+# Camera. CONFIG_CAMERA_GC0308 defaults to 'n', so without this the DVP
+# interface comes up with no sensor behind it and /dev/video0 never appears --
+# which is what "Camera unavailable" was.
+# Grayscale 320x240 is chosen deliberately: quirc wants 8-bit luma, so this
+# avoids a colour conversion per frame entirely.
+# The DVP controller wants a single contiguous DMA buffer, and DMA can only come
+# from internal RAM. With the Thread stack resident the largest free DMA block is
+# ~10 KB, so the 32 KB default fails with "no mem for CAM DVP DMA receive buffer"
+# even though ~24 KB is free in total. 8 KB fits and is ample for QVGA grey.
+CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE=8192
+
+CONFIG_CAMERA_GC0308=y
+CONFIG_CAMERA_GC0308_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
+CONFIG_CAMERA_GC0308_DVP_GRAY_320X240_20FPS=y
+CONFIG_CAMERA_GC0308_DVP_DEFAULT_FMT_GRAY_320X240_20FPS=y
+CONFIG_LV_FONT_MONTSERRAT_16=y

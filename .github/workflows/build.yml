@@ -1,0 +1,41 @@
+# Rebuilds the firmware on every push and commits the merged Launchpad binary
+# back to firmware/, so the ESP Launchpad link always serves the latest build.
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "firmware/**"
+      - "README.md"
+      - "launchpad.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build with ESP-IDF
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.4
+          target: esp32s3
+          command: |
+            idf.py build
+            mkdir -p firmware
+            cd build
+            python -m esptool --chip esp32s3 merge_bin -o ../firmware/cores3-epskc-commissioner.bin @flash_args
+
+      - name: Commit merged binary
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add firmware/cores3-epskc-commissioner.bin
+          git diff --cached --quiet && exit 0
+          git commit -m "ci: rebuild Launchpad firmware binary"
+          git push

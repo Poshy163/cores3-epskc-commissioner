@@ -1,0 +1,19 @@
+menu "ePSKc Commissioner"
+
+    config EPSKC_WIFI_SSID
+        string "Wi-Fi SSID (compile-time default)"
+        default ""
+        help
+            Applied only when no Wi-Fi credentials are stored on the device
+            yet, so a unit provisioned over the console keeps its runtime
+            credentials across reflashes. Leave empty to provision with the
+            `wifi <ssid> <password>` console command instead.
+
+    config EPSKC_WIFI_PASSWORD
+        string "Wi-Fi password (compile-time default)"
+        default ""
+        help
+            Password for EPSKC_WIFI_SSID. Stored in the firmware image in
+            plain text - do not use on images you distribute.
+
+endmenu
