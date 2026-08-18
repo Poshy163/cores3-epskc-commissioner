@@ -3,3 +3,4 @@ managed_components/
 sdkconfig
 sdkconfig.old
 firmware-merged.bin
+sdkconfig.debug
