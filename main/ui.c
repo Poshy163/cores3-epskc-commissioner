@@ -17,6 +17,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "lvgl.h"
@@ -47,7 +48,12 @@ static const char *TAG = "ui";
 #define COL_OK      0x4ECBB8
 #define COL_ERROR   0xF0798F
 
-typedef enum { JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN } job_t;
+typedef enum {
+    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_CAMTEST
+} job_t;
+
+/* Signals the console task that the worker has finished the camera selftest. */
+static SemaphoreHandle_t s_camtest_done;
 
 static lv_obj_t *panel_main, *panel_list, *panel_keypad, *panel_result, *panel_qr;
 static lv_obj_t *panel_wifi, *panel_wpass;
@@ -156,11 +162,17 @@ static void refresh_network_label(void)
     if (!lbl_network) {
         return;
     }
-    char buf[96];
+    char buf[128];
     if (s_have_net) {
         const char *role = thread_role();
-        snprintf(buf, sizeof(buf), "%s  ch %d  pan 0x%04x\nthread: %s",
-                 s_net_name, s_net_channel, s_net_panid, role);
+        /* Parent link strength, when there is a parent to measure. */
+        char sig[20] = "";
+        int8_t rssi;
+        if (thread_link_rssi(&rssi)) {
+            snprintf(sig, sizeof(sig), "  %d dBm", rssi);
+        }
+        snprintf(buf, sizeof(buf), "%s  ch %d  pan 0x%04x\nthread: %s%s",
+                 s_net_name, s_net_channel, s_net_panid, role, sig);
         lv_obj_set_style_text_color(
             lbl_network,
             lv_color_hex(thread_attached() ? COL_OK : COL_ACCENT), LV_PART_MAIN);
@@ -577,6 +589,9 @@ static void worker(void *arg)
         }
         if (job == JOB_QR) {
             run_qr_job();
+        } else if (job == JOB_CAMTEST) {
+            qrscan_selftest();
+            xSemaphoreGive(s_camtest_done);
         } else if (job == JOB_WIFI_SCAN) {
             s_aps_n = app_wifi_scan(s_aps, sizeof(s_aps) / sizeof(s_aps[0]));
             finish_wifi_scan();
@@ -932,3 +947,23 @@ void ui_show_dataset(const char *net_name, int channel, uint16_t panid)
 }
 
 void ui_clear_dataset(void) { }
+
+bool ui_run_camtest(void)
+{
+    if (!s_ready || s_jobs == NULL) {
+        return false;
+    }
+    if (s_camtest_done == NULL) {
+        s_camtest_done = xSemaphoreCreateBinary();
+        if (s_camtest_done == NULL) {
+            return false;
+        }
+    }
+    job_t j = JOB_CAMTEST;
+    if (xQueueSend(s_jobs, &j, 0) != pdTRUE) {
+        return false;
+    }
+    /* The selftest captures 40 frames with a decode attempt on each, so it can
+     * legitimately take tens of seconds. */
+    return xSemaphoreTake(s_camtest_done, pdMS_TO_TICKS(120000)) == pdTRUE;
+}

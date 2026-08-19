@@ -39,7 +39,7 @@ Two ways to get the device online:
 | `wifi <ssid> <pass>` | connect and persist |
 | `status` | Wi-Fi and IP state |
 | `join <ip> <port> <code>` | run the ePSKc exchange from the console |
-| `thread` | role and stored credentials |
+| `thread` | role, stored credentials, parent signal strength |
 | `forget` | erase Thread credentials |
 | `batt` | battery %, voltage, charge state |
 | `name <hostname>` | set the mDNS name other tools see |

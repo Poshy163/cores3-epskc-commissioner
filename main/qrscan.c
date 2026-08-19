@@ -11,10 +11,14 @@
 #include "qrscan.h"
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_cam_sensor.h"
@@ -127,6 +131,40 @@ static void qrscan_teardown(void)
     }
     memset(s_buf, 0, sizeof(s_buf));
     s_running = false;
+}
+
+void qrscan_selftest(void)
+{
+    if (qrscan_start() != ESP_OK) {
+        printf(">>> camera FAILED to start (see errors above) <<<\n");
+        return;
+    }
+    printf("camera started: %dx%d\n", qrscan_width(), qrscan_height());
+
+    char payload[256];
+    int decoded = 0, frames = 0;
+    for (int i = 0; i < 40; i++) {
+        frames++;
+        if (qrscan_poll(payload, sizeof(payload), NULL)) {
+            printf("decoded: %s\n", payload);
+            decoded = 1;
+            break;
+        }
+        if ((i % 10) == 9) {
+            uint8_t mn, mx, mean;
+            int cand;
+            qrscan_last_frame_stats(&mn, &mx, &mean, &cand);
+            printf("  frame %2d: luma min=%3u max=%3u mean=%3u  qr_candidates=%d\n",
+                   frames, mn, mx, mean, cand);
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));   /* let other tasks breathe */
+    }
+    printf("frames=%d decoded=%d\n", frames, decoded);
+    qrscan_dump_ascii();
+    qrscan_stop();
+    printf("selftest stack headroom: %u bytes\n",
+           (unsigned) uxTaskGetStackHighWaterMark(NULL));
+    printf(">>> camera OK <<<\n");
 }
 
 esp_err_t qrscan_start(void)

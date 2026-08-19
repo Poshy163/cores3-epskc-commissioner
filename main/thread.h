@@ -40,3 +40,10 @@ const char *thread_role(void);
 
 /* True once attached as child, router or leader. */
 bool thread_attached(void);
+
+/*
+ * Average RSSI in dBm of the radio link to the parent. False when there is no
+ * parent to measure: a router or leader has none, and OpenThread reports
+ * INVALID_STATE for those roles.
+ */
+bool thread_link_rssi(int8_t *rssi);

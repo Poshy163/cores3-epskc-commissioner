@@ -297,3 +297,17 @@ bool thread_attached(void)
     const char *r = thread_role();
     return strcmp(r, "child") == 0 || strcmp(r, "router") == 0 || strcmp(r, "leader") == 0;
 }
+
+bool thread_link_rssi(int8_t *rssi)
+{
+    if (!s_ready) {
+        return false;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otThreadGetParentAverageRssi(esp_openthread_get_instance(), rssi);
+    esp_openthread_lock_release();
+
+    /* 127 is OpenThread's "no measurement yet" sentinel, which shows up in the
+     * window between attaching and the first parent frame. */
+    return err == OT_ERROR_NONE && *rssi != 127;
+}

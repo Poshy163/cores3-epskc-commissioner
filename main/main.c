@@ -20,6 +20,7 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
@@ -243,6 +244,10 @@ static int cmd_thread(int argc, char **argv)
     (void) argc; (void) argv;
     printf("role       : %s\n", thread_role());
     printf("credentials: %s\n", thread_has_dataset() ? "stored" : "none");
+    int8_t rssi;
+    if (thread_link_rssi(&rssi)) {
+        printf("parent rssi: %d dBm\n", rssi);
+    }
     return 0;
 }
 
@@ -261,17 +266,17 @@ static int cmd_forget(int argc, char **argv)
 static int cmd_camtest(int argc, char **argv)
 {
     (void) argc; (void) argv;
-    printf("internal heap free : %u\n",
-           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    printf("internal heap free : %u (largest block %u)\n",
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     printf("DMA-capable free   : %u (largest block %u)\n",
            (unsigned) heap_caps_get_free_size(MALLOC_CAP_DMA),
            (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     printf("PSRAM free         : %u\n",
            (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
-    /* The UI's QR job may own the camera right now. Polling or stopping it
-     * from here as well crashes the board (use-after-free in the decoder),
-     * so fall back to reporting the UI scan's stats without touching it. */
+    /* The UI's QR job may own the camera. Driving it from here as well tears
+     * the decoder down under an in-flight poll, so report its stats instead. */
     if (qrscan_active()) {
         printf("UI scan in progress - observing, not driving\n");
         for (int i = 0; i < 10; i++) {
@@ -282,44 +287,18 @@ static int cmd_camtest(int argc, char **argv)
                    mn, mx, mean, cand);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        qrscan_dump_ascii();
         return 0;
     }
 
-    if (qrscan_start() != ESP_OK) {
-        printf(">>> camera FAILED to start (see errors above) <<<\n");
+    /*
+     * Run it on the UI worker, which already has the stack quirc needs. A
+     * dedicated task is not an option: internal RAM is exhausted enough that
+     * the largest free block is ~11 KB, well under what the decoder wants.
+     */
+    if (!ui_run_camtest()) {
+        printf("camtest unavailable (UI worker not running)\n");
         return 1;
     }
-    printf("camera started: %dx%d\n", qrscan_width(), qrscan_height());
-    printf("heap integrity after start: %s\n",
-           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
-
-    char payload[256];
-    int decoded = 0, frames = 0;
-    for (int i = 0; i < 40; i++) {
-        frames++;
-        if (qrscan_poll(payload, sizeof(payload), NULL)) {
-            printf("decoded: %s\n", payload);
-            decoded = 1;
-            break;
-        }
-        if ((i % 10) == 9) {
-            uint8_t mn, mx, mean;
-            int cand;
-            qrscan_last_frame_stats(&mn, &mx, &mean, &cand);
-            printf("  frame %2d: luma min=%3u max=%3u mean=%3u  qr_candidates=%d\n",
-                   frames, mn, mx, mean, cand);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));   /* let other tasks breathe */
-    }
-    printf("frames=%d decoded=%d\n", frames, decoded);
-    printf("heap integrity after loop : %s\n",
-           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
-    qrscan_dump_ascii();
-    qrscan_stop();
-    printf("heap integrity after stop : %s\n",
-           heap_caps_check_integrity(MALLOC_CAP_INTERNAL, true) ? "OK" : "CORRUPT");
-    printf(">>> camera OK <<<\n");
     return 0;
 }
 
