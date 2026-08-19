@@ -1,24 +1,24 @@
 # Building in CLion
 
-This repo builds in Docker, so `build/compile_commands.json` points at paths
-inside the container (`/project`, `/opt/esp/idf`). Those don't exist on
-Windows, so no ESP-IDF header resolves and CLion reports "this file does not
-belong to any project" for everything under `main/`.
-
-The real cause is `CMakeLists.txt`:
+`CMakeLists.txt` starts with:
 
 ```cmake
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 ```
 
-With `IDF_PATH` unset that reads `include(/tools/cmake/project.cmake)`, CMake
-aborts before defining a target, and nothing gets indexed. A local ESP-IDF is
-the fix.
+Without `IDF_PATH` that reads `include(/tools/cmake/project.cmake)`, CMake
+aborts before defining a target, and CLion reports "this file does not belong
+to any project" for everything under `main/`. If it configures but you still
+get `Cannot resolve symbol 'uint8_t'`, CLion is configuring with its default
+toolchain instead of the Xtensa one, so none of the target's standard headers
+are on the include path.
+
+Both are fixed by a local ESP-IDF plus the checked-in CMake preset.
 
 ## 1. Install ESP-IDF v5.5.4
 
 Already installed on this machine at `C:\Espressif\frameworks\esp-idf-v5.5.4`,
-with the toolchain under `%USERPROFILE%\.espressif`. To reproduce elsewhere:
+with the tools under `%USERPROFILE%\.espressif`. To reproduce elsewhere:
 
 ```powershell
 git clone -b v5.5.4 --depth 1 --recursive --shallow-submodules `
@@ -33,41 +33,30 @@ with "MSys/Mingw is not supported".
 Match v5.5.4 to the Docker image and CI. A different version compiles but can
 behave differently on hardware.
 
-## 2. Give CLion the ESP-IDF environment
+## 2. Environment
 
-Source the export script, then launch CLion from that same shell so it inherits
-`IDF_PATH` and the Xtensa toolchain:
+`IDF_PATH`, `IDF_PYTHON_ENV_PATH`, `IDF_TOOLS_PATH` and the tool directories are
+already set as persistent user variables, so CLion picks them up wherever it is
+launched from. Nothing to do unless you move the installation.
+
+If you ever need to redo it, source the export script and copy what it sets:
 
 ```powershell
 . C:\Espressif\frameworks\esp-idf-v5.5.4\export.ps1
-& "C:\Program Files\JetBrains\CLion 2026.2.0.1\bin\clion64.exe"
 ```
 
-To skip that each time, add a toolchain under **Settings > Build, Execution,
-Deployment > Toolchains** with:
+Environment changes only reach newly started processes, so restart CLion (fully,
+not just the project) after any change here.
 
-| Field | Value |
-|---|---|
-| Environment script | `C:\Espressif\frameworks\esp-idf-v5.5.4\export.bat` |
-| C compiler | `%USERPROFILE%\.espressif\tools\xtensa-esp-elf\esp-14.2.0_20260121\xtensa-esp-elf\bin\xtensa-esp32s3-elf-gcc.exe` |
-| C++ compiler | the matching `xtensa-esp32s3-elf-g++.exe` |
-| Debugger | `%USERPROFILE%\.espressif\tools\xtensa-esp-elf-gdb\...\xtensa-esp32s3-elf-gdb.exe` |
+## 3. Open the project
 
-## 3. CMake profile
+The repo ships `CMakePresets.json` with an **esp32s3** preset that mirrors what
+`idf.py` configures: Ninja, `build/` as the binary directory, `IDF_TARGET`, and
+ESP-IDF's `toolchain-esp32s3.cmake`. CLion picks presets up automatically.
 
-Under **Settings > Build, Execution, Deployment > CMake**, delete the default
-profile and add one with:
-
-| Field | Value |
-|---|---|
-| Build directory | `build` |
-| CMake options | `-DIDF_TARGET=esp32s3` |
-| Generator | Ninja |
-| Toolchain | the ESP-IDF one |
-
-Keep the build directory as `build`, or `idf.py flash` and CLion disagree about
-where the binaries are. Reload; if it complains, use **Tools > CMake > Reset
-Cache and Reload Project**.
+Open the project, choose the **ESP32-S3 (ESP-IDF)** profile, and let it reload.
+Because the preset points at the same `build/` the CLI uses, CLion and `idf.py`
+share one cache instead of fighting over two.
 
 If a stale `build/` or `cmake-build-debug/` from an earlier attempt is present,
 delete it first. A cache written inside the container records
@@ -75,7 +64,7 @@ delete it first. A cache written inside the container records
 
 ## 4. Build and flash
 
-Build the `app` target, then:
+Build the `app` target, or from a terminal:
 
 ```
 idf.py -p COM5 flash monitor
