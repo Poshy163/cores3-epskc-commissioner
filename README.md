@@ -23,7 +23,13 @@ Flashing replaces M5Stack's stock border-router firmware. To go back, use M5Burn
 Two ways to get the device online:
 
 * On the screen: tap **Wi-Fi**, pick your network from the scan, type the password on the keyboard. Saved to flash, survives reboots and reflashes. **Leave** disconnects and erases the credentials.
-* Over the console: open a 115200 serial terminal (ESP Launchpad has one built in) and run `wifi "My Network" mypassword`.
+* Over the console: open a 115200 serial terminal (ESP Launchpad has one built in) and run:
+
+  ```
+  wifi "My Network" "mypassword"
+  ```
+
+  Quote both arguments. The console splits on whitespace, so an unquoted SSID or password containing a space arrives truncated.
 
 ## Using it
 
