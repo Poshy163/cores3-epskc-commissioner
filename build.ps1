@@ -1,5 +1,5 @@
 # Fast build: sources are copied into a Docker named volume (Linux-native FS)
-# and compiled there with ccache; only the flash artifacts land back in .\build.
+# and compiled there with ccache; only the flash artifacts land back in dist/.
 # A Windows bind mount makes every compile step cross Docker's file-sharing
 # layer, which is what made builds take 10+ minutes.
 #
@@ -20,7 +20,7 @@ docker run --rm -e IDF_CCACHE_ENABLE=1 `
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 if ($Port) {
-    Push-Location "$PSScriptRoot\build"
+    Push-Location "$PSScriptRoot/dist"
     python -m esptool --chip esp32s3 -p $Port -b 460800 --before default_reset --after hard_reset write_flash "@flash_args"
     Pop-Location
 }

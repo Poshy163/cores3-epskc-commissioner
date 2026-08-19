@@ -21,9 +21,9 @@ fi
 
 idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
 
-mkdir -p /host/build/bootloader /host/build/partition_table
-cp build/flash_args /host/build/
-cp build/bootloader/bootloader.bin /host/build/bootloader/
-cp build/partition_table/partition-table.bin /host/build/partition_table/
-cp build/epskc_commissioner.bin /host/build/
-echo "artifacts copied to host build/"
+mkdir -p /host/dist/bootloader /host/dist/partition_table
+cp build/flash_args /host/dist/
+cp build/bootloader/bootloader.bin /host/dist/bootloader/
+cp build/partition_table/partition-table.bin /host/dist/partition_table/
+cp build/epskc_commissioner.bin /host/dist/
+echo "artifacts copied to host dist/"
