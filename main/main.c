@@ -437,8 +437,11 @@ void app_main(void)
     esp_console_dev_usb_serial_jtag_config_t ucfg =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
 
-    ESP_LOGI(TAG, "internal heap free before console: %u",
-             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    /* Largest block, not just total: the REPL stack has to be contiguous, and
+     * this allocation is the first thing to fail when internal RAM tightens. */
+    ESP_LOGI(TAG, "internal heap before console: %u free, largest block %u",
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     /* The console is a convenience; the touch UI is the product. If it cannot
      * start, log it and carry on rather than aborting the boot. */

@@ -896,10 +896,16 @@ esp_err_t ui_init(void)
     show_panel(panel_main);
     bsp_display_unlock();
 
-    /* 24 KB. Task stacks must be internal RAM, so 48 KB was expensive -- and
-     * the same handshake already runs fine on the 12 KB console task, so the
-     * larger figure was never justified. */
-    xTaskCreate(worker, "epskc_worker", 24576, NULL, 5, NULL);
+    /*
+     * 28 KB. Measured: a real ePSKc join peaks at ~23.3 KB of stack, leaving
+     * only 1240 bytes free at 24 KB. Nearly all of that is mbedTLS's EC-JPAKE
+     * bignum arithmetic, not this code -- the CoAP buffers are already static
+     * -- so it cannot be trimmed from our side. Task stacks must come from
+     * internal RAM, which is scarce here, so this buys a ~5 KB margin rather
+     * than a generous one. Do not lower it: an overflow here corrupts silently
+     * and faults minutes later somewhere unrelated.
+     */
+    xTaskCreate(worker, "epskc_worker", 28672, NULL, 5, NULL);
 
     s_ready = true;
     ESP_LOGI(TAG, "display up");
