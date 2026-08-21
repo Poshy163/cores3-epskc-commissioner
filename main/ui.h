@@ -39,5 +39,17 @@ bool ui_run_camtest(void);
  */
 bool ui_defer_br_start(esp_netif_t *backbone);
 
+/*
+ * Run a blocking function on the UI worker and wait for it.
+ *
+ * For callers whose own task has a small stack. The REST handlers are the
+ * motivating case: esp_http_server gives them ~4 KB, and OpenThread calls that
+ * reach the spinel layer need far more, so calling them directly overflowed
+ * the HTTP task and corrupted FreeRTOS' task lists. False if the worker is not
+ * running or the call did not finish inside timeout_ms.
+ */
+typedef void (*ui_worker_fn)(void *arg);
+bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms);
+
 /* Drop the remembered network from the screen and NVS. */
 void ui_forget_network(void);

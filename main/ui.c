@@ -64,8 +64,14 @@ static const char *TAG = "ui";
 
 typedef enum {
     JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_CAMTEST,
-    JOB_FORM, JOB_BR_START, JOB_SHARE
+    JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_CALL
 } job_t;
+
+/* JOB_CALL payload; one at a time, guarded by s_call_busy. */
+static ui_worker_fn s_call_fn;
+static void *s_call_arg;
+static SemaphoreHandle_t s_call_done;
+static volatile bool s_call_busy;
 
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
@@ -881,6 +887,11 @@ static void worker(void *arg)
                                                                : "Could not start ephemeral key");
             }
             bsp_display_unlock();
+        } else if (job == JOB_CALL) {
+            if (s_call_fn) {
+                s_call_fn(s_call_arg);
+            }
+            xSemaphoreGive(s_call_done);
         } else if (job == JOB_BR_START) {
             thread_run_border_router_start(s_br_backbone);
             bsp_display_lock(0);
@@ -1873,6 +1884,33 @@ bool ui_defer_br_start(esp_netif_t *backbone)
     s_br_backbone = backbone;
     job_t j = JOB_BR_START;
     return xQueueSend(s_jobs, &j, 0) == pdTRUE;
+}
+
+bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
+{
+    if (!s_ready || s_jobs == NULL || fn == NULL) {
+        return false;
+    }
+    if (s_call_done == NULL) {
+        s_call_done = xSemaphoreCreateBinary();
+        if (s_call_done == NULL) {
+            return false;
+        }
+    }
+    /* Serialise: the slot below is shared, and the worker runs one job at a
+     * time anyway. */
+    if (s_call_busy) {
+        return false;
+    }
+    s_call_busy = true;
+    s_call_fn = fn;
+    s_call_arg = arg;
+
+    job_t j = JOB_CALL;
+    bool ok = xQueueSend(s_jobs, &j, 0) == pdTRUE &&
+              xSemaphoreTake(s_call_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
+    s_call_busy = false;
+    return ok;
 }
 
 bool ui_run_camtest(void)

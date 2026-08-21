@@ -38,4 +38,11 @@ jobs:
           git add firmware/cores3-epskc-commissioner.bin
           git diff --cached --quiet && exit 0
           git commit -m "ci: rebuild Launchpad firmware binary"
-          git push
+          # The branch can move while this job builds, so rebase and retry
+          # rather than failing the run outright.
+          for i in 1 2 3; do
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
+            echo "push attempt $i failed, retrying"
+            sleep 5
+          done
+          echo "could not push the rebuilt binary"; exit 1

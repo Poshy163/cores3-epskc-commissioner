@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "settings.h"
 #include "thread.h"
+#include "ui.h"
 
 static const char *TAG = "otbr_rest";
 static httpd_handle_t s_server;
@@ -78,12 +79,43 @@ static esp_err_t h_rloc16(httpd_req_t *r)
 }
 
 /*
- * GET  /node/state -- "disabled" | "detached" | "child" | "router" | "leader"
- * POST /node/state -- body "enable" / "disable"
+ * OpenThread calls that reach the spinel layer (enabling the stack, applying a
+ * dataset) need more stack than esp_http_server gives a handler, and blew it
+ * badly enough to corrupt FreeRTOS' lists. They run on the UI worker instead;
+ * these little structs carry the arguments and the result across.
+ */
+struct set_enabled_args {
+    bool on;
+    esp_err_t result;
+};
+
+static void do_set_enabled(void *arg)
+{
+    struct set_enabled_args *a = arg;
+    a->result = thread_set_enabled(a->on);
+}
+
+struct set_dataset_args {
+    const char *hex;
+    esp_err_t result;
+};
+
+static void do_set_dataset(void *arg)
+{
+    struct set_dataset_args *a = arg;
+    a->result = thread_set_dataset_hex(a->hex);
+}
+
+/*
+ * GET      /node/state -- "disabled" | "detached" | "child" | "router" | "leader"
+ * PUT/POST /node/state -- body "enable" / "disable"
+ *
+ * python-otbr-api uses PUT; ot-br-posix has historically accepted POST too, so
+ * both are registered.
  */
 static esp_err_t h_state(httpd_req_t *r)
 {
-    if (r->method == HTTP_POST) {
+    if (r->method == HTTP_PUT || r->method == HTTP_POST) {
         char body[16] = { 0 };
         int n = httpd_req_recv(r, body, sizeof(body) - 1);
         if (n <= 0) {
@@ -91,7 +123,8 @@ static esp_err_t h_state(httpd_req_t *r)
             return httpd_resp_sendstr(r, "\"empty body\"");
         }
         bool on = strstr(body, "enable") != NULL && strstr(body, "disable") == NULL;
-        if (thread_set_enabled(on) != ESP_OK) {
+        struct set_enabled_args a = { .on = on, .result = ESP_FAIL };
+        if (!ui_run_on_worker(do_set_enabled, &a, 20000) || a.result != ESP_OK) {
             httpd_resp_set_status(r, "409 Conflict");
             return httpd_resp_sendstr(r, "\"could not change state\"");
         }
@@ -129,12 +162,21 @@ static esp_err_t h_dataset_active(httpd_req_t *r)
                 *q = '\0';
             }
         }
-        if (thread_set_dataset_hex(p) != ESP_OK) {
+        /* A JSON body means create_active_dataset(), which builds a network
+         * from named fields rather than TLVs. Not supported here; say so
+         * rather than failing on hex parsing. */
+        if (*p == '{') {
+            httpd_resp_set_status(r, "400 Bad Request");
+            return httpd_resp_sendstr(r, "\"send dataset TLVs as hex, not JSON\"");
+        }
+        struct set_dataset_args a = { .hex = p, .result = ESP_FAIL };
+        if (!ui_run_on_worker(do_set_dataset, &a, 30000) || a.result != ESP_OK) {
             httpd_resp_set_status(r, "400 Bad Request");
             return httpd_resp_sendstr(r, "\"expected hex TLVs\"");
         }
-        httpd_resp_set_status(r, "202 Accepted");
-        return httpd_resp_sendstr(r, "\"applied\"");
+        /* 200, not 202: python-otbr-api accepts only 200 or 201 and reports
+         * anything else as "Failed to call OTBR API". */
+        return send_quoted(r, "applied");
     }
 
     static char hex[540];
@@ -157,6 +199,18 @@ static esp_err_t h_dataset_active(httpd_req_t *r)
              "{\"NetworkName\":\"%s\",\"ExtPanId\":\"%s\",\"ActiveTimestamp\":{\"Seconds\":0}}",
              name, pan);
     return send_json(r, json);
+}
+
+/*
+ * DELETE /node is factory_reset(). Wiping credentials from an unauthenticated
+ * HTTP call is not something this device should do, and the client treats 405
+ * specifically as "this router cannot factory reset" rather than an error.
+ */
+static esp_err_t h_node_delete(httpd_req_t *r)
+{
+    httpd_resp_set_status(r, "405 Method Not Allowed");
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, "\"factory reset is not supported over REST\"");
 }
 
 /* Pending dataset is not maintained here; report empty rather than 500. */
@@ -292,7 +346,8 @@ esp_err_t otbr_rest_start(void)
     }
 
     static const httpd_uri_t uris[] = {
-        { .uri = "/node",                 .method = HTTP_GET,  .handler = h_node },
+        { .uri = "/node",                 .method = HTTP_GET,    .handler = h_node },
+        { .uri = "/node",                 .method = HTTP_DELETE, .handler = h_node_delete },
         { .uri = "/node/ba-id",           .method = HTTP_GET,  .handler = h_ba_id },
         { .uri = "/node/ext-address",     .method = HTTP_GET,  .handler = h_ext_address },
         { .uri = "/node/ext-panid",       .method = HTTP_GET,  .handler = h_ext_panid },
@@ -300,6 +355,7 @@ esp_err_t otbr_rest_start(void)
         { .uri = "/node/rloc16",          .method = HTTP_GET,  .handler = h_rloc16 },
         { .uri = "/node/state",           .method = HTTP_GET,  .handler = h_state },
         { .uri = "/node/state",           .method = HTTP_POST, .handler = h_state },
+        { .uri = "/node/state",           .method = HTTP_PUT,  .handler = h_state },
         { .uri = "/node/dataset/active",  .method = HTTP_GET,  .handler = h_dataset_active },
         { .uri = "/node/dataset/active",  .method = HTTP_PUT,  .handler = h_dataset_active },
         { .uri = "/node/dataset/pending", .method = HTTP_GET,  .handler = h_dataset_pending },
