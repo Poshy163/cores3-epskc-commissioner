@@ -13,6 +13,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
@@ -28,6 +29,7 @@
 #include "openthread/dataset.h"
 #include "openthread/dataset_ftd.h"
 #include "openthread/instance.h"
+#include "openthread/link.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
 
@@ -302,7 +304,8 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     return ESP_OK;
 }
 
-esp_err_t thread_form_network(char *name, size_t name_len, int *channel, uint16_t *panid)
+esp_err_t thread_form_network(uint8_t channel, char *name, size_t name_len,
+                              int *channel_out, uint16_t *panid)
 {
     if (!s_ready) {
         return ESP_FAIL;
@@ -319,6 +322,10 @@ esp_err_t thread_form_network(char *name, size_t name_len, int *channel, uint16_
         snprintf(ds.mNetworkName.m8, sizeof(ds.mNetworkName.m8), "CoreS3-%02X%02X",
                  ds.mExtendedPanId.m8[6], ds.mExtendedPanId.m8[7]);
         ds.mComponents.mIsNetworkNamePresent = true;
+        if (channel >= 11 && channel <= 26) {
+            ds.mChannel = channel;
+            ds.mComponents.mIsChannelPresent = true;
+        }
         otDatasetConvertToTlvs(&ds, &tlvs);
     }
     esp_openthread_lock_release();
@@ -330,8 +337,8 @@ esp_err_t thread_form_network(char *name, size_t name_len, int *channel, uint16_
     if (name != NULL) {
         snprintf(name, name_len, "%s", ds.mNetworkName.m8);
     }
-    if (channel != NULL) {
-        *channel = ds.mChannel;
+    if (channel_out != NULL) {
+        *channel_out = ds.mChannel;
     }
     if (panid != NULL) {
         *panid = ds.mPanId;
@@ -422,6 +429,11 @@ static void share_state_cb(void *ctx)
 
 esp_err_t thread_share_start(char *code, size_t cap, uint32_t lifetime_ms)
 {
+    return thread_share_start_on(code, cap, lifetime_ms, 0);
+}
+
+esp_err_t thread_share_start_on(char *code, size_t cap, uint32_t lifetime_ms, uint16_t port)
+{
     if (!s_ready || !s_br_started || cap < 10) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -438,7 +450,7 @@ esp_err_t thread_share_start(char *code, size_t cap, uint32_t lifetime_ms)
     err = otBorderAgentEphemeralKeyGenerateTap(&tap);
     if (err == OT_ERROR_NONE) {
         /* Port 0: let the stack pick, and read it back in the callback. */
-        err = otBorderAgentEphemeralKeyStart(ins, tap.mTap, lifetime_ms, 0);
+        err = otBorderAgentEphemeralKeyStart(ins, tap.mTap, lifetime_ms, port);
     }
     esp_openthread_lock_release();
 
@@ -460,15 +472,22 @@ void thread_share_stop(void)
     esp_openthread_lock_release();
 }
 
-const char *thread_share_state(void)
+/* One read of the stack state; the two callers word it differently. */
+static otBorderAgentEphemeralKeyState epskc_state(void)
 {
     if (!s_ready) {
-        return "off";
+        return OT_BORDER_AGENT_STATE_DISABLED;
     }
     esp_openthread_lock_acquire(portMAX_DELAY);
-    otBorderAgentEphemeralKeyState st = otBorderAgentEphemeralKeyGetState(esp_openthread_get_instance());
+    otBorderAgentEphemeralKeyState st =
+        otBorderAgentEphemeralKeyGetState(esp_openthread_get_instance());
     esp_openthread_lock_release();
-    switch (st) {
+    return st;
+}
+
+const char *thread_share_state(void)
+{
+    switch (epskc_state()) {
     case OT_BORDER_AGENT_STATE_STARTED:   return "waiting";
     case OT_BORDER_AGENT_STATE_CONNECTED: return "connected";
     case OT_BORDER_AGENT_STATE_ACCEPTED:  return "accepted";
@@ -511,4 +530,213 @@ int thread_child_count(void)
     }
     esp_openthread_lock_release();
     return n;
+}
+
+/* ---------------- router preference ---------------- */
+
+static bool s_prefer_router;
+static int64_t s_last_promote_us;
+
+void thread_set_prefer_router(bool on)
+{
+    s_prefer_router = on;
+    if (!s_ready) {
+        return;
+    }
+    /*
+     * Router eligibility stays ON regardless of this setting. Clearing it does
+     * not merely keep us a child: an ineligible device cannot become leader
+     * either, so forming a new network left the device stuck in `detached`
+     * forever, publishing no meshcop record and invisible to Home Assistant.
+     * The preference only decides whether we actively ask to be promoted while
+     * we are a child of someone else's mesh.
+     */
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otThreadSetRouterEligible(esp_openthread_get_instance(), true);
+    esp_openthread_lock_release();
+    if (on) {
+        s_last_promote_us = 0;   /* allow an immediate attempt */
+        thread_apply_router_preference();
+    }
+}
+
+void thread_apply_router_preference(void)
+{
+    if (!s_prefer_router || !s_ready) {
+        return;
+    }
+    /* A promotion request is an Address Solicit to the leader; once every
+     * 30 s is plenty and keeps a refusing leader from being spammed. */
+    int64_t now = esp_timer_get_time();
+    if (now - s_last_promote_us < 30LL * 1000 * 1000) {
+        return;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *ins = esp_openthread_get_instance();
+    if (otThreadGetDeviceRole(ins) == OT_DEVICE_ROLE_CHILD) {
+        s_last_promote_us = now;
+        otError err = otThreadBecomeRouter(ins);
+        ESP_LOGI(TAG, "asked for router role (%d)", err);
+    }
+    esp_openthread_lock_release();
+}
+
+/* ---------------- values for the REST API ---------------- */
+
+static void bytes_to_hex(const uint8_t *b, size_t n, char *out)
+{
+    static const char *H = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) {
+        out[2 * i]     = H[b[i] >> 4];
+        out[2 * i + 1] = H[b[i] & 0x0f];
+    }
+    out[2 * n] = '\0';
+}
+
+bool thread_border_agent_id_hex(char *out, size_t cap)
+{
+    if (!s_ready || cap < OT_BORDER_AGENT_ID_LENGTH * 2 + 1) {
+        return false;
+    }
+    otBorderAgentId id;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otBorderAgentGetId(esp_openthread_get_instance(), &id);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        return false;
+    }
+    bytes_to_hex(id.mId, OT_BORDER_AGENT_ID_LENGTH, out);
+    return true;
+}
+
+bool thread_ext_address_hex(char *out, size_t cap)
+{
+    if (!s_ready || cap < OT_EXT_ADDRESS_SIZE * 2 + 1) {
+        return false;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otExtAddress *a = otLinkGetExtendedAddress(esp_openthread_get_instance());
+    if (a != NULL) {
+        bytes_to_hex(a->m8, OT_EXT_ADDRESS_SIZE, out);
+    }
+    esp_openthread_lock_release();
+    return a != NULL;
+}
+
+bool thread_ext_panid_hex(char *out, size_t cap)
+{
+    if (!s_ready || cap < OT_EXT_PAN_ID_SIZE * 2 + 1) {
+        return false;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const otExtendedPanId *x = otThreadGetExtendedPanId(esp_openthread_get_instance());
+    if (x != NULL) {
+        bytes_to_hex(x->m8, OT_EXT_PAN_ID_SIZE, out);
+    }
+    esp_openthread_lock_release();
+    return x != NULL;
+}
+
+const char *thread_network_name(void)
+{
+    if (!s_ready) {
+        return "";
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const char *n = otThreadGetNetworkName(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    return n ? n : "";
+}
+
+uint16_t thread_rloc16(void)
+{
+    if (!s_ready) {
+        return 0;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    uint16_t r = otThreadGetRloc16(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    return r;
+}
+
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+esp_err_t thread_set_dataset_hex(const char *hex)
+{
+    size_t len = strlen(hex);
+    if (len == 0 || (len % 2) != 0 || len / 2 > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint8_t tlvs[OT_OPERATIONAL_DATASET_MAX_LENGTH];
+    for (size_t i = 0; i < len / 2; i++) {
+        int hi = hex_nibble(hex[2 * i]), lo = hex_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            return ESP_ERR_INVALID_ARG;
+        }
+        tlvs[i] = (uint8_t) ((hi << 4) | lo);
+    }
+    return thread_join(tlvs, len / 2);
+}
+
+esp_err_t thread_set_enabled(bool on)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *ins = esp_openthread_get_instance();
+    otError err = otIp6SetEnabled(ins, on);
+    if (err == OT_ERROR_NONE) {
+        err = otThreadSetEnabled(ins, on);
+    }
+    esp_openthread_lock_release();
+    return err == OT_ERROR_NONE ? ESP_OK : ESP_FAIL;
+}
+
+bool thread_epskc_feature_enabled(void)
+{
+    return epskc_state() != OT_BORDER_AGENT_STATE_DISABLED;
+}
+
+void thread_epskc_set_feature_enabled(bool on)
+{
+    if (!s_ready) {
+        return;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *ins = esp_openthread_get_instance();
+    if (on && !s_share_cb_set) {
+        otBorderAgentEphemeralKeySetCallback(ins, share_state_cb, NULL);
+        s_share_cb_set = true;
+    }
+    otBorderAgentEphemeralKeySetEnabled(ins, on);
+    esp_openthread_lock_release();
+}
+
+const char *thread_share_state_rest(void)
+{
+    switch (epskc_state()) {
+    case OT_BORDER_AGENT_STATE_STOPPED:   return "stopped";
+    case OT_BORDER_AGENT_STATE_STARTED:   return "started";
+    case OT_BORDER_AGENT_STATE_CONNECTED: return "connected";
+    case OT_BORDER_AGENT_STATE_ACCEPTED:  return "accepted";
+    default:                              return "disabled";
+    }
+}
+
+uint16_t thread_share_port(void)
+{
+    if (!s_ready) {
+        return 0;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    uint16_t p = otBorderAgentEphemeralKeyGetUdpPort(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    return p;
 }

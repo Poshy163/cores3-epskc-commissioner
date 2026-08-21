@@ -26,11 +26,15 @@
 
 #include "discover.h"
 #include "meshcop.h"
+#include "otbr_rest.h"
 #include "power.h"
 #include "qrscan.h"
+#include "settings.h"
 #include "thread.h"
 #include "ui.h"
 #include "wifi_ctl.h"
+#include "esp_system.h"
+#include "nvs.h"
 
 static const char *TAG = "epskc";
 
@@ -79,6 +83,10 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
          * are stored) re-attach to its network. Idempotent on reconnects. */
         if (!ui_defer_br_start(s_sta_netif)) {
             thread_start_border_router(s_sta_netif);   /* headless fallback */
+        }
+        /* Idempotent, so reconnects are harmless. */
+        if (settings_get()->rest_api) {
+            otbr_rest_start();
         }
     }
 }
@@ -329,6 +337,106 @@ static int cmd_name(int argc, char **argv)
 #define FW_VERSION "dev"
 #endif
 
+void app_reboot(void)
+{
+    ESP_LOGW(TAG, "reboot requested");
+    vTaskDelay(pdMS_TO_TICKS(200));   /* let the console/UI flush */
+    esp_restart();
+}
+
+void app_factory_reset(void)
+{
+    ESP_LOGW(TAG, "factory reset");
+    thread_forget();
+    app_wifi_leave();
+    settings_erase();
+    nvs_handle_t h;
+    if (nvs_open("epskc", NVS_READWRITE, &h) == ESP_OK) {   /* remembered network */
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    app_reboot();
+}
+
+static int cmd_rest(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+        otbr_rest_stop();
+        settings_get()->rest_api = false;
+        settings_save();
+        printf("REST API stopped\n");
+        return 0;
+    }
+    if (argc >= 3 && strcmp(argv[1], "epskc") == 0) {
+        bool on = strcmp(argv[2], "on") == 0;
+        settings_get()->rest_epskc = on;
+        settings_save();
+        thread_epskc_set_feature_enabled(on);
+        otbr_rest_set_epskc(on);
+        printf("ba-epskc endpoints %s\n", on ? "registered" : "removed");
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "start") == 0) {
+        settings_get()->rest_api = true;
+        settings_save();
+        if (otbr_rest_start() != ESP_OK) {
+            printf("could not start (see log)\n");
+            return 1;
+        }
+    }
+    printf("REST API : %s\n", otbr_rest_running() ? "running" : "stopped");
+    printf("URL      : http://%s:%d\n", s_ip, OTBR_REST_PORT);
+    printf("ba-epskc : %s\n", settings_get()->rest_epskc ? "registered" : "removed");
+    return 0;
+}
+
+static int cmd_power(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    power_status_t ps;
+    if (power_read(&ps) != ESP_OK) {
+        printf("PMIC unreachable\n");
+        return 1;
+    }
+    printf("battery  : %d%%  %d mV  %s%s\n", ps.percent, ps.batt_mv,
+           ps.present ? "" : "(not detected) ", ps.charge_detail);
+    printf("vbus     : %s  %d mV\n", ps.vbus ? "present" : "absent", ps.vbus_mv);
+    printf("vsys     : %d mV\n", ps.vsys_mv);
+    printf("pmic temp: %d C\n", ps.pmic_temp_c);
+    float t;
+    if (power_esp_temp(&t)) {
+        printf("esp temp : %.1f C\n", t);
+    }
+    float rate;
+    int mins;
+    if (power_discharge_rate(&rate, &mins)) {
+        printf("discharge: %.1f %%/h  ~%dh%02dm left\n", rate, mins / 60, mins % 60);
+    } else {
+        printf("discharge: measuring (needs 10 min on battery)\n");
+    }
+    return 0;
+}
+
+static int cmd_settings(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    const settings_t *c = settings_get();
+    printf("brightness   : %u%%\n", c->brightness);
+    printf("sleep        : %s\n", c->sleep_idx == 0 ? "30 s" : c->sleep_idx == 1 ? "1 min"
+                                   : c->sleep_idx == 2 ? "5 min" : "never");
+    printf("prefer router: %s\n", c->prefer_router ? "yes" : "no");
+    if (c->new_net_channel) {
+        printf("new-net chan : %u\n", c->new_net_channel);
+    } else {
+        printf("new-net chan : auto\n");
+    }
+    printf("share minutes: %u\n", c->share_minutes);
+    printf("rest api     : %s\n", c->rest_api ? "on" : "off");
+    printf("rest epskc   : %s\n", c->rest_epskc ? "on" : "off");
+    return 0;
+}
+
 static int cmd_share(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
@@ -341,7 +449,7 @@ static int cmd_share(int argc, char **argv)
         return 0;
     }
     char code[10];
-    esp_err_t err = thread_share_start(code, sizeof(code), 300000);
+    esp_err_t err = thread_share_start(code, sizeof(code), settings_get()->share_minutes * 60000u);
     if (err == ESP_ERR_INVALID_STATE) {
         printf("border router not running yet\n");
         return 1;
@@ -350,7 +458,7 @@ static int cmd_share(int argc, char **argv)
         printf("could not start ephemeral key\n");
         return 1;
     }
-    printf("ephemeral key: %s  (5 min, single use)\n", code);
+    printf("ephemeral key: %s  (%u min, single use)\n", code, settings_get()->share_minutes);
     printf("state: %s\n", thread_share_state());
     return 0;
 }
@@ -361,7 +469,7 @@ static int cmd_newnet(int argc, char **argv)
     char name[17];
     int ch = 0;
     uint16_t pan = 0;
-    if (thread_form_network(name, sizeof(name), &ch, &pan) != ESP_OK) {
+    if (thread_form_network(settings_get()->new_net_channel, name, sizeof(name), &ch, &pan) != ESP_OK) {
         printf("failed to create network\n");
         return 1;
     }
@@ -398,6 +506,9 @@ static void register_commands(void)
 {
     const esp_console_cmd_t cmds[] = {
         { .command = "newnet", .help = "form a new Thread network with fresh credentials", .func = cmd_newnet },
+        { .command = "rest", .help = "rest [start|stop|epskc on|off] - OTBR REST API", .func = cmd_rest },
+        { .command = "power", .help = "voltages, temperatures, discharge rate", .func = cmd_power },
+        { .command = "settings", .help = "show persisted settings", .func = cmd_settings },
         { .command = "share", .help = "share [stop|state] - ePSKc code so a commissioner can pull our credentials", .func = cmd_share },
         { .command = "batt", .help = "battery %, voltage and charge state", .func = cmd_batt },
         { .command = "name", .help = "name <hostname> - set the mDNS/border-router name", .func = cmd_name },
@@ -422,6 +533,7 @@ void app_main(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+    settings_load();
 
     /* Display first, so boot progress is visible on the LCD rather than
      * leaving the screen dark until something happens. */
@@ -480,6 +592,8 @@ void app_main(void)
     if (thread_init() != ESP_OK) {
         ESP_LOGW(TAG, "OpenThread unavailable - credential retrieval still works");
     }
+    thread_set_prefer_router(settings_get()->prefer_router);
+    thread_epskc_set_feature_enabled(settings_get()->rest_epskc);
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t rcfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -513,13 +627,11 @@ void app_main(void)
     }
 
     /*
-     * Claim the camera pipeline last, after the console has its 12 KB stack.
-     * The pipeline stays alive for the life of the process anyway (see
-     * qrscan.c), so this only fixes WHEN the DMA buffer is allocated: left
-     * until the first scan, it has to find contiguous internal RAM after the
-     * device has become Thread leader, and that block no longer exists.
-     * Order matters -- claimed before the console, it was the console that
-     * failed to start instead.
+     * Camera pipeline: after the console (its 12 KB REPL stack must win the
+     * contiguous-memory race -- claimed first, the console silently fails to
+     * start), before Wi-Fi/Thread bring-up finishes fragmenting the heap. The
+     * pipeline then stays alive for the life of the process (see qrscan.c),
+     * so this is a one-time claim of the 8 KB DVP DMA buffer.
      */
     if (qrscan_start() == ESP_OK) {
         qrscan_stop();

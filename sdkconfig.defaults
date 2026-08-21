@@ -108,3 +108,7 @@ CONFIG_LV_FONT_MONTSERRAT_16=y
 
 # QR widget for showing the dataset TLVs on screen.
 CONFIG_LV_USE_QRCODE=y
+
+# LVGL heap stays at the 64 KB default. Tried 40 KB to free internal RAM for
+# the camera's DMA buffer: the UI boot-looped with a white screen, so this UI
+# genuinely needs most of it. Do not lower without watching a real boot.

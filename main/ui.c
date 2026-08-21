@@ -9,6 +9,7 @@
  */
 #include "ui.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -23,10 +24,17 @@
 #include "lvgl.h"
 #include "meshcop.h"
 #include "nvs.h"
+#include "otbr_rest.h"
 #include "power.h"
 #include "qrscan.h"
+#include "settings.h"
 #include "thread.h"
 #include "wifi_ctl.h"
+#include "esp_idf_version.h"
+#include "esp_mac.h"
+#include "esp_system.h"
+#include "esp_timer.h"
+#include "mdns.h"
 
 static const char *TAG = "ui";
 
@@ -39,6 +47,12 @@ static const char *TAG = "ui";
  * small internal buffer costs a fixed, affordable amount and never fails.
  */
 #define LVGL_BUFFER_PIXELS (BSP_LCD_H_RES * 10)
+
+/* Every panel sits below the title/wifi header and above a Back-button strip.
+ * tools/layout_check.py models the same geometry -- keep the two in step. */
+#define UI_HEADER_H   44
+#define UI_PANEL_H    (BSP_LCD_V_RES - UI_HEADER_H)
+#define UI_BACK_STRIP 56
 
 #define COL_BG      0x101410
 #define COL_PANEL   0x1B2119
@@ -63,7 +77,14 @@ static lv_obj_t *lbl_net_info, *lbl_share_code, *lbl_share_state, *dsqr_widget;
 static char s_share_code[10];
 static int s_share_left_s;
 static bool s_share_active;
-static bool s_dimmed;
+/* Settings screens. */
+static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *panel_name, *panel_about;
+static lv_obj_t *lbl_power_info, *lbl_about_info, *name_ta;
+static lv_obj_t *s_sleep_shield;   /* full-screen tap catcher while asleep */
+static bool s_asleep;
+static int s_sample_tick;          /* batt timer ticks since last gauge sample */
+static bool s_on_external_power;   /* latest VBUS reading, for keep-awake */
+static char s_ip_str[16] = "-";
 
 /* Backbone netif handed over for JOB_BR_START. */
 static esp_netif_t *s_br_backbone;
@@ -132,6 +153,9 @@ static void network_load(void)
 }
 
 static void refresh_network_label(void);
+static void refresh_power_info(void);
+static void refresh_about_info(void);
+static void on_wake(lv_event_t *e);
 
 /* Runs on the LVGL task. The battery lives on the Base DIN behind its power
  * switch, so the PMIC may legitimately see no battery at all -- hide the
@@ -140,13 +164,23 @@ static void batt_timer_cb(lv_timer_t *t)
 {
     (void) t;
     power_status_t ps;
-    if (power_read(&ps) != ESP_OK || !ps.present || ps.percent < 0) {
+    esp_err_t perr = power_read(&ps);
+    if (perr == ESP_OK) {
+        s_on_external_power = ps.vbus;
+    }
+    if (perr != ESP_OK || !ps.present || ps.percent < 0) {
         lv_obj_add_flag(batt_body, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(batt_nub, LV_OBJ_FLAG_HIDDEN);
         return;
     }
     lv_obj_clear_flag(batt_body, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(batt_nub, LV_OBJ_FLAG_HIDDEN);
+
+    /* One gauge sample a minute for the discharge estimate (timer is 10 s). */
+    if (++s_sample_tick >= 6) {
+        s_sample_tick = 0;
+        power_note_sample(ps.percent, !ps.vbus);
+    }
 
     /* Bolt whenever external power is present, not only while the charger is
      * actively topping up: a full battery on USB reported "no bolt", which
@@ -173,17 +207,35 @@ static void role_timer_cb(lv_timer_t *t)
         refresh_network_label();
     }
 
-    /* Backlight: 15% after a minute idle, back to full on any touch. Not
-     * while a share code is showing -- someone is reading it. Dim rather than
-     * off, so the wake-up tap is not blind. */
-    uint32_t idle = lv_display_get_inactive_time(NULL);
+    thread_apply_router_preference();
+
+    /* Live pages refresh while visible. */
+    if (panel_power && !lv_obj_has_flag(panel_power, LV_OBJ_FLAG_HIDDEN)) {
+        refresh_power_info();
+    }
+    if (panel_about && !lv_obj_has_flag(panel_about, LV_OBJ_FLAG_HIDDEN)) {
+        refresh_about_info();
+    }
+
+    /*
+     * Screen sleep: backlight off after the configured idle time, and a
+     * transparent full-screen catcher so the waking touch does not also land
+     * on whatever is underneath. Never while a share code is showing.
+     */
+    uint32_t timeout = settings_sleep_ms[settings_get()->sleep_idx];
     bool sharing = panel_share && !lv_obj_has_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
-    if (idle > 60000 && !s_dimmed && !sharing) {
-        bsp_display_brightness_set(15);
-        s_dimmed = true;
-    } else if (idle < 60000 && s_dimmed) {
-        bsp_display_brightness_set(100);
-        s_dimmed = false;
+    bool held_awake = settings_get()->keep_awake_powered && s_on_external_power;
+    if (timeout && !s_asleep && !sharing && !held_awake &&
+        lv_display_get_inactive_time(NULL) > timeout) {
+        s_sleep_shield = lv_obj_create(lv_layer_top());
+        lv_obj_set_size(s_sleep_shield, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_opa(s_sleep_shield, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(s_sleep_shield, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(s_sleep_shield, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_sleep_shield, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_sleep_shield, on_wake, LV_EVENT_PRESSED, NULL);
+        bsp_display_brightness_set(0);
+        s_asleep = true;
     }
 }
 
@@ -246,7 +298,7 @@ static lv_obj_t *mk_label(lv_obj_t *p, const lv_font_t *f, uint32_t col, const c
 static lv_obj_t *mk_panel(void)
 {
     lv_obj_t *p = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(p, BSP_LCD_H_RES, BSP_LCD_V_RES - 44);
+    lv_obj_set_size(p, BSP_LCD_H_RES, UI_PANEL_H);
     lv_obj_align(p, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(p, lv_color_hex(COL_BG), LV_PART_MAIN);
     lv_obj_set_style_border_width(p, 0, LV_PART_MAIN);
@@ -285,6 +337,12 @@ static void show_panel(lv_obj_t *p)
     lv_obj_add_flag(panel_net, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_screen, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_power, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_tset, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_name, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_about, LV_OBJ_FLAG_HIDDEN);
     if (panel_qr) {
         lv_obj_add_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     }
@@ -804,7 +862,7 @@ static void worker(void *arg)
             qrscan_selftest();
             xSemaphoreGive(s_camtest_done);
         } else if (job == JOB_SHARE) {
-            const uint32_t lifetime_ms = 300000;   /* 5 min; spec max is 10 */
+            const uint32_t lifetime_ms = settings_get()->share_minutes * 60000u;
             esp_err_t err = thread_share_start(s_share_code, sizeof(s_share_code), lifetime_ms);
             bsp_display_lock(0);
             if (err == ESP_OK) {
@@ -814,7 +872,8 @@ static void worker(void *arg)
                 lv_label_set_text(lbl_share_code, spaced);
                 s_share_left_s = lifetime_ms / 1000;
                 s_share_active = true;
-                lv_label_set_text(lbl_share_state, "Waiting for a commissioner   5:00");
+                lv_label_set_text_fmt(lbl_share_state, "Waiting for a commissioner   %d:00",
+                                      (int) settings_get()->share_minutes);
             } else {
                 lv_label_set_text(lbl_share_code, "--- --- ---");
                 lv_label_set_text(lbl_share_state,
@@ -831,7 +890,7 @@ static void worker(void *arg)
             char name[17];
             int ch = 0;
             uint16_t pan = 0;
-            esp_err_t err = thread_form_network(name, sizeof(name), &ch, &pan);
+            esp_err_t err = thread_form_network(settings_get()->new_net_channel, name, sizeof(name), &ch, &pan);
             if (err == ESP_OK) {
                 snprintf(s_net_name, sizeof(s_net_name), "%s", name);
                 s_net_channel = ch;
@@ -916,6 +975,282 @@ static void worker(void *arg)
 
 /* ---------------- construction ---------------- */
 
+/* ---------------- settings ---------------- */
+
+static void on_settings_open(lv_event_t *e)
+{
+    (void) e;
+    show_panel(panel_settings);
+}
+
+static void on_wake(lv_event_t *e)
+{
+    (void) e;
+    if (!s_asleep) {
+        return;
+    }
+    s_asleep = false;
+    bsp_display_brightness_set(settings_get()->brightness);
+    /* Deleting the object from inside its own event is unsafe; defer it. */
+    lv_obj_delete_async(s_sleep_shield);
+    s_sleep_shield = NULL;
+}
+
+/* -- screen -- */
+
+static void on_brightness(lv_event_t *e)
+{
+    lv_obj_t *sl = lv_event_get_target(e);
+    int v = lv_slider_get_value(sl);
+    settings_get()->brightness = (uint8_t) v;
+    bsp_display_brightness_set(v);
+    if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
+        settings_save();
+    }
+}
+
+static void on_sleep_choice(lv_event_t *e)
+{
+    settings_get()->sleep_idx = (uint8_t) lv_roller_get_selected(lv_event_get_target(e));
+    settings_save();
+}
+
+static void on_keep_awake(lv_event_t *e)
+{
+    settings_get()->keep_awake_powered =
+        lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save();
+}
+
+/* -- power -- */
+
+/*
+ * Appends to a fixed buffer, clamping at the end.
+ *
+ * `n += snprintf(buf + n, sizeof(buf) - n, ...)` is the obvious idiom and it
+ * is wrong: snprintf returns the length it *would* have written, so once the
+ * text is truncated `n` exceeds the buffer and `sizeof(buf) - n` underflows to
+ * a huge size_t -- the next call then writes off the end.
+ */
+static void appendf(char *buf, size_t cap, size_t *used, const char *fmt, ...)
+{
+    if (*used >= cap) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(buf + *used, cap - *used, fmt, ap);
+    va_end(ap);
+    if (w < 0) {
+        return;
+    }
+    *used = ((size_t) w >= cap - *used) ? cap - 1 : *used + (size_t) w;
+}
+
+static void refresh_power_info(void)
+{
+    power_status_t ps;
+    char buf[320];
+    size_t n = 0;
+    if (power_read(&ps) != ESP_OK) {
+        lv_label_set_text(lbl_power_info, "PMIC not reachable");
+        return;
+    }
+    if (ps.present) {
+        appendf(buf, sizeof(buf), &n, "Battery  %d%%   %d.%02d V   %s\n",
+                ps.percent, ps.batt_mv / 1000, (ps.batt_mv % 1000) / 10, ps.charge_detail);
+    } else {
+        appendf(buf, sizeof(buf), &n, "Battery  not connected (switch on Base DIN)\n");
+    }
+    appendf(buf, sizeof(buf), &n, "USB      %s   %d.%02d V\n",
+            ps.vbus ? "present" : "absent", ps.vbus_mv / 1000, (ps.vbus_mv % 1000) / 10);
+    appendf(buf, sizeof(buf), &n, "System   %d.%02d V\n",
+            ps.vsys_mv / 1000, (ps.vsys_mv % 1000) / 10);
+    float t;
+    if (power_esp_temp(&t)) {
+        appendf(buf, sizeof(buf), &n, "Temp     PMIC %d C   ESP32 %.0f C\n", ps.pmic_temp_c, t);
+    } else {
+        appendf(buf, sizeof(buf), &n, "Temp     PMIC %d C\n", ps.pmic_temp_c);
+    }
+    float rate;
+    int mins;
+    if (ps.vbus) {
+        appendf(buf, sizeof(buf), &n, "\nOn external power; discharge\nrate measured on battery only.");
+    } else if (power_discharge_rate(&rate, &mins)) {
+        appendf(buf, sizeof(buf), &n, "\nDischarge  %.1f %%/h   about %dh %02dm left",
+                rate, mins / 60, mins % 60);
+    } else {
+        appendf(buf, sizeof(buf), &n, "\nDischarge  measuring (10 min on battery)");
+    }
+    appendf(buf, sizeof(buf), &n, "\n\nThe AXP2101 has no current sensor,\nso there is no live mW figure.");
+    lv_label_set_text(lbl_power_info, buf);
+}
+
+static void on_power_open(lv_event_t *e)
+{
+    (void) e;
+    refresh_power_info();
+    show_panel(panel_power);
+}
+
+/* -- thread -- */
+
+static void on_prefer_router(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_get()->prefer_router = on;
+    settings_save();
+    thread_set_prefer_router(on);
+}
+
+static void on_rest_api(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_get()->rest_api = on;
+    settings_save();
+    if (on) {
+        otbr_rest_start();
+    } else {
+        otbr_rest_stop();
+    }
+}
+
+static void on_rest_epskc(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_get()->rest_epskc = on;
+    settings_save();
+    /* Turning it on also enables the stack feature, so a client can activate
+     * a key without anyone pressing Share first. */
+    thread_epskc_set_feature_enabled(on);
+    otbr_rest_set_epskc(on);
+}
+
+static void on_channel_choice(lv_event_t *e)
+{
+    uint32_t idx = lv_roller_get_selected(lv_event_get_target(e));
+    settings_get()->new_net_channel = idx == 0 ? 0 : (uint8_t) (10 + idx);   /* 1 -> 11 */
+    settings_save();
+}
+
+static void on_share_choice(lv_event_t *e)
+{
+    static const uint8_t mins[] = { 2, 5, 10 };
+    uint32_t idx = lv_roller_get_selected(lv_event_get_target(e));
+    settings_get()->share_minutes = mins[idx < 3 ? idx : 1];
+    settings_save();
+}
+
+/* -- device name -- */
+
+static void on_name_open(lv_event_t *e)
+{
+    (void) e;
+    char host[33] = "cores3-thread-br";
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) {
+        size_t len = sizeof(host);
+        nvs_get_str(h, "host", host, &len);
+        nvs_close(h);
+    }
+    lv_textarea_set_text(name_ta, host);
+    show_panel(panel_name);
+}
+
+static void on_name_kb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CANCEL) {
+        show_panel(panel_settings);
+        return;
+    }
+    if (code != LV_EVENT_READY) {
+        return;
+    }
+    const char *name = lv_textarea_get_text(name_ta);
+    if (name[0] == '\0') {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "host", name);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    /* Takes effect for anything published from now on; the meshcop record
+     * re-publishes on the next attach or reboot. */
+    mdns_hostname_set(name);
+    show_panel(panel_settings);
+}
+
+/* -- about -- */
+
+static const char *reset_reason_str(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "power on";
+    case ESP_RST_SW:        return "software";
+    case ESP_RST_PANIC:     return "panic";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_USB:       return "USB";
+    case ESP_RST_JTAG:      return "JTAG";
+    default:                return "unknown";
+    }
+}
+
+static void refresh_about_info(void)
+{
+    uint8_t mac[6] = { 0 };
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    int64_t up = esp_timer_get_time() / 1000000;
+    char buf[320];
+    snprintf(buf, sizeof(buf),
+             "Firmware   %s\n"
+             "ESP-IDF    %s\n"
+             "IP         %s\n"
+             "MAC        %02x:%02x:%02x:%02x:%02x:%02x\n"
+             "Uptime     %lldh %02lldm %02llds\n"
+             "Last reset %s\n"
+             "Free RAM   %u KB internal, %u KB PSRAM",
+             FW_VERSION, esp_get_idf_version(), s_ip_str,
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+             (long long) (up / 3600), (long long) ((up / 60) % 60), (long long) (up % 60),
+             reset_reason_str(),
+             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    lv_label_set_text(lbl_about_info, buf);
+}
+
+static void on_about_open(lv_event_t *e)
+{
+    (void) e;
+    refresh_about_info();
+    show_panel(panel_about);
+}
+
+static void on_screen_open(lv_event_t *e)   { (void) e; show_panel(panel_screen); }
+static void on_tset_open(lv_event_t *e)     { (void) e; show_panel(panel_tset); }
+
+static void on_reboot(lv_event_t *e)
+{
+    if (confirm_tap(lv_event_get_target(e))) {
+        app_reboot();
+    }
+}
+
+static void on_factory_reset(lv_event_t *e)
+{
+    if (confirm_tap(lv_event_get_target(e))) {
+        app_factory_reset();
+    }
+}
+
+/* ---------------- construction ---------------- */
+
 static void build_main(void)
 {
     panel_main = mk_panel();
@@ -943,8 +1278,252 @@ static void build_main(void)
      * one tap further away than Scan. */
     lv_obj_t *f = mk_button(panel_main, "Network", on_net_open, COL_DIM, bw, bh);
     lv_obj_align(f, LV_ALIGN_BOTTOM_MID, -col, -6);
-    lv_obj_t *w = mk_button(panel_main, "Wi-Fi", on_wifi_open, COL_DIM, bw, bh);
+    lv_obj_t *w = mk_button(panel_main, "Settings", on_settings_open, COL_DIM, bw, bh);
     lv_obj_align(w, LV_ALIGN_BOTTOM_MID, col, -6);
+}
+
+static lv_obj_t *settings_row(lv_obj_t *list, const char *txt, lv_event_cb_t cb)
+{
+    /* No icon: confirm_tap() relabels child 0, which must be the text. */
+    lv_obj_t *b = lv_list_add_button(list, NULL, txt);
+    lv_obj_set_style_text_color(b, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    return b;
+}
+
+/*
+ * Scrolling content region: fills the panel except the strip the Back button
+ * occupies, so text can never run underneath it.
+ *
+ * `flex` lays children out as a column, which is what the settings pages want.
+ * They are built from flex rows rather than hand-placed at pixel offsets
+ * because widgets draw larger than the size they are given -- a slider's knob
+ * overhangs its track, switches and rollers carry theme padding -- so absolute
+ * placement kept producing overlaps that only showed up on the hardware. Text
+ * panels pass false and position their own label.
+ */
+static lv_obj_t *mk_content(lv_obj_t *panel, bool flex)
+{
+    lv_obj_t *box = lv_obj_create(panel);
+    lv_obj_set_size(box, BSP_LCD_H_RES - 12, UI_PANEL_H - UI_BACK_STRIP);
+    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(box, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(box, 4, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(box, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(box, LV_SCROLLBAR_MODE_AUTO);
+    if (flex) {
+        lv_obj_set_style_pad_row(box, 6, LV_PART_MAIN);
+        lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    }
+    return box;
+}
+
+/* Plain left-aligned caption, for panels that are not flex pages. */
+static lv_obj_t *mk_caption(lv_obj_t *p, const char *txt, int y)
+{
+    lv_obj_t *l = lv_label_create(p);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COL_DIM), LV_PART_MAIN);
+    lv_label_set_text(l, txt);
+    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 8, y);
+    return l;
+}
+
+/* One setting: caption on the left, control added by the caller on the right. */
+static lv_obj_t *mk_row(lv_obj_t *page, const char *caption, int h)
+{
+    lv_obj_t *row = lv_obj_create(page);
+    lv_obj_set_size(row, LV_PCT(100), h);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, 8, LV_PART_MAIN);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *l = lv_label_create(row);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COL_DIM), LV_PART_MAIN);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(l, 1);
+    lv_label_set_text(l, caption);
+    return row;
+}
+
+/*
+ * Roller, not dropdown. A dropdown's list opens downward over whatever follows
+ * -- on a 196 px panel the channel list (17 entries) covered the next setting
+ * and the Back button, and ran off the bottom. A roller keeps its size.
+ */
+static lv_obj_t *mk_roller(lv_obj_t *row, const char *opts, lv_event_cb_t cb)
+{
+    lv_obj_t *r = lv_roller_create(row);
+    lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(r, 2);
+    lv_obj_set_width(r, 118);
+    lv_obj_set_style_bg_color(r, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_text_color(r, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(r, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(r, lv_color_hex(COL_ACCENT), LV_PART_SELECTED);
+    lv_obj_add_event_cb(r, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return r;
+}
+
+static lv_obj_t *mk_switch(lv_obj_t *row, bool on, lv_event_cb_t cb)
+{
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_size(sw, 50, 26);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (on) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    return sw;
+}
+
+static void build_settings(void)
+{
+    panel_settings = mk_panel();
+
+    lv_obj_t *list = lv_list_create(panel_settings);
+    lv_obj_set_size(list, BSP_LCD_H_RES - 20, 140);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 2);
+    lv_obj_set_style_bg_color(list, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
+
+    settings_row(list, "Wi-Fi", on_wifi_open);
+    settings_row(list, "Screen", on_screen_open);
+    settings_row(list, "Power", on_power_open);
+    settings_row(list, "Thread", on_tset_open);
+    settings_row(list, "Device name", on_name_open);
+    settings_row(list, "About", on_about_open);
+    lv_obj_t *rb = settings_row(list, "Reboot", on_reboot);
+    lv_obj_set_style_text_color(rb, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
+    lv_obj_t *fr = settings_row(list, "Factory reset", on_factory_reset);
+    lv_obj_set_style_text_color(fr, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+
+    lv_obj_t *bk = mk_button(panel_settings, "Back", on_back_main, COL_DIM, 110, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+static void build_screen(void)
+{
+    panel_screen = mk_panel();
+
+    lv_obj_t *page = mk_content(panel_screen, true);
+
+    /* 30 px row: the knob overhangs the track, so the row must be taller than
+     * the slider itself or the knob clips into the neighbouring row. */
+    lv_obj_t *r1 = mk_row(page, "Brightness", 30);
+    lv_obj_t *sl = lv_slider_create(r1);
+    lv_slider_set_range(sl, 10, 100);
+    lv_slider_set_value(sl, settings_get()->brightness, LV_ANIM_OFF);
+    lv_obj_set_size(sl, 150, 8);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sl, lv_color_hex(COL_ACCENT), LV_PART_KNOB);
+    lv_obj_add_event_cb(sl, on_brightness, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(sl, on_brightness, LV_EVENT_RELEASED, NULL);
+
+    lv_obj_t *r2 = mk_row(page, "Sleep after", 62);
+    lv_obj_t *rl = mk_roller(r2, SETTINGS_SLEEP_OPTIONS, on_sleep_choice);
+    lv_roller_set_selected(rl, settings_get()->sleep_idx, LV_ANIM_OFF);
+
+    lv_obj_t *r3 = mk_row(page, "Stay on when plugged in", 34);
+    mk_switch(r3, settings_get()->keep_awake_powered, on_keep_awake);
+
+    lv_obj_t *bk = mk_button(panel_screen, "Back", on_settings_open, COL_DIM, 110, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+static void build_power(void)
+{
+    panel_power = mk_panel();
+    /* Scrollable region that ends above the Back button: the text is taller
+     * than the panel, and a plain label just ran underneath the button. */
+    lv_obj_t *box = mk_content(panel_power, false);
+    lbl_power_info = lv_label_create(box);
+    lv_obj_set_style_text_font(lbl_power_info, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_power_info, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    lv_obj_set_width(lbl_power_info, BSP_LCD_H_RES - 28);
+    lv_label_set_long_mode(lbl_power_info, LV_LABEL_LONG_WRAP);
+    lv_obj_align(lbl_power_info, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bk = mk_button(panel_power, "Back", on_settings_open, COL_DIM, 110, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+static void build_tset(void)
+{
+    panel_tset = mk_panel();
+
+    lv_obj_t *page = mk_content(panel_tset, true);
+
+    lv_obj_t *r1 = mk_row(page, "Prefer router role", 34);
+    mk_switch(r1, settings_get()->prefer_router, on_prefer_router);
+
+    lv_obj_t *r_rest = mk_row(page, "REST API (port 8081)", 34);
+    mk_switch(r_rest, settings_get()->rest_api, on_rest_api);
+
+    lv_obj_t *r_eps = mk_row(page, "ePSKc over REST", 34);
+    mk_switch(r_eps, settings_get()->rest_epskc, on_rest_epskc);
+
+    lv_obj_t *r2 = mk_row(page, "New network channel", 62);
+    lv_obj_t *ch = mk_roller(r2,
+                             "Auto\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26",
+                             on_channel_choice);
+    uint8_t c = settings_get()->new_net_channel;
+    lv_roller_set_selected(ch, c ? c - 10 : 0, LV_ANIM_OFF);
+
+    lv_obj_t *r3 = mk_row(page, "Share code lifetime", 62);
+    lv_obj_t *sh = mk_roller(r3, "2 min\n5 min\n10 min", on_share_choice);
+    uint8_t m = settings_get()->share_minutes;
+    lv_roller_set_selected(sh, m == 2 ? 0 : m == 10 ? 2 : 1, LV_ANIM_OFF);
+
+    lv_obj_t *bk = mk_button(panel_tset, "Back", on_settings_open, COL_DIM, 110, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+static void build_name(void)
+{
+    panel_name = mk_panel();
+
+    mk_caption(panel_name, "Device name (mDNS)", 0);
+
+    name_ta = lv_textarea_create(panel_name);
+    lv_textarea_set_one_line(name_ta, true);
+    lv_textarea_set_max_length(name_ta, 32);
+    lv_textarea_set_accepted_chars(name_ta,
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-");
+    lv_obj_set_size(name_ta, BSP_LCD_H_RES - 24, 36);
+    lv_obj_align(name_ta, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_set_style_bg_color(name_ta, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_text_color(name_ta, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+
+    lv_obj_t *kb = lv_keyboard_create(panel_name);
+    lv_keyboard_set_textarea(kb, name_ta);
+    lv_obj_set_size(kb, BSP_LCD_H_RES - 12, 130);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_color(kb, lv_color_hex(COL_BG), LV_PART_MAIN);
+    lv_obj_add_event_cb(kb, on_name_kb, LV_EVENT_ALL, NULL);
+}
+
+static void build_about(void)
+{
+    panel_about = mk_panel();
+    lv_obj_t *box = mk_content(panel_about, false);
+    lbl_about_info = lv_label_create(box);
+    lv_obj_set_style_text_font(lbl_about_info, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_about_info, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    lv_obj_set_width(lbl_about_info, BSP_LCD_H_RES - 28);
+    lv_label_set_long_mode(lbl_about_info, LV_LABEL_LONG_WRAP);
+    lv_obj_align(lbl_about_info, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *bk = mk_button(panel_about, "Back", on_settings_open, COL_DIM, 110, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
 static void build_net(void)
@@ -1015,7 +1594,7 @@ static void build_wifi(void)
     lv_obj_align(r, LV_ALIGN_BOTTOM_LEFT, 4, -6);
     lv_obj_t *l = mk_button(panel_wifi, "Leave", on_wifi_leave, COL_ERROR, 96, 40);
     lv_obj_align(l, LV_ALIGN_BOTTOM_MID, 0, -6);
-    lv_obj_t *bk = mk_button(panel_wifi, "Back", on_back_main, COL_DIM, 96, 40);
+    lv_obj_t *bk = mk_button(panel_wifi, "Back", on_settings_open, COL_DIM, 96, 40);
     lv_obj_align(bk, LV_ALIGN_BOTTOM_RIGHT, -4, -6);
 }
 
@@ -1147,6 +1726,7 @@ esp_err_t ui_init(void)
         return ESP_FAIL;
     }
     bsp_display_backlight_on();
+    bsp_display_brightness_set(settings_get()->brightness);
 
     s_jobs = xQueueCreate(4, sizeof(job_t));
 
@@ -1162,13 +1742,6 @@ esp_err_t ui_init(void)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
     lbl_wifi = mk_label(scr, &lv_font_montserrat_14, COL_DIM, "wifi: not connected");
     lv_obj_align(lbl_wifi, LV_ALIGN_TOP_MID, 0, 30);
-
-    /* Which build is on the board. Plain label: mk_label would centre it. */
-    lv_obj_t *ver = lv_label_create(scr);
-    lv_obj_set_style_text_font(ver, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(ver, lv_color_hex(COL_DIM), LV_PART_MAIN);
-    lv_label_set_text(ver, FW_VERSION);
-    lv_obj_align(ver, LV_ALIGN_TOP_LEFT, 4, 10);
 
     /* Battery drawn as an outline with the percent inside, top-right on the
      * top layer so it rides above every panel. Non-clickable, so touches fall
@@ -1221,6 +1794,12 @@ esp_err_t ui_init(void)
     build_net();
     build_share();
     build_dsqr();
+    build_settings();
+    build_screen();
+    build_power();
+    build_tset();
+    build_name();
+    build_about();
     refresh_network_label();
     lv_timer_create(role_timer_cb, 2000, NULL);
     lv_timer_ready(lv_timer_create(batt_timer_cb, 10000, NULL));
@@ -1250,6 +1829,7 @@ void ui_set_wifi(const char *ssid, const char *ip)
     }
     char buf[96];
     s_have_wifi = ip && ip[0] && ip[0] != '-';
+    snprintf(s_ip_str, sizeof(s_ip_str), "%s", s_have_wifi ? ip : "-");
     if (s_have_wifi) {
         snprintf(buf, sizeof(buf), "%s  |  %s", ssid ? ssid : "?", ip);
     } else {

@@ -25,3 +25,8 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
 
 /* Disconnect and erase the stored credentials. */
 void app_wifi_leave(void);
+
+/* Whole-device actions, also used by the Settings screen. */
+void app_reboot(void);
+/* Thread credentials, Wi-Fi credentials, device name and settings, then reboot. */
+void app_factory_reset(void);

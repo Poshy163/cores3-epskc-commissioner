@@ -1,8 +1,8 @@
 idf_component_register(
-    SRCS "main.c" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c"
+    SRCS "main.c" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c" "settings.c" "otbr_rest.c"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_netif nvs_flash console mbedtls esp_timer lwip
-             openthread driver vfs
+             openthread driver vfs esp_driver_tsens esp_timer esp_http_server
 )
 
 # Bake the git revision into the binary so the board can say which build it

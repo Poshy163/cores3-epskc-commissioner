@@ -43,7 +43,8 @@ esp_err_t thread_join(const uint8_t *dataset_tlvs, size_t len);
  * becomes leader, and the border agent publishes it as its own network in
  * Home Assistant's Thread panel. Outputs identify the network on the UI.
  */
-esp_err_t thread_form_network(char *name, size_t name_len, int *channel, uint16_t *panid);
+esp_err_t thread_form_network(uint8_t channel, char *name, size_t name_len,
+                              int *channel_out, uint16_t *panid);
 
 /* Wipe stored Thread credentials and detach. */
 esp_err_t thread_forget(void);
@@ -81,3 +82,41 @@ bool thread_dataset_hex(char *out, size_t cap);
 
 /* Children attached directly to this device (meaningful as router/leader). */
 int thread_child_count(void);
+
+/*
+ * Router preference. Off (default): stay whatever the mesh makes us, which on
+ * a mesh already rich in routers means child. On: mark ourselves router-
+ * eligible and, whenever we find ourselves a child, ask to be promoted.
+ * thread_apply_router_preference() is cheap and rate-limited; call it from a
+ * periodic timer.
+ */
+void thread_set_prefer_router(bool on);
+void thread_apply_router_preference(void);
+
+/*
+ * Values the OTBR REST API reports. All return false when the stack is not
+ * running or the value is unavailable; buffers get lowercase hex, no prefix.
+ */
+bool thread_border_agent_id_hex(char *out, size_t cap);   /* 16 bytes -> 32 chars */
+bool thread_ext_address_hex(char *out, size_t cap);       /* 8 bytes  -> 16 chars */
+bool thread_ext_panid_hex(char *out, size_t cap);         /* 8 bytes  -> 16 chars */
+const char *thread_network_name(void);
+uint16_t thread_rloc16(void);
+
+/* Apply an Active Operational Dataset given as hex TLVs (REST PUT). */
+esp_err_t thread_set_dataset_hex(const char *hex);
+
+/* Bring the Thread interface up or down (REST POST /node/state). */
+esp_err_t thread_set_enabled(bool on);
+
+/*
+ * ePSKc over REST (python-otbr-api #267). Separate from thread_share_state()
+ * because the REST contract uses OpenThread's own state names rather than the
+ * friendlier words the touch UI shows.
+ */
+bool thread_epskc_feature_enabled(void);
+void thread_epskc_set_feature_enabled(bool on);
+const char *thread_share_state_rest(void);   /* disabled|stopped|started|connected|accepted */
+uint16_t thread_share_port(void);
+/* port 0 lets the stack choose. */
+esp_err_t thread_share_start_on(char *code, size_t cap, uint32_t lifetime_ms, uint16_t port);
