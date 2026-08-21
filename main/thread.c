@@ -22,9 +22,14 @@
 #include "esp_vfs_eventfd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mdns.h"
+#include "openthread/border_agent.h"
+#include "openthread/border_agent_ephemeral_key.h"
 #include "openthread/dataset.h"
+#include "openthread/dataset_ftd.h"
 #include "openthread/instance.h"
 #include "openthread/thread.h"
+#include "openthread/thread_ftd.h"
 
 static const char *TAG = "thread";
 
@@ -140,9 +145,22 @@ esp_err_t thread_init(void)
     return s_ready ? ESP_OK : ESP_FAIL;
 }
 
-static void br_start_task(void *arg)
+/* Boot-time BR outcome, queryable later: the logs of this task land in the
+ * USB re-enumeration blackout after a port-open reset, so nothing printed
+ * here is ever seen. */
+const char *g_br_boot_status = "not started";
+
+void thread_run_border_router_start(esp_netif_t *backbone)
 {
-    esp_netif_t *backbone = (esp_netif_t *) arg;
+    if (!s_ready || backbone == NULL) {
+        g_br_boot_status = "br start skipped (thread not ready)";
+        return;
+    }
+    if (s_br_started || s_br_starting) {
+        return;
+    }
+    s_br_starting = true;
+    g_br_boot_status = "br start running";
 
     esp_openthread_lock_acquire(portMAX_DELAY);
     esp_openthread_set_backbone_netif(backbone);
@@ -150,7 +168,8 @@ static void br_start_task(void *arg)
     if (err != ESP_OK) {
         esp_openthread_lock_release();
         ESP_LOGE(TAG, "border_router_init failed: %s", esp_err_to_name(err));
-        vTaskDelete(NULL);
+        g_br_boot_status = "border_router_init FAILED";
+        s_br_starting = false;
         return;
     }
 
@@ -165,19 +184,29 @@ static void br_start_task(void *arg)
     otError oterr = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &ds);
     if (oterr == OT_ERROR_NONE && ds.mLength > 0) {
         ESP_LOGI(TAG, "stored credentials found, re-attaching");
+        g_br_boot_status = "re-attach started";
         err = esp_openthread_auto_start(&ds);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "auto_start failed: %s", esp_err_to_name(err));
+            g_br_boot_status = "auto_start FAILED";
         }
     } else {
         ESP_LOGI(TAG, "border router up; no credentials stored yet");
+        g_br_boot_status = "no stored credentials";
     }
     esp_openthread_lock_release();
 
     s_br_started = true;
+    g_br_boot_status = "border router up";
     /* Note: meshcop is published by the stack on attach, not here -- watch for
      * "Failed to publish meshcop mdns service" rather than trusting this line. */
     ESP_LOGI(TAG, "border router init done");
+}
+
+/* Fallback for headless boots (no UI worker): own task, own stack. */
+static void br_start_task(void *arg)
+{
+    thread_run_border_router_start((esp_netif_t *) arg);
     vTaskDelete(NULL);
 }
 
@@ -189,7 +218,6 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
     if (s_br_started || s_br_starting) {
         return ESP_OK;
     }
-    s_br_starting = true;
 
     /*
      * Deferred to its own task on purpose. This is called from the Wi-Fi
@@ -198,10 +226,11 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
      * reboots the board.
      */
     if (xTaskCreate(br_start_task, "ot_br_start", 8192, backbone, 4, NULL) != pdPASS) {
-        s_br_starting = false;
+        g_br_boot_status = "br task spawn FAILED (no internal RAM)";
         ESP_LOGE(TAG, "could not start border router task");
         return ESP_ERR_NO_MEM;
     }
+    g_br_boot_status = "br task spawned";
     return ESP_OK;
 }
 
@@ -273,6 +302,46 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     return ESP_OK;
 }
 
+esp_err_t thread_form_network(char *name, size_t name_len, int *channel, uint16_t *panid)
+{
+    if (!s_ready) {
+        return ESP_FAIL;
+    }
+    otInstance *ins = esp_openthread_get_instance();
+    otOperationalDataset ds;
+    otOperationalDatasetTlvs tlvs;
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otDatasetCreateNewNetwork(ins, &ds);
+    if (err == OT_ERROR_NONE) {
+        /* Recognisable on the HA Thread panel; suffix keeps repeated
+         * generations distinct. */
+        snprintf(ds.mNetworkName.m8, sizeof(ds.mNetworkName.m8), "CoreS3-%02X%02X",
+                 ds.mExtendedPanId.m8[6], ds.mExtendedPanId.m8[7]);
+        ds.mComponents.mIsNetworkNamePresent = true;
+        otDatasetConvertToTlvs(&ds, &tlvs);
+    }
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "could not generate dataset (%d)", err);
+        return ESP_FAIL;
+    }
+
+    if (name != NULL) {
+        snprintf(name, name_len, "%s", ds.mNetworkName.m8);
+    }
+    if (channel != NULL) {
+        *channel = ds.mChannel;
+    }
+    if (panid != NULL) {
+        *panid = ds.mPanId;
+    }
+
+    /* Same route as joining someone else's network: erase the old identity,
+     * apply the dataset, attach. Sole member of a new PAN -> leader. */
+    return thread_join(tlvs.mTlvs, tlvs.mLength);
+}
+
 const char *thread_role(void)
 {
     if (!s_ready) {
@@ -310,4 +379,136 @@ bool thread_link_rssi(int8_t *rssi)
     /* 127 is OpenThread's "no measurement yet" sentinel, which shows up in the
      * window between attaching and the first parent frame. */
     return err == OT_ERROR_NONE && *rssi != 127;
+}
+
+/* ---------------- sharing (ePSKc border-agent side) ---------------- */
+
+static bool s_share_cb_set;
+static bool s_meshcop_e_published;
+
+/*
+ * IDF wires the _meshcop-e publish/remove events but nothing in it ever posts
+ * them; advertising the ephemeral-key listener is the application's job.
+ * Runs on the OpenThread task with the stack lock held.
+ */
+static void share_state_cb(void *ctx)
+{
+    (void) ctx;
+    otInstance *ins = esp_openthread_get_instance();
+    otBorderAgentEphemeralKeyState st = otBorderAgentEphemeralKeyGetState(ins);
+
+    if (st == OT_BORDER_AGENT_STATE_STARTED && !s_meshcop_e_published) {
+        uint16_t port = otBorderAgentEphemeralKeyGetUdpPort(ins);
+        const char *nn = otThreadGetNetworkName(ins);
+        mdns_txt_item_t txt[] = {
+            { "rv", "1" },
+            { "tv", "1.4.0" },
+            { "vn", "OpenThread" },
+            { "mn", "BorderRouter" },
+            { "nn", nn ? nn : "" },
+        };
+        esp_err_t err = mdns_service_add(NULL, "_meshcop-e", "_udp", port, txt,
+                                         sizeof(txt) / sizeof(txt[0]));
+        s_meshcop_e_published = (err == ESP_OK);
+        ESP_LOGI(TAG, "ephemeral key listening on udp/%u (%s)", port,
+                 err == ESP_OK ? "advertised" : "advertise FAILED");
+    } else if ((st == OT_BORDER_AGENT_STATE_STOPPED || st == OT_BORDER_AGENT_STATE_DISABLED)
+               && s_meshcop_e_published) {
+        mdns_service_remove("_meshcop-e", "_udp");
+        s_meshcop_e_published = false;
+        ESP_LOGI(TAG, "ephemeral key closed, _meshcop-e withdrawn");
+    }
+}
+
+esp_err_t thread_share_start(char *code, size_t cap, uint32_t lifetime_ms)
+{
+    if (!s_ready || !s_br_started || cap < 10) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    otInstance *ins = esp_openthread_get_instance();
+    otBorderAgentEphemeralKeyTap tap;
+    otError err;
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (!s_share_cb_set) {
+        otBorderAgentEphemeralKeySetCallback(ins, share_state_cb, NULL);
+        s_share_cb_set = true;
+    }
+    otBorderAgentEphemeralKeySetEnabled(ins, true);
+    err = otBorderAgentEphemeralKeyGenerateTap(&tap);
+    if (err == OT_ERROR_NONE) {
+        /* Port 0: let the stack pick, and read it back in the callback. */
+        err = otBorderAgentEphemeralKeyStart(ins, tap.mTap, lifetime_ms, 0);
+    }
+    esp_openthread_lock_release();
+
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "ephemeral key start failed (%d)", err);
+        return ESP_FAIL;
+    }
+    snprintf(code, cap, "%s", tap.mTap);
+    return ESP_OK;
+}
+
+void thread_share_stop(void)
+{
+    if (!s_ready) {
+        return;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otBorderAgentEphemeralKeyStop(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+}
+
+const char *thread_share_state(void)
+{
+    if (!s_ready) {
+        return "off";
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otBorderAgentEphemeralKeyState st = otBorderAgentEphemeralKeyGetState(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    switch (st) {
+    case OT_BORDER_AGENT_STATE_STARTED:   return "waiting";
+    case OT_BORDER_AGENT_STATE_CONNECTED: return "connected";
+    case OT_BORDER_AGENT_STATE_ACCEPTED:  return "accepted";
+    default:                              return "off";
+    }
+}
+
+bool thread_dataset_hex(char *out, size_t cap)
+{
+    if (!s_ready) {
+        return false;
+    }
+    otOperationalDatasetTlvs ds;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &ds);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE || ds.mLength == 0 || cap < (size_t) ds.mLength * 2 + 1) {
+        return false;
+    }
+    for (size_t i = 0; i < ds.mLength; i++) {
+        snprintf(out + 2 * i, 3, "%02x", ds.mTlvs[i]);
+    }
+    return true;
+}
+
+int thread_child_count(void)
+{
+    if (!s_ready) {
+        return 0;
+    }
+    otInstance *ins = esp_openthread_get_instance();
+    int n = 0;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    uint16_t max = otThreadGetMaxAllowedChildren(ins);
+    for (uint16_t i = 0; i < max; i++) {
+        otChildInfo ci;
+        if (otThreadGetChildInfoByIndex(ins, i, &ci) == OT_ERROR_NONE) {
+            n++;
+        }
+    }
+    esp_openthread_lock_release();
+    return n;
 }

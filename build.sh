@@ -9,6 +9,7 @@ DEFAULTS="${1:-sdkconfig.defaults}"
 rm -rf /work/main
 cp -r /host/main /work/
 cp /host/CMakeLists.txt /host/partitions.csv /host/sdkconfig.defaults /host/dependencies.lock /work/
+v=$(git -C /host rev-parse --short=7 HEAD 2>/dev/null || echo unknown); git -C /host diff --quiet 2>/dev/null || v="${v}*"; echo "$v" > /work/version.txt
 if [ -f /host/sdkconfig.debug ]; then cp /host/sdkconfig.debug /work/; fi
 
 cd /work

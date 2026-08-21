@@ -43,3 +43,6 @@ void meshcop_print_tlvs(const uint8_t *tlvs, size_t len, bool reveal);
  */
 void meshcop_summarize(const uint8_t *tlvs, size_t len,
                        char *name, size_t name_cap, int *channel, uint16_t *panid);
+
+/* Why the last meshcop_fetch_dataset() failed, for the result screen. */
+const char *meshcop_last_error(void);

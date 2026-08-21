@@ -77,7 +77,9 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
         /* Backbone is up, so the border router can start and (if credentials
          * are stored) re-attach to its network. Idempotent on reconnects. */
-        thread_start_border_router(s_sta_netif);
+        if (!ui_defer_br_start(s_sta_netif)) {
+            thread_start_border_router(s_sta_netif);   /* headless fallback */
+        }
     }
 }
 
@@ -175,6 +177,7 @@ static int cmd_status(int argc, char **argv)
     }
     printf("ip     : %s\n", s_ip);
     printf("reveal : %s\n", s_reveal ? "on" : "off");
+    printf("fw     : %s\n", FW_VERSION);
     return 0;
 }
 
@@ -244,6 +247,8 @@ static int cmd_thread(int argc, char **argv)
     (void) argc; (void) argv;
     printf("role       : %s\n", thread_role());
     printf("credentials: %s\n", thread_has_dataset() ? "stored" : "none");
+    extern const char *g_br_boot_status;
+    printf("br boot    : %s\n", g_br_boot_status);
     int8_t rssi;
     if (thread_link_rssi(&rssi)) {
         printf("parent rssi: %d dBm\n", rssi);
@@ -320,6 +325,54 @@ static int cmd_name(int argc, char **argv)
     return 0;
 }
 
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
+
+static int cmd_share(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
+        thread_share_stop();
+        printf("ephemeral key stopped\n");
+        return 0;
+    }
+    if (argc >= 2 && strcmp(argv[1], "state") == 0) {
+        printf("share: %s\n", thread_share_state());
+        return 0;
+    }
+    char code[10];
+    esp_err_t err = thread_share_start(code, sizeof(code), 300000);
+    if (err == ESP_ERR_INVALID_STATE) {
+        printf("border router not running yet\n");
+        return 1;
+    }
+    if (err != ESP_OK) {
+        printf("could not start ephemeral key\n");
+        return 1;
+    }
+    printf("ephemeral key: %s  (5 min, single use)\n", code);
+    printf("state: %s\n", thread_share_state());
+    return 0;
+}
+
+static int cmd_newnet(int argc, char **argv)
+{
+    (void) argc; (void) argv;
+    char name[17];
+    int ch = 0;
+    uint16_t pan = 0;
+    if (thread_form_network(name, sizeof(name), &ch, &pan) != ESP_OK) {
+        printf("failed to create network\n");
+        return 1;
+    }
+    printf("forming \"%s\"  ch %d  pan 0x%04x\n", name, ch, pan);
+    for (int i = 0; i < 30 && !thread_attached(); i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    printf("role: %s\n", thread_role());
+    return 0;
+}
+
 static int cmd_batt(int argc, char **argv)
 {
     (void) argc; (void) argv;
@@ -344,6 +397,8 @@ static int cmd_batt(int argc, char **argv)
 static void register_commands(void)
 {
     const esp_console_cmd_t cmds[] = {
+        { .command = "newnet", .help = "form a new Thread network with fresh credentials", .func = cmd_newnet },
+        { .command = "share", .help = "share [stop|state] - ePSKc code so a commissioner can pull our credentials", .func = cmd_share },
         { .command = "batt", .help = "battery %, voltage and charge state", .func = cmd_batt },
         { .command = "name", .help = "name <hostname> - set the mDNS/border-router name", .func = cmd_name },
         { .command = "camtest", .help = "start the camera and try 30 frames", .func = cmd_camtest },
@@ -374,6 +429,7 @@ void app_main(void)
         ESP_LOGW(TAG, "continuing headless - console still works");
     }
     ui_set_status(UI_STATE_BUSY, "Starting...");
+
 
     s_wifi_events = xEventGroupCreate();
     ESP_ERROR_CHECK(esp_netif_init());
@@ -454,6 +510,21 @@ void app_main(void)
     if (cerr != ESP_OK) {
         ESP_LOGE(TAG, "console unavailable (%s) - touch UI still active",
                  esp_err_to_name(cerr));
+    }
+
+    /*
+     * Claim the camera pipeline last, after the console has its 12 KB stack.
+     * The pipeline stays alive for the life of the process anyway (see
+     * qrscan.c), so this only fixes WHEN the DMA buffer is allocated: left
+     * until the first scan, it has to find contiguous internal RAM after the
+     * device has become Thread leader, and that block no longer exists.
+     * Order matters -- claimed before the console, it was the console that
+     * failed to start instead.
+     */
+    if (qrscan_start() == ESP_OK) {
+        qrscan_stop();
+    } else {
+        ESP_LOGW(TAG, "camera unavailable - QR scanning disabled");
     }
 
     ui_set_status(UI_STATE_IDLE, "Ready");

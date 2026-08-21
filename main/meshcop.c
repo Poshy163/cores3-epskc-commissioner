@@ -231,10 +231,24 @@ void meshcop_summarize(const uint8_t *p, size_t len,
     }
 }
 
+/* Last failure, in words the result screen can show. */
+static char s_last_error[64] = "";
+
+static void set_err(const char *fmt, int code)
+{
+    snprintf(s_last_error, sizeof(s_last_error), fmt, (unsigned) -code);
+}
+
+const char *meshcop_last_error(void)
+{
+    return s_last_error;
+}
+
 esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *passcode,
                                 uint8_t *dataset, size_t dataset_cap, size_t *dataset_len)
 {
     int ret;
+    s_last_error[0] = '\0';
     esp_err_t err = ESP_FAIL;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
@@ -262,6 +276,7 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
     ESP_LOGI(TAG, "connecting UDP %s:%s", addr, port_str);
     if ((ret = mbedtls_net_connect(&fd, addr, port_str, MBEDTLS_NET_PROTO_UDP)) != 0) {
         ESP_LOGE(TAG, "net_connect: -0x%04x", (unsigned) -ret);
+        set_err("Could not reach the router (-0x%04x)", ret);
         goto done;
     }
 
@@ -303,14 +318,14 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
             case MBEDTLS_ERR_NET_SEND_FAILED:
             case MBEDTLS_ERR_NET_RECV_FAILED:
             case MBEDTLS_ERR_NET_CONN_RESET:
-                why = "network/transport failure (out of buffers or unreachable)";
+                why = "router unreachable or out of buffers";
                 break;
             case MBEDTLS_ERR_SSL_TIMEOUT:
-                why = "timed out - border agent not responding";
+                why = "timed out, router not responding";
                 break;
             case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
             case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:
-                why = "rejected - wrong passcode or key already used";
+                why = "wrong passcode or key already used";
                 break;
             default:
                 why = "unexpected";
@@ -319,6 +334,7 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
             ESP_LOGE(TAG, "handshake FAILED: -0x%04x (%s); internal heap free %u",
                      (unsigned) -ret, why,
                      (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            snprintf(s_last_error, sizeof(s_last_error), "Handshake failed: %s", why);
             goto done;
         }
     }
@@ -338,11 +354,13 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         size_t n = coap_post(out, URI_PETITION, pl, pn);
         if ((ret = mbedtls_ssl_write(&ssl, out, n)) <= 0) {
             ESP_LOGE(TAG, "petition write: -0x%04x", (unsigned) -ret);
+            set_err("Petition send failed (-0x%04x)", ret);
             goto done;
         }
         ret = read_real_response(&ssl, in, sizeof(in));
         if (ret <= 0) {
             ESP_LOGE(TAG, "petition read failed: -0x%04x", (unsigned) -ret);
+            set_err("No reply to petition (-0x%04x)", ret);
             goto done;
         }
         ESP_LOGI(TAG, "petition accepted (%d bytes)", ret);
@@ -350,11 +368,13 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         n = coap_post(out, URI_ACTIVE_GET, NULL, 0);
         if ((ret = mbedtls_ssl_write(&ssl, out, n)) <= 0) {
             ESP_LOGE(TAG, "active_get write: -0x%04x", (unsigned) -ret);
+            set_err("Dataset request failed (-0x%04x)", ret);
             goto done;
         }
         ret = read_real_response(&ssl, in, sizeof(in));
         if (ret <= 0) {
             ESP_LOGE(TAG, "active_get read: -0x%04x", (unsigned) -ret);
+            set_err("No dataset reply (-0x%04x)", ret);
             goto done;
         }
 
@@ -362,10 +382,12 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         const uint8_t *p = coap_payload(in, (size_t) ret, &plen);
         if (!p || plen == 0) {
             ESP_LOGE(TAG, "no dataset payload in response");
+            snprintf(s_last_error, sizeof(s_last_error), "Router sent no dataset");
             goto done;
         }
         if (plen > dataset_cap) {
             ESP_LOGE(TAG, "dataset too large (%u > %u)", (unsigned) plen, (unsigned) dataset_cap);
+            snprintf(s_last_error, sizeof(s_last_error), "Dataset too large");
             goto done;
         }
         memcpy(dataset, p, plen);

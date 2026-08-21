@@ -1,6 +1,10 @@
 {
   "version": 3,
-  "cmakeMinimumRequired": { "major": 3, "minor": 16, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 16,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "esp32s3",
@@ -14,8 +18,5 @@
         "CMAKE_TOOLCHAIN_FILE": "$env{IDF_PATH}/tools/cmake/toolchain-esp32s3.cmake"
       }
     }
-  ],
-  "buildPresets": [
-    { "name": "esp32s3", "configurePreset": "esp32s3" }
   ]
 }

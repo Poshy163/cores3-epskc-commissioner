@@ -49,13 +49,31 @@ static const char *TAG = "ui";
 #define COL_ERROR   0xF0798F
 
 typedef enum {
-    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_CAMTEST
+    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_CAMTEST,
+    JOB_FORM, JOB_BR_START, JOB_SHARE
 } job_t;
+
+#ifndef FW_VERSION
+#define FW_VERSION "dev"
+#endif
+
+/* Network details / share / dataset-QR screens. */
+static lv_obj_t *panel_net, *panel_share, *panel_dsqr;
+static lv_obj_t *lbl_net_info, *lbl_share_code, *lbl_share_state, *dsqr_widget;
+static char s_share_code[10];
+static int s_share_left_s;
+static bool s_share_active;
+static bool s_dimmed;
+
+/* Backbone netif handed over for JOB_BR_START. */
+static esp_netif_t *s_br_backbone;
 
 /* Signals the console task that the worker has finished the camera selftest. */
 static SemaphoreHandle_t s_camtest_done;
 
 static lv_obj_t *panel_main, *panel_list, *panel_keypad, *panel_result, *panel_qr;
+static void show_panel(lv_obj_t *p);
+static bool confirm_tap(lv_obj_t *btn);
 static lv_obj_t *panel_wifi, *panel_wpass;
 static lv_obj_t *wifi_list_w, *lbl_wifi_hint, *lbl_wpass_ssid, *wpass_ta;
 static wifi_scan_rec_t s_aps[12];
@@ -154,6 +172,19 @@ static void role_timer_cb(lv_timer_t *t)
     if (s_have_net) {
         refresh_network_label();
     }
+
+    /* Backlight: 15% after a minute idle, back to full on any touch. Not
+     * while a share code is showing -- someone is reading it. Dim rather than
+     * off, so the wake-up tap is not blind. */
+    uint32_t idle = lv_display_get_inactive_time(NULL);
+    bool sharing = panel_share && !lv_obj_has_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
+    if (idle > 60000 && !s_dimmed && !sharing) {
+        bsp_display_brightness_set(15);
+        s_dimmed = true;
+    } else if (idle < 60000 && s_dimmed) {
+        bsp_display_brightness_set(100);
+        s_dimmed = false;
+    }
 }
 
 /* Caller must hold the LVGL lock. */
@@ -171,8 +202,15 @@ static void refresh_network_label(void)
         if (thread_link_rssi(&rssi)) {
             snprintf(sig, sizeof(sig), "  %d dBm", rssi);
         }
-        snprintf(buf, sizeof(buf), "%s  ch %d  pan 0x%04x\nthread: %s%s",
-                 s_net_name, s_net_channel, s_net_panid, role, sig);
+        /* As router/leader, how many devices hang off us -- the thing you
+         * actually want to know when validating joins against this network. */
+        char kids[20] = "";
+        if (strcmp(role, "leader") == 0 || strcmp(role, "router") == 0) {
+            int n = thread_child_count();
+            snprintf(kids, sizeof(kids), "  %d device%s", n, n == 1 ? "" : "s");
+        }
+        snprintf(buf, sizeof(buf), "%s  ch %d  pan 0x%04x\nthread: %s%s%s",
+                 s_net_name, s_net_channel, s_net_panid, role, sig, kids);
         lv_obj_set_style_text_color(
             lbl_network,
             lv_color_hex(thread_attached() ? COL_OK : COL_ACCENT), LV_PART_MAIN);
@@ -244,6 +282,9 @@ static void show_panel(lv_obj_t *p)
     lv_obj_add_flag(panel_result, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_wifi, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_wpass, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_net, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
     if (panel_qr) {
         lv_obj_add_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     }
@@ -290,12 +331,122 @@ void ui_forget_network(void)
 
 static void on_forget(lv_event_t *e)
 {
-    (void) e;
+    if (!confirm_tap(lv_event_get_target(e))) {
+        return;
+    }
     thread_forget();
     network_erase_nvs();
     refresh_network_label();
     lv_label_set_text(lbl_status, "Credentials cleared");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    show_panel(panel_main);
+}
+
+/* ---------------- network details / share / dataset QR ---------------- */
+
+static void refresh_net_info(void)
+{
+    char buf[160];
+    if (!s_have_net) {
+        snprintf(buf, sizeof(buf), "No Thread network yet.\n\nScan for a router, or create one.");
+    } else {
+        const char *role = thread_role();
+        int n = thread_child_count();
+        int8_t rssi;
+        char link[24] = "";
+        if (thread_link_rssi(&rssi)) {
+            snprintf(link, sizeof(link), "\nparent link %d dBm", rssi);
+        }
+        snprintf(buf, sizeof(buf), "%s\nchannel %d   pan 0x%04x\nrole: %s   %d device%s%s",
+                 s_net_name, s_net_channel, s_net_panid, role, n, n == 1 ? "" : "s", link);
+    }
+    lv_label_set_text(lbl_net_info, buf);
+}
+
+static void on_net_open(lv_event_t *e)
+{
+    (void) e;
+    refresh_net_info();
+    show_panel(panel_net);
+}
+
+static void on_share_open(lv_event_t *e)
+{
+    (void) e;
+    if (!thread_attached()) {
+        lv_label_set_text(lbl_net_info, "Join or create a network first.");
+        return;
+    }
+    lv_label_set_text(lbl_share_code, "...");
+    lv_label_set_text(lbl_share_state, "Opening...");
+    show_panel(panel_share);
+    job_t j = JOB_SHARE;
+    xQueueSend(s_jobs, &j, 0);
+}
+
+static void on_share_close(lv_event_t *e)
+{
+    (void) e;
+    s_share_active = false;
+    thread_share_stop();
+    show_panel(panel_net);
+}
+
+/* 1 s tick while the share screen is up: state word and countdown. */
+static void share_timer_cb(lv_timer_t *t)
+{
+    (void) t;
+    if (!s_share_active) {
+        return;
+    }
+    const char *st = thread_share_state();
+    if (s_share_left_s > 0) {
+        s_share_left_s--;
+    }
+    char buf[64];
+    if (strcmp(st, "off") == 0) {
+        snprintf(buf, sizeof(buf), "Used or expired - close and share again");
+        s_share_active = false;
+    } else if (strcmp(st, "accepted") == 0) {
+        snprintf(buf, sizeof(buf), "Commissioner accepted - credentials sent");
+    } else if (strcmp(st, "connected") == 0) {
+        snprintf(buf, sizeof(buf), "Commissioner connecting...");
+    } else {
+        snprintf(buf, sizeof(buf), "Waiting for a commissioner   %d:%02d",
+                 s_share_left_s / 60, s_share_left_s % 60);
+    }
+    lv_label_set_text(lbl_share_state, buf);
+}
+
+static void on_dsqr_open(lv_event_t *e)
+{
+    (void) e;
+    char hex[520];
+    if (!thread_dataset_hex(hex, sizeof(hex))) {
+        lv_label_set_text(lbl_net_info, "No dataset stored.");
+        return;
+    }
+    /* Built on demand and torn down on close: the QR widget and its encoder
+     * scratch come out of internal RAM, which this board cannot spare idle. */
+    if (dsqr_widget == NULL) {
+        dsqr_widget = lv_qrcode_create(panel_dsqr);
+        lv_qrcode_set_size(dsqr_widget, 140);
+        lv_qrcode_set_dark_color(dsqr_widget, lv_color_hex(0x000000));
+        lv_qrcode_set_light_color(dsqr_widget, lv_color_hex(0xFFFFFF));
+        lv_obj_align(dsqr_widget, LV_ALIGN_TOP_MID, 0, 2);
+    }
+    lv_qrcode_update(dsqr_widget, hex, strlen(hex));
+    show_panel(panel_dsqr);
+}
+
+static void on_dsqr_close(lv_event_t *e)
+{
+    (void) e;
+    if (dsqr_widget) {
+        lv_obj_delete(dsqr_widget);
+        dsqr_widget = NULL;
+    }
+    show_panel(panel_net);
 }
 
 static void on_scan(lv_event_t *e)
@@ -309,6 +460,64 @@ static void on_scan(lv_event_t *e)
     lv_label_set_text(lbl_status, "Scanning...");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
     job_t j = JOB_SCAN;
+    xQueueSend(s_jobs, &j, 0);
+}
+
+/*
+ * Two-tap confirmation for anything that throws credentials away. First tap
+ * relabels the button "Tap again" for 3 s; a second tap inside that window
+ * returns true. Any other button, or the timeout, disarms it.
+ */
+static lv_obj_t *s_armed;
+static lv_timer_t *s_arm_timer;
+static char s_arm_label[24];
+
+static void disarm(void)
+{
+    if (s_armed) {
+        lv_label_set_text(lv_obj_get_child(s_armed, 0), s_arm_label);
+        s_armed = NULL;
+    }
+    if (s_arm_timer) {
+        lv_timer_delete(s_arm_timer);
+        s_arm_timer = NULL;
+    }
+}
+
+static void disarm_cb(lv_timer_t *t)
+{
+    (void) t;
+    s_arm_timer = NULL;   /* one-shot: LVGL frees it after this returns */
+    if (s_armed) {
+        lv_label_set_text(lv_obj_get_child(s_armed, 0), s_arm_label);
+        s_armed = NULL;
+    }
+}
+
+static bool confirm_tap(lv_obj_t *btn)
+{
+    if (s_armed == btn) {
+        disarm();
+        return true;
+    }
+    disarm();
+    lv_obj_t *l = lv_obj_get_child(btn, 0);
+    snprintf(s_arm_label, sizeof(s_arm_label), "%s", lv_label_get_text(l));
+    lv_label_set_text(l, "Tap again");
+    s_armed = btn;
+    s_arm_timer = lv_timer_create(disarm_cb, 3000, NULL);
+    lv_timer_set_repeat_count(s_arm_timer, 1);
+    return false;
+}
+
+static void on_generate(lv_event_t *e)
+{
+    if (!confirm_tap(lv_event_get_target(e))) {
+        return;
+    }
+    lv_label_set_text(lbl_status, "Creating network...");
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
+    job_t j = JOB_FORM;
     xQueueSend(s_jobs, &j, 0);
 }
 
@@ -503,9 +712,11 @@ static void finish_join(bool ok, const char *name, int channel, uint16_t panid)
     } else {
         lv_label_set_text(lbl_result_title, "Failed");
         lv_obj_set_style_text_color(lbl_result_title, lv_color_hex(COL_ERROR), LV_PART_MAIN);
-        lv_label_set_text(lbl_result_body,
-                          "See serial log for the cause.\n"
-                          "Keys are single-use and expire.");
+        const char *why = meshcop_last_error();
+        char body[160];
+        snprintf(body, sizeof(body), "%s\n\nKeys are single-use and expire.",
+                 why && why[0] ? why : "Unknown error - see serial log.");
+        lv_label_set_text(lbl_result_body, body);
     }
     bsp_display_unlock();
 }
@@ -592,6 +803,56 @@ static void worker(void *arg)
         } else if (job == JOB_CAMTEST) {
             qrscan_selftest();
             xSemaphoreGive(s_camtest_done);
+        } else if (job == JOB_SHARE) {
+            const uint32_t lifetime_ms = 300000;   /* 5 min; spec max is 10 */
+            esp_err_t err = thread_share_start(s_share_code, sizeof(s_share_code), lifetime_ms);
+            bsp_display_lock(0);
+            if (err == ESP_OK) {
+                char spaced[16];
+                snprintf(spaced, sizeof(spaced), "%.3s %.3s %.3s",
+                         s_share_code, s_share_code + 3, s_share_code + 6);
+                lv_label_set_text(lbl_share_code, spaced);
+                s_share_left_s = lifetime_ms / 1000;
+                s_share_active = true;
+                lv_label_set_text(lbl_share_state, "Waiting for a commissioner   5:00");
+            } else {
+                lv_label_set_text(lbl_share_code, "--- --- ---");
+                lv_label_set_text(lbl_share_state,
+                                  err == ESP_ERR_INVALID_STATE ? "Border router not running"
+                                                               : "Could not start ephemeral key");
+            }
+            bsp_display_unlock();
+        } else if (job == JOB_BR_START) {
+            thread_run_border_router_start(s_br_backbone);
+            bsp_display_lock(0);
+            refresh_network_label();
+            bsp_display_unlock();
+        } else if (job == JOB_FORM) {
+            char name[17];
+            int ch = 0;
+            uint16_t pan = 0;
+            esp_err_t err = thread_form_network(name, sizeof(name), &ch, &pan);
+            if (err == ESP_OK) {
+                snprintf(s_net_name, sizeof(s_net_name), "%s", name);
+                s_net_channel = ch;
+                s_net_panid = pan;
+                s_have_net = true;
+                network_save();
+                /* Sole member of a fresh PAN: leader comes quickly. */
+                for (int i = 0; i < 30 && !thread_attached(); i++) {
+                    vTaskDelay(pdMS_TO_TICKS(500));
+                }
+            }
+            bsp_display_lock(0);
+            if (err == ESP_OK) {
+                lv_label_set_text(lbl_status, "Network created");
+                lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_OK), LV_PART_MAIN);
+                refresh_network_label();
+            } else {
+                lv_label_set_text(lbl_status, "Failed to create network");
+                lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+            }
+            bsp_display_unlock();
         } else if (job == JOB_WIFI_SCAN) {
             s_aps_n = app_wifi_scan(s_aps, sizeof(s_aps) / sizeof(s_aps[0]));
             finish_wifi_scan();
@@ -666,14 +927,74 @@ static void build_main(void)
     lbl_network = mk_label(panel_main, &lv_font_montserrat_14, COL_DIM, "no credentials yet");
     lv_obj_align(lbl_network, LV_ALIGN_TOP_MID, 0, 40);
 
-    lv_obj_t *b = mk_button(panel_main, "Scan for routers", on_scan, COL_ACCENT, 240, 52);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -46);
+    /*
+     * 2x2 grid of identical 148x46 buttons, centred: columns sit at +-78 from
+     * the panel's middle (half of 148 + an 8 px gutter). Top row is the two
+     * ways to get credentials -- from an existing router, or minted fresh.
+     */
+    const int bw = 148, bh = 46, col = 78;
+    lv_obj_t *b = mk_button(panel_main, "Scan", on_scan, COL_ACCENT, bw, bh);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, -col, -58);
+    lv_obj_t *g = mk_button(panel_main, "New network", on_generate, COL_OK, bw, bh);
+    lv_obj_align(g, LV_ALIGN_BOTTOM_MID, col, -58);
 
-    lv_obj_t *f = mk_button(panel_main, "Forget network", on_forget, COL_DIM, 178, 34);
-    lv_obj_align(f, LV_ALIGN_BOTTOM_LEFT, 6, -6);
+    /* Details, share, dataset QR and forget all live behind "Network": the
+     * grid has no room for four more buttons, and the destructive one belongs
+     * one tap further away than Scan. */
+    lv_obj_t *f = mk_button(panel_main, "Network", on_net_open, COL_DIM, bw, bh);
+    lv_obj_align(f, LV_ALIGN_BOTTOM_MID, -col, -6);
+    lv_obj_t *w = mk_button(panel_main, "Wi-Fi", on_wifi_open, COL_DIM, bw, bh);
+    lv_obj_align(w, LV_ALIGN_BOTTOM_MID, col, -6);
+}
 
-    lv_obj_t *w = mk_button(panel_main, "Wi-Fi", on_wifi_open, COL_DIM, 110, 34);
-    lv_obj_align(w, LV_ALIGN_BOTTOM_RIGHT, -6, -6);
+static void build_net(void)
+{
+    panel_net = mk_panel();
+
+    lbl_net_info = mk_label(panel_net, &lv_font_montserrat_14, COL_TEXT, "");
+    lv_obj_align(lbl_net_info, LV_ALIGN_TOP_MID, 0, 6);
+
+    const int w = 72, h = 40, y = -6;
+    lv_obj_t *sh = mk_button(panel_net, "Share", on_share_open, COL_OK, w, h);
+    lv_obj_align(sh, LV_ALIGN_BOTTOM_MID, -117, y);
+    lv_obj_t *qr = mk_button(panel_net, "QR", on_dsqr_open, COL_ACCENT, w, h);
+    lv_obj_align(qr, LV_ALIGN_BOTTOM_MID, -39, y);
+    lv_obj_t *fg = mk_button(panel_net, "Forget", on_forget, COL_ERROR, w, h);
+    lv_obj_align(fg, LV_ALIGN_BOTTOM_MID, 39, y);
+    lv_obj_t *bk = mk_button(panel_net, "Back", on_back_main, COL_DIM, w, h);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 117, y);
+}
+
+static void build_share(void)
+{
+    panel_share = mk_panel();
+
+    lv_obj_t *hint = mk_label(panel_share, &lv_font_montserrat_14, COL_DIM,
+                              "Enter this code on the commissioner");
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 8);
+
+    lbl_share_code = mk_label(panel_share, &lv_font_montserrat_20, COL_ACCENT, "");
+    lv_obj_align(lbl_share_code, LV_ALIGN_TOP_MID, 0, 44);
+
+    lbl_share_state = mk_label(panel_share, &lv_font_montserrat_14, COL_TEXT, "");
+    lv_obj_align(lbl_share_state, LV_ALIGN_TOP_MID, 0, 90);
+
+    lv_obj_t *b = mk_button(panel_share, "Close", on_share_close, COL_DIM, 110, 40);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -6);
+
+    lv_timer_create(share_timer_cb, 1000, NULL);
+}
+
+static void build_dsqr(void)
+{
+    panel_dsqr = mk_panel();
+
+    lv_obj_t *hint = mk_label(panel_dsqr, &lv_font_montserrat_14, COL_DIM,
+                              "Dataset TLVs - contains the network key");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    lv_obj_t *b = mk_button(panel_dsqr, "Back", on_dsqr_close, COL_DIM, 110, 40);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -6);
 }
 
 static void build_wifi(void)
@@ -842,6 +1163,13 @@ esp_err_t ui_init(void)
     lbl_wifi = mk_label(scr, &lv_font_montserrat_14, COL_DIM, "wifi: not connected");
     lv_obj_align(lbl_wifi, LV_ALIGN_TOP_MID, 0, 30);
 
+    /* Which build is on the board. Plain label: mk_label would centre it. */
+    lv_obj_t *ver = lv_label_create(scr);
+    lv_obj_set_style_text_font(ver, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ver, lv_color_hex(COL_DIM), LV_PART_MAIN);
+    lv_label_set_text(ver, FW_VERSION);
+    lv_obj_align(ver, LV_ALIGN_TOP_LEFT, 4, 10);
+
     /* Battery drawn as an outline with the percent inside, top-right on the
      * top layer so it rides above every panel. Non-clickable, so touches fall
      * through to whatever is underneath. -8 leaves room for the nub. */
@@ -890,6 +1218,9 @@ esp_err_t ui_init(void)
     build_qr();
     build_wifi();
     build_wpass();
+    build_net();
+    build_share();
+    build_dsqr();
     refresh_network_label();
     lv_timer_create(role_timer_cb, 2000, NULL);
     lv_timer_ready(lv_timer_create(batt_timer_cb, 10000, NULL));
@@ -953,6 +1284,16 @@ void ui_show_dataset(const char *net_name, int channel, uint16_t panid)
 }
 
 void ui_clear_dataset(void) { }
+
+bool ui_defer_br_start(esp_netif_t *backbone)
+{
+    if (!s_ready || s_jobs == NULL || backbone == NULL) {
+        return false;
+    }
+    s_br_backbone = backbone;
+    job_t j = JOB_BR_START;
+    return xQueueSend(s_jobs, &j, 0) == pdTRUE;
+}
 
 bool ui_run_camtest(void)
 {

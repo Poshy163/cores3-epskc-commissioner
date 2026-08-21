@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_netif.h"
 
 typedef enum {
     UI_STATE_IDLE,
@@ -28,6 +29,15 @@ void ui_clear_dataset(void);
  * sized for it. False if the UI (and therefore the worker) never started.
  */
 bool ui_run_camtest(void);
+
+/*
+ * Start the border router on the UI worker instead of a new task. Spawning
+ * an 8 KB task at the got-IP moment fails when internal RAM is fragmented,
+ * and nothing retries, so the device silently never becomes a border router.
+ * Returns false if the UI (and its worker) never started; fall back to
+ * thread_start_border_router() in that case.
+ */
+bool ui_defer_br_start(esp_netif_t *backbone);
 
 /* Drop the remembered network from the screen and NVS. */
 void ui_forget_network(void);
