@@ -120,3 +120,11 @@ const char *thread_share_state_rest(void);   /* disabled|stopped|started|connect
 uint16_t thread_share_port(void);
 /* port 0 lets the stack choose. */
 esp_err_t thread_share_start_on(char *code, size_t cap, uint32_t lifetime_ms, uint16_t port);
+
+/*
+ * Live network identity, straight from the stored Active Dataset. Use this
+ * rather than a cached copy: credentials can change without the UI being
+ * involved at all (a dataset pushed over REST by Home Assistant, or `newnet`
+ * from the console), and a cache silently goes stale.
+ */
+bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *panid);

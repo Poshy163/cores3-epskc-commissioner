@@ -740,3 +740,31 @@ uint16_t thread_share_port(void)
     esp_openthread_lock_release();
     return p;
 }
+
+bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *panid)
+{
+    if (!s_ready) {
+        return false;
+    }
+    otOperationalDataset ds;
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otError err = otDatasetGetActive(esp_openthread_get_instance(), &ds);
+    esp_openthread_lock_release();
+    if (err != OT_ERROR_NONE) {
+        return false;
+    }
+    if (name != NULL && name_len > 0) {
+        if (ds.mComponents.mIsNetworkNamePresent) {
+            snprintf(name, name_len, "%s", ds.mNetworkName.m8);
+        } else {
+            name[0] = '\0';
+        }
+    }
+    if (channel != NULL) {
+        *channel = ds.mComponents.mIsChannelPresent ? ds.mChannel : 0;
+    }
+    if (panid != NULL) {
+        *panid = ds.mComponents.mIsPanIdPresent ? ds.mPanId : 0;
+    }
+    return true;
+}

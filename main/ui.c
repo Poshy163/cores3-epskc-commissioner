@@ -209,9 +209,7 @@ static void batt_timer_cb(lv_timer_t *t)
 static void role_timer_cb(lv_timer_t *t)
 {
     (void) t;
-    if (s_have_net) {
-        refresh_network_label();
-    }
+    refresh_network_label();
 
     thread_apply_router_preference();
 
@@ -245,12 +243,40 @@ static void role_timer_cb(lv_timer_t *t)
     }
 }
 
+/*
+ * Reconcile the cached network identity with what the stack actually holds.
+ *
+ * The cache exists so the screen can show a name before Thread finishes
+ * starting, but credentials change behind its back: Home Assistant pushes a
+ * dataset over REST, or `newnet` runs from the console. Re-reading here keeps
+ * the display honest and re-persists whatever changed.
+ */
+static void sync_network_from_stack(void)
+{
+    char name[17];
+    int ch = 0;
+    uint16_t pan = 0;
+    if (!thread_network_info(name, sizeof(name), &ch, &pan) || name[0] == '\0') {
+        return;
+    }
+    if (strcmp(name, s_net_name) == 0 && ch == s_net_channel && pan == s_net_panid) {
+        return;
+    }
+    snprintf(s_net_name, sizeof(s_net_name), "%s", name);
+    s_net_channel = ch;
+    s_net_panid = pan;
+    s_have_net = true;
+    network_save();
+    ESP_LOGI(TAG, "network changed outside the UI: %s ch %d pan 0x%04x", name, ch, pan);
+}
+
 /* Caller must hold the LVGL lock. */
 static void refresh_network_label(void)
 {
     if (!lbl_network) {
         return;
     }
+    sync_network_from_stack();
     char buf[128];
     if (s_have_net) {
         const char *role = thread_role();
