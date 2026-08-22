@@ -200,6 +200,86 @@ static int cmd_reveal(int argc, char **argv)
     return 0;
 }
 
+/*
+ * Console commands that reach OpenThread's spinel layer, or run the DTLS
+ * handshake, need far more stack than the REPL task has. The join path alone
+ * peaks around 23 KB against a 12 KB console stack, which is a silent overflow
+ * rather than an error. They all run on the 28 KB UI worker instead, the same
+ * way the touch UI and the REST handlers do.
+ */
+struct fetch_args {
+    const char *addr;
+    uint16_t port;
+    const char *passcode;
+    uint8_t *dataset;
+    size_t cap;
+    size_t len;
+    esp_err_t result;
+};
+
+static void do_fetch_dataset(void *arg)
+{
+    struct fetch_args *a = arg;
+    a->result = meshcop_fetch_dataset(a->addr, a->port, a->passcode,
+                                      a->dataset, a->cap, &a->len);
+}
+
+struct tlv_args {
+    const uint8_t *tlvs;
+    size_t len;
+    esp_err_t result;
+};
+
+static void do_thread_join(void *arg)
+{
+    struct tlv_args *a = arg;
+    a->result = thread_join(a->tlvs, a->len);
+}
+
+struct form_args {
+    uint8_t channel;
+    char name[17];
+    int ch;
+    uint16_t pan;
+    esp_err_t result;
+};
+
+static void do_form_network(void *arg)
+{
+    struct form_args *a = arg;
+    a->result = thread_form_network(a->channel, a->name, sizeof(a->name),
+                                    &a->ch, &a->pan);
+}
+
+struct share_args {
+    char code[10];
+    uint32_t lifetime_ms;
+    esp_err_t result;
+};
+
+static void do_share_start(void *arg)
+{
+    struct share_args *a = arg;
+    a->result = thread_share_start(a->code, sizeof(a->code), a->lifetime_ms);
+}
+
+static void do_thread_forget(void *arg)
+{
+    *(esp_err_t *) arg = thread_forget();
+}
+
+/* Falls back to running inline when the worker is unavailable (headless
+ * boot); better a deep call than no call, and the UI is absent anyway. */
+static bool run_off_console(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
+{
+    if (ui_run_on_worker(fn, arg, timeout_ms)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "worker unavailable; running inline on the console stack");
+    fn(arg);
+    return true;
+}
+
 static int cmd_join(int argc, char **argv)
 {
     if (argc != 4) {
@@ -219,8 +299,13 @@ static int cmd_join(int argc, char **argv)
     ui_clear_dataset();
     ui_set_status(UI_STATE_BUSY, "Connecting...");
 
-    esp_err_t err = meshcop_fetch_dataset(argv[1], (uint16_t) atoi(argv[2]), argv[3],
-                                          dataset, sizeof(dataset), &dlen);
+    struct fetch_args fa = {
+        .addr = argv[1], .port = (uint16_t) atoi(argv[2]), .passcode = argv[3],
+        .dataset = dataset, .cap = sizeof(dataset), .result = ESP_FAIL,
+    };
+    run_off_console(do_fetch_dataset, &fa, 60000);
+    esp_err_t err = fa.result;
+    dlen = fa.len;
     if (err != ESP_OK) {
         ui_set_status(UI_STATE_ERROR, "Failed");
         printf("\n>>> FAILED <<<\n");
@@ -239,7 +324,9 @@ static int cmd_join(int argc, char **argv)
     printf(">>> DATASET RETRIEVED <<<\n");
 
     /* Same as the touch flow: apply it and actually attach. */
-    if (thread_join(dataset, dlen) == ESP_OK) {
+    struct tlv_args ja = { .tlvs = dataset, .len = dlen, .result = ESP_FAIL };
+    run_off_console(do_thread_join, &ja, 30000);
+    if (ja.result == ESP_OK) {
         for (int i = 0; i < 40 && !thread_attached(); i++) {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
@@ -267,7 +354,9 @@ static int cmd_thread(int argc, char **argv)
 static int cmd_forget(int argc, char **argv)
 {
     (void) argc; (void) argv;
-    if (thread_forget() != ESP_OK) {
+    esp_err_t ferr = ESP_FAIL;
+    run_off_console(do_thread_forget, &ferr, 30000);
+    if (ferr != ESP_OK) {
         printf("failed to erase\n");
         return 1;
     }
@@ -449,7 +538,12 @@ static int cmd_share(int argc, char **argv)
         return 0;
     }
     char code[10];
-    esp_err_t err = thread_share_start(code, sizeof(code), settings_get()->share_minutes * 60000u);
+    struct share_args sa = {
+        .lifetime_ms = settings_get()->share_minutes * 60000u, .result = ESP_FAIL,
+    };
+    run_off_console(do_share_start, &sa, 30000);
+    esp_err_t err = sa.result;
+    snprintf(code, sizeof(code), "%s", sa.code);
     if (err == ESP_ERR_INVALID_STATE) {
         printf("border router not running yet\n");
         return 1;
@@ -469,10 +563,15 @@ static int cmd_newnet(int argc, char **argv)
     char name[17];
     int ch = 0;
     uint16_t pan = 0;
-    if (thread_form_network(settings_get()->new_net_channel, name, sizeof(name), &ch, &pan) != ESP_OK) {
+    struct form_args na = { .channel = settings_get()->new_net_channel, .result = ESP_FAIL };
+    run_off_console(do_form_network, &na, 40000);
+    if (na.result != ESP_OK) {
         printf("failed to create network\n");
         return 1;
     }
+    snprintf(name, sizeof(name), "%s", na.name);
+    ch = na.ch;
+    pan = na.pan;
     printf("forming \"%s\"  ch %d  pan 0x%04x\n", name, ch, pan);
     for (int i = 0; i < 30 && !thread_attached(); i++) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -599,10 +698,13 @@ void app_main(void)
     esp_console_repl_config_t rcfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     rcfg.prompt = "epskc>";
     rcfg.max_cmdline_length = 256;
-    /* 12 KB: the console `join` still runs a DTLS handshake on this task, but
-     * the touch flow uses the worker task, so this no longer needs 32 KB --
-     * which was large enough to fail allocation once PSRAM shifted the layout. */
-    rcfg.task_stack_size = 12288;
+    /*
+     * 6 KB. Every deep command -- join, newnet, share, forget -- now runs on
+     * the UI worker, so nothing on this task goes anywhere near the DTLS or
+     * spinel paths. The reclaimed internal RAM is what lets the camera find a
+     * contiguous 8 KB DMA buffer.
+     */
+    rcfg.task_stack_size = 6144;
 
     esp_console_dev_usb_serial_jtag_config_t ucfg =
         ESP_CONSOLE_DEV_USB_SERIAL_JTAG_CONFIG_DEFAULT();
