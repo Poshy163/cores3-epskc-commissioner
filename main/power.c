@@ -112,6 +112,31 @@ static const char *charge_detail_str(uint8_t st2)
     }
 }
 
+/*
+ * Open-circuit curve for a single Li-ion cell. Coarse by design: it only has
+ * to stand in while the gauge re-converges, and it is read under light load.
+ */
+static int percent_from_mv(int mv)
+{
+    static const struct { int16_t mv; int8_t pct; } curve[] = {
+        { 4200, 100 }, { 4060, 90 }, { 3980, 80 }, { 3920, 70 },
+        { 3870, 60 },  { 3820, 50 }, { 3790, 40 }, { 3770, 30 },
+        { 3740, 20 },  { 3680, 10 }, { 3450, 5 },  { 3000, 0 },
+    };
+    const size_t n = sizeof(curve) / sizeof(curve[0]);
+    if (mv >= curve[0].mv) {
+        return 100;
+    }
+    for (size_t i = 1; i < n; i++) {
+        if (mv >= curve[i].mv) {
+            int span_mv = curve[i - 1].mv - curve[i].mv;
+            int span_pct = curve[i - 1].pct - curve[i].pct;
+            return curve[i].pct + ((mv - curve[i].mv) * span_pct + span_mv / 2) / span_mv;
+        }
+    }
+    return 0;
+}
+
 esp_err_t power_read(power_status_t *out)
 {
     out->percent = -1;
@@ -120,6 +145,7 @@ esp_err_t power_read(power_status_t *out)
     out->vsys_mv = -1;
     out->pmic_temp_c = INT_MIN;
     out->present = false;
+    out->percent_estimated = false;
     out->charging = false;
     out->full = false;
     out->vbus = false;
@@ -158,8 +184,18 @@ esp_err_t power_read(power_status_t *out)
 
     if (out->present) {
         uint8_t soc = 0;
-        if (reg_read(AXP2101_REG_SOC, &soc) == ESP_OK && soc <= 100) {
+        bool gauge_ok = reg_read(AXP2101_REG_SOC, &soc) == ESP_OK && soc <= 100;
+        if (gauge_ok && soc > 0) {
             out->percent = soc;
+        } else if (out->batt_mv > 0) {
+            /*
+             * Switching the Base DIN battery out and back in restarts the
+             * AXP2101's gauge, which then reports 0 % for several minutes
+             * while it re-converges. A cell sitting at 4 V is plainly not
+             * empty, so read the voltage curve instead of showing 0 %.
+             */
+            out->percent = percent_from_mv(out->batt_mv);
+            out->percent_estimated = true;
         }
     }
     return ESP_OK;

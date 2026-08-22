@@ -23,6 +23,9 @@ typedef struct {
     int  vsys_mv;    /* system rail, -1 if unreadable */
     int  pmic_temp_c;/* PMIC die temperature, INT32_MIN if unreadable */
     bool present;    /* battery detected by the PMIC */
+    bool percent_estimated; /* percent came from the cell voltage because the
+                             * gauge restarted (battery switched out and back
+                             * in) and still reports 0 % */
     bool charging;
     bool full;       /* charger reports charge-done */
     bool vbus;       /* 5V input (USB) present */

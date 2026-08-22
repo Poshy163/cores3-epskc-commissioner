@@ -118,6 +118,21 @@ CONFIG_LV_FONT_MONTSERRAT_16=y
 # QR widget for showing the dataset TLVs on screen.
 CONFIG_LV_USE_QRCODE=y
 
-# LVGL heap stays at the 64 KB default. Tried 40 KB to free internal RAM for
-# the camera's DMA buffer: the UI boot-looped with a white screen, so this UI
-# genuinely needs most of it. Do not lower without watching a real boot.
+# The 64 KB built-in LVGL heap was always marginal: 40 KB boot-looped with a
+# white screen, and 64 KB eventually ran out too (see below). Sizing it is the
+# wrong game, so the allocator itself changed rather than the number.
+
+# LVGL's built-in allocator is a fixed 64 KB array in internal .bss
+# (work_mem_int). Seventeen pre-built panels plus a draw-task descriptor for
+# every label drawn in every refresh slice exhaust it, and LV_ASSERT_MALLOC's
+# default handler is "while(1);" -- so the LVGL task spins forever, starves
+# IDLE0, and the whole UI freezes with the task watchdog firing every 5 s.
+# The C library allocator has no fixed ceiling and hands the 64 KB back to the
+# internal heap that camera DMA and the Thread stack compete for; with
+# SPIRAM_USE_MALLOC it only spills to PSRAM once internal RAM is truly scarce.
+CONFIG_LV_USE_CLIB_MALLOC=y
+
+# That assert logs before halting, but LVGL logging was off, so the failure was
+# silent and looked like a hang with no cause. Warnings and errors only.
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y

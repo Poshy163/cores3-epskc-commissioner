@@ -56,3 +56,10 @@ bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms);
 
 /* Drop the remembered network from the screen and NVS. */
 void ui_forget_network(void);
+
+/*
+ * Smallest number of bytes ever left on the LVGL task stack. A page that
+ * builds large buffers can only be shown to be safe by watching this fall.
+ * 0 if no LVGL callback has run yet.
+ */
+size_t ui_lvgl_stack_free(void);

@@ -154,6 +154,12 @@ static lv_obj_t *btn_home_join;
 static lv_obj_t *btn_net_activity, *btn_net_share, *btn_net_qr, *btn_net_forget;
 static volatile bool s_ui_job_busy;
 
+/* Captured from inside an LVGL callback. The UI runs on the port task,
+ * whose stack is fixed at ESP_LVGL_PORT_INIT_CONFIG() time, so the only
+ * way to see how close a page came to overflowing it is to sample the
+ * high-water mark from a task that is still alive. */
+static TaskHandle_t s_lvgl_task;
+
 /* Battery outline geometry. Interior width = BATT_W minus border and padding
  * on both sides; the fill bar is scaled against it. 62 wide because the worst
  * case, bolt + "100%", is ~48 px at 14 pt and must fit inside the outline. */
@@ -295,7 +301,10 @@ static void batt_timer_cb(lv_timer_t *t)
     /* One gauge sample a minute for the discharge estimate (timer is 10 s). */
     if (++s_sample_tick >= 6) {
         s_sample_tick = 0;
-        power_note_sample(ps.percent, !ps.vbus);
+        /* A voltage estimate swings with load, so it would make the
+         * discharge rate meaningless. Treat it like external power and
+         * hold the history until the gauge is authoritative again. */
+        power_note_sample(ps.percent, !ps.vbus && !ps.percent_estimated);
     }
 
     /* Bolt whenever external power is present, not only while the charger is
@@ -319,6 +328,7 @@ static void batt_timer_cb(lv_timer_t *t)
 static void role_timer_cb(lv_timer_t *t)
 {
     (void) t;
+    s_lvgl_task = xTaskGetCurrentTaskHandle();
     refresh_network_label();
 
     /* Stopping a share is security-sensitive. If the worker queue happened
@@ -1686,8 +1696,9 @@ static void refresh_power_info(void)
         return;
     }
     if (ps.present) {
-        appendf(buf, sizeof(buf), &n, "Battery  %d%%   %d.%02d V   %s\n",
-                ps.percent, ps.batt_mv / 1000, (ps.batt_mv % 1000) / 10, ps.charge_detail);
+        appendf(buf, sizeof(buf), &n, "Battery  %d%%%s   %d.%02d V   %s\n",
+                ps.percent, ps.percent_estimated ? " est" : "",
+                ps.batt_mv / 1000, (ps.batt_mv % 1000) / 10, ps.charge_detail);
     } else {
         appendf(buf, sizeof(buf), &n, "Battery  not connected (switch on Base DIN)\n");
     }
@@ -2694,4 +2705,9 @@ bool ui_run_camtest(void)
     /* The selftest captures 40 frames with a decode attempt on each, so it can
      * legitimately take tens of seconds. */
     return xSemaphoreTake(s_camtest_done, pdMS_TO_TICKS(120000)) == pdTRUE;
+}
+
+size_t ui_lvgl_stack_free(void)
+{
+    return s_lvgl_task ? uxTaskGetStackHighWaterMark(s_lvgl_task) : 0;
 }

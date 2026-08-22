@@ -334,6 +334,7 @@ static int cmd_status(int argc, char **argv)
     }
     printf("ip     : %s\n", s_ip);
     printf("ipv6   : %s\n", s_ip6);
+    printf("lvgl st: %u bytes free (min)\n", (unsigned) ui_lvgl_stack_free());
     printf("reveal : %s\n", s_reveal ? "on" : "off");
     printf("fw     : %s\n", FW_VERSION);
     return 0;
@@ -762,7 +763,8 @@ static int cmd_power(int argc, char **argv)
         printf("PMIC unreachable\n");
         return 1;
     }
-    printf("battery  : %d%%  %d mV  %s%s\n", ps.percent, ps.batt_mv,
+    printf("battery  : %d%%%s  %d mV  %s%s\n",
+           ps.percent, ps.percent_estimated ? " est" : "", ps.batt_mv,
            ps.present ? "" : "(not detected) ", ps.charge_detail);
     printf("vbus     : %s  %d mV\n", ps.vbus ? "present" : "absent", ps.vbus_mv);
     printf("vsys     : %d mV\n", ps.vsys_mv);
