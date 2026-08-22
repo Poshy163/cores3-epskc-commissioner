@@ -34,6 +34,7 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "mdns.h"
 
 static const char *TAG = "ui";
@@ -63,26 +64,66 @@ static const char *TAG = "ui";
 #define COL_ERROR   0xF0798F
 
 typedef enum {
-    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_CAMTEST,
-    JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_CALL
+    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE, JOB_CAMTEST,
+    JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_SHARE_STOP, JOB_FORGET,
+    JOB_FACTORY_RESET, JOB_CALL
 } job_t;
 
-/* JOB_CALL payload; one at a time, guarded by s_call_busy. */
-static ui_worker_fn s_call_fn;
-static void *s_call_arg;
+/*
+ * Queue complete, immutable requests rather than a bare enum that reads
+ * mutable globals later. Besides making rapid taps deterministic, this keeps
+ * REST/console calls paired with the exact function and argument they queued.
+ */
+typedef struct {
+    job_t type;
+    union {
+        struct {
+            ba_entry_t target;
+            char code[10];
+        } join;
+        struct {
+            char ssid[33];
+            char pass[65];
+            bool had_previous;
+        } wifi_join;
+        struct {
+            uint8_t channel;
+        } form;
+        struct {
+            uint32_t lifetime_ms;
+            uint32_t request_id;
+        } share;
+        struct {
+            uint32_t request_id;
+        } share_stop;
+        struct {
+            esp_netif_t *backbone;
+        } br_start;
+        struct {
+            ui_worker_fn fn;
+            void *arg;
+        } call;
+    } data;
+} ui_job_msg_t;
+
+/* JOB_CALL is serialised because callers wait on one reusable completion. */
 static SemaphoreHandle_t s_call_done;
-static volatile bool s_call_busy;
+static SemaphoreHandle_t s_call_lock;
 
 #ifndef FW_VERSION
 #define FW_VERSION "dev"
 #endif
 
-/* Network details / share / dataset-QR screens. */
-static lv_obj_t *panel_net, *panel_share, *panel_dsqr;
-static lv_obj_t *lbl_net_info, *lbl_share_code, *lbl_share_state, *dsqr_widget;
+/* Network details / live activity / share / dataset-QR screens. */
+static lv_obj_t *panel_net, *panel_activity, *panel_share, *panel_dsqr;
+static lv_obj_t *lbl_net_info, *lbl_activity_info, *lbl_share_code, *lbl_share_state,
+                *dsqr_widget;
+static lv_obj_t *btn_activity_refresh;
 static char s_share_code[10];
 static int s_share_left_s;
 static bool s_share_active;
+static volatile uint32_t s_share_request_id;
+static volatile bool s_share_stop_pending;
 /* Settings screens. */
 static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *panel_name, *panel_about;
 static lv_obj_t *lbl_power_info, *lbl_about_info, *name_ta;
@@ -92,25 +133,26 @@ static int s_sample_tick;          /* batt timer ticks since last gauge sample *
 static bool s_on_external_power;   /* latest VBUS reading, for keep-awake */
 static char s_ip_str[16] = "-";
 
-/* Backbone netif handed over for JOB_BR_START. */
-static esp_netif_t *s_br_backbone;
-
 /* Signals the console task that the worker has finished the camera selftest. */
 static SemaphoreHandle_t s_camtest_done;
+static QueueHandle_t s_jobs;
 
 static lv_obj_t *panel_main, *panel_list, *panel_keypad, *panel_result, *panel_qr;
 static void show_panel(lv_obj_t *p);
 static bool confirm_tap(lv_obj_t *btn);
+static void on_wifi_open(lv_event_t *e);
 static lv_obj_t *panel_wifi, *panel_wpass;
 static lv_obj_t *wifi_list_w, *lbl_wifi_hint, *lbl_wpass_ssid, *wpass_ta;
 static wifi_scan_rec_t s_aps[12];
 static int s_aps_n;
 static char s_join_ssid[33];
-static char s_join_pass[65];
-static lv_obj_t *lbl_wifi, *lbl_status, *lbl_list_hint, *lbl_code, *lbl_target;
+static lv_obj_t *lbl_title, *lbl_wifi, *lbl_status, *lbl_list_hint, *lbl_code, *lbl_target;
 static lv_obj_t *lbl_result_title, *lbl_result_body, *ba_list;
 static lv_obj_t *qr_canvas, *lbl_qr_hint, *lbl_network;
 static lv_obj_t *batt_body, *batt_fill, *batt_nub, *lbl_batt;
+static lv_obj_t *btn_home_join;
+static lv_obj_t *btn_net_activity, *btn_net_share, *btn_net_qr, *btn_net_forget;
+static volatile bool s_ui_job_busy;
 
 /* Battery outline geometry. Interior width = BATT_W minus border and padding
  * on both sides; the fill bar is scaled against it. 62 wide because the worst
@@ -127,6 +169,19 @@ static char s_net_name[17];
 static int s_net_channel;
 static uint16_t s_net_panid;
 static bool s_have_net;
+
+#define ACTIVITY_SAMPLE_COUNT 31
+typedef struct {
+    uint64_t at_ms;
+    uint32_t tx;
+    uint32_t rx;
+} activity_sample_t;
+
+static thread_activity_t s_activity;
+static bool s_activity_valid;
+static activity_sample_t s_activity_samples[ACTIVITY_SAMPLE_COUNT];
+static size_t s_activity_sample_count;
+static uint64_t s_activity_last_sample_ms;
 
 static void network_save(void)
 {
@@ -159,9 +214,64 @@ static void network_load(void)
 }
 
 static void refresh_network_label(void);
+static void refresh_thread_activity(void);
 static void refresh_power_info(void);
 static void refresh_about_info(void);
 static void on_wake(lv_event_t *e);
+static void network_erase_nvs(void);
+
+static void activity_history_reset(void)
+{
+    s_activity_sample_count = 0;
+    s_activity_last_sample_ms = 0;
+}
+
+/* Take at most one counter sample per role-timer interval. Multiple screen
+ * redraws can still reuse the newest coherent attachment snapshot. */
+static bool sample_thread_activity(void)
+{
+    thread_activity_t next;
+    if (!thread_activity_get(&next)) {
+        s_activity_valid = false;
+        return false;
+    }
+
+    if (s_activity_valid && s_activity.attached != next.attached) {
+        activity_history_reset();
+    }
+    s_activity = next;
+    s_activity_valid = true;
+
+    uint64_t now_ms = (uint64_t) esp_timer_get_time() / 1000;
+    if (s_activity_last_sample_ms != 0 && now_ms - s_activity_last_sample_ms < 1500) {
+        return true;
+    }
+
+    if (s_activity_sample_count != 0) {
+        const activity_sample_t *last = &s_activity_samples[s_activity_sample_count - 1];
+        if (next.mac_tx_total < last->tx || next.mac_rx_total < last->rx) {
+            activity_history_reset();
+        }
+    }
+    if (s_activity_sample_count == ACTIVITY_SAMPLE_COUNT) {
+        memmove(&s_activity_samples[0], &s_activity_samples[1],
+                sizeof(s_activity_samples[0]) * (ACTIVITY_SAMPLE_COUNT - 1));
+        s_activity_sample_count--;
+    }
+    s_activity_samples[s_activity_sample_count++] = (activity_sample_t) {
+        .at_ms = now_ms,
+        .tx = next.mac_tx_total,
+        .rx = next.mac_rx_total,
+    };
+    while (s_activity_sample_count > 1 &&
+           now_ms - s_activity_samples[0].at_ms > 60000) {
+        memmove(&s_activity_samples[0], &s_activity_samples[1],
+                sizeof(s_activity_samples[0]) * (s_activity_sample_count - 1));
+        s_activity_sample_count--;
+    }
+    s_activity_last_sample_ms = now_ms;
+    return true;
+}
 
 /* Runs on the LVGL task. The battery lives on the Base DIN behind its power
  * switch, so the PMIC may legitimately see no battery at all -- hide the
@@ -211,6 +321,19 @@ static void role_timer_cb(lv_timer_t *t)
     (void) t;
     refresh_network_label();
 
+    /* Stopping a share is security-sensitive. If the worker queue happened
+     * to be full when Close was tapped, keep retrying until the stop request
+     * is accepted rather than leaving a hidden key active. */
+    if (s_share_stop_pending && s_jobs) {
+        ui_job_msg_t stop = {
+            .type = JOB_SHARE_STOP,
+            .data.share_stop.request_id = s_share_request_id,
+        };
+        if (xQueueSend(s_jobs, &stop, 0) == pdTRUE) {
+            s_share_stop_pending = false;
+        }
+    }
+
     thread_apply_router_preference();
 
     /* Live pages refresh while visible. */
@@ -220,6 +343,9 @@ static void role_timer_cb(lv_timer_t *t)
     if (panel_about && !lv_obj_has_flag(panel_about, LV_OBJ_FLAG_HIDDEN)) {
         refresh_about_info();
     }
+    if (panel_activity && !lv_obj_has_flag(panel_activity, LV_OBJ_FLAG_HIDDEN)) {
+        refresh_thread_activity();
+    }
 
     /*
      * Screen sleep: backlight off after the configured idle time, and a
@@ -228,8 +354,11 @@ static void role_timer_cb(lv_timer_t *t)
      */
     uint32_t timeout = settings_sleep_ms[settings_get()->sleep_idx];
     bool sharing = panel_share && !lv_obj_has_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
+    bool showing_secret = panel_dsqr && !lv_obj_has_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
+    bool camera_open = panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     bool held_awake = settings_get()->keep_awake_powered && s_on_external_power;
-    if (timeout && !s_asleep && !sharing && !held_awake &&
+    if (timeout && !s_asleep && !sharing && !showing_secret && !camera_open &&
+        !s_ui_job_busy && !held_awake &&
         lv_display_get_inactive_time(NULL) > timeout) {
         s_sleep_shield = lv_obj_create(lv_layer_top());
         lv_obj_set_size(s_sleep_shield, LV_PCT(100), LV_PCT(100));
@@ -257,11 +386,19 @@ static void sync_network_from_stack(void)
     int ch = 0;
     uint16_t pan = 0;
     if (!thread_network_info(name, sizeof(name), &ch, &pan) || name[0] == '\0') {
+        /* Before thread_init() the NVS summary is our only boot-time status.
+         * Once the stack is live, however, absence is authoritative and a
+         * stale card would be actively misleading. */
+        if (thread_available() && s_have_net) {
+            network_erase_nvs();
+            ESP_LOGW(TAG, "cleared stale cached network summary");
+        }
         return;
     }
     if (strcmp(name, s_net_name) == 0 && ch == s_net_channel && pan == s_net_panid) {
         return;
     }
+    activity_history_reset();
     snprintf(s_net_name, sizeof(s_net_name), "%s", name);
     s_net_channel = ch;
     s_net_panid = pan;
@@ -277,29 +414,37 @@ static void refresh_network_label(void)
         return;
     }
     sync_network_from_stack();
+    sample_thread_activity();
     char buf[128];
     if (s_have_net) {
-        const char *role = thread_role();
-        /* Parent link strength, when there is a parent to measure. */
-        char sig[20] = "";
-        int8_t rssi;
-        if (thread_link_rssi(&rssi)) {
-            snprintf(sig, sizeof(sig), "  %d dBm", rssi);
+        char status[72];
+        if (!s_activity_valid) {
+            snprintf(status, sizeof(status), "Thread stack unavailable");
+        } else if (s_activity.parent_valid) {
+            if (s_activity.parent_rssi_valid) {
+                snprintf(status, sizeof(status), "%s | %d dBm | %u routers known",
+                         s_activity.role, s_activity.parent_rssi,
+                         s_activity.known_routers);
+            } else {
+                snprintf(status, sizeof(status), "%s | signal pending | %u routers",
+                         s_activity.role, s_activity.known_routers);
+            }
+        } else if (s_activity.direct_children_valid) {
+            snprintf(status, sizeof(status), "%s | %u direct | %u routers known",
+                     s_activity.role, s_activity.direct_children,
+                     s_activity.known_routers);
+        } else {
+            snprintf(status, sizeof(status), "%s | not attached",
+                     s_activity.role);
         }
-        /* As router/leader, how many devices hang off us -- the thing you
-         * actually want to know when validating joins against this network. */
-        char kids[20] = "";
-        if (strcmp(role, "leader") == 0 || strcmp(role, "router") == 0) {
-            int n = thread_child_count();
-            snprintf(kids, sizeof(kids), "  %d device%s", n, n == 1 ? "" : "s");
-        }
-        snprintf(buf, sizeof(buf), "%s  ch %d  pan 0x%04x\nthread: %s%s%s",
-                 s_net_name, s_net_channel, s_net_panid, role, sig, kids);
+        snprintf(buf, sizeof(buf), "%s | ch %d | PAN %04X\n%s",
+                 s_net_name, s_net_channel, s_net_panid, status);
         lv_obj_set_style_text_color(
             lbl_network,
-            lv_color_hex(thread_attached() ? COL_OK : COL_ACCENT), LV_PART_MAIN);
+            lv_color_hex(s_activity_valid && s_activity.attached ? COL_OK : COL_ACCENT),
+            LV_PART_MAIN);
     } else {
-        snprintf(buf, sizeof(buf), "no credentials yet");
+        snprintf(buf, sizeof(buf), "No Thread network\nJoin existing or create a new network");
         lv_obj_set_style_text_color(lbl_network, lv_color_hex(COL_DIM), LV_PART_MAIN);
     }
     lv_label_set_text(lbl_network, buf);
@@ -309,7 +454,6 @@ static ba_entry_t s_found[BA_MAX];
 static int s_found_n;
 static ba_entry_t s_target;
 static char s_code[10];
-static QueueHandle_t s_jobs;
 static bool s_ready;
 static bool s_have_wifi;
 
@@ -347,14 +491,40 @@ static lv_obj_t *mk_button(lv_obj_t *p, const char *txt, lv_event_cb_t cb,
     lv_obj_t *b = lv_button_create(p);
     lv_obj_set_size(b, w, h);
     lv_obj_set_style_bg_color(b, lv_color_hex(col), LV_PART_MAIN);
-    lv_obj_set_style_radius(b, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(b, 8, LV_PART_MAIN);
+    lv_obj_set_style_border_width(b, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(b, lv_color_hex(col), LV_PART_MAIN);
+    lv_obj_set_style_opa(b, LV_OPA_70, LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_opa(b, LV_OPA_40, LV_PART_MAIN | LV_STATE_DISABLED);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *l = lv_label_create(b);
     lv_label_set_text(l, txt);
     lv_obj_set_style_text_color(l, lv_color_hex(0x101410), LV_PART_MAIN);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_center(l);
     return b;
+}
+
+static void refresh_header_title(lv_obj_t *p)
+{
+    const char *title = "Thread Commissioner";
+    if (p == panel_list)          title = "Join a network";
+    else if (p == panel_keypad)   title = "Enter share code";
+    else if (p == panel_result)   title = "Commissioning";
+    else if (p == panel_qr)       title = "Scan share code";
+    else if (p == panel_wifi)     title = "Wi-Fi networks";
+    else if (p == panel_wpass)    title = "Wi-Fi password";
+    else if (p == panel_net)      title = "Thread network";
+    else if (p == panel_activity) title = "Thread activity";
+    else if (p == panel_share)    title = "Share credentials";
+    else if (p == panel_dsqr)     title = "Dataset QR";
+    else if (p == panel_settings) title = "Settings";
+    else if (p == panel_screen)   title = "Display";
+    else if (p == panel_power)    title = "Power";
+    else if (p == panel_tset)     title = "Thread & REST";
+    else if (p == panel_name)     title = "Device name";
+    else if (p == panel_about)    title = "Diagnostics";
+    lv_label_set_text(lbl_title, title);
 }
 
 /* Caller must already hold the LVGL lock. */
@@ -367,6 +537,7 @@ static void show_panel(lv_obj_t *p)
     lv_obj_add_flag(panel_wifi, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_wpass, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_net, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(panel_activity, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_settings, LV_OBJ_FLAG_HIDDEN);
@@ -379,6 +550,32 @@ static void show_panel(lv_obj_t *p)
         lv_obj_add_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     }
     lv_obj_clear_flag(p, LV_OBJ_FLAG_HIDDEN);
+    refresh_header_title(p);
+}
+
+/* UI operations are intentionally one-at-a-time. This keeps action state
+ * truthful and stops repeat taps from filling the worker queue. Internal
+ * control-plane jobs (BR start and REST/console calls) still use the same
+ * worker, but carry their own immutable queue records. */
+static bool queue_ui_job(const ui_job_msg_t *msg)
+{
+    if (s_ui_job_busy || s_jobs == NULL) {
+        return false;
+    }
+    s_ui_job_busy = true;
+    if (xQueueSend(s_jobs, msg, 0) != pdTRUE) {
+        s_ui_job_busy = false;
+        return false;
+    }
+    return true;
+}
+
+static bool is_ui_job(job_t type)
+{
+    return type == JOB_SCAN || type == JOB_JOIN || type == JOB_QR ||
+           type == JOB_WIFI_SCAN || type == JOB_WIFI_JOIN || type == JOB_WIFI_LEAVE ||
+           type == JOB_FORM ||
+           type == JOB_SHARE || type == JOB_FORGET || type == JOB_FACTORY_RESET;
 }
 
 /* Caller must hold the LVGL lock. Refreshes the on-screen passcode field. */
@@ -407,15 +604,18 @@ static void network_erase_nvs(void)
     s_net_channel = 0;
     s_net_panid = 0;
     s_have_net = false;
+    activity_history_reset();
 }
 
 void ui_forget_network(void)
 {
-    network_erase_nvs();
     if (s_ready) {
         bsp_display_lock(0);
+        network_erase_nvs();
         refresh_network_label();
         bsp_display_unlock();
+    } else {
+        network_erase_nvs();
     }
 }
 
@@ -424,33 +624,237 @@ static void on_forget(lv_event_t *e)
     if (!confirm_tap(lv_event_get_target(e))) {
         return;
     }
-    thread_forget();
-    network_erase_nvs();
-    refresh_network_label();
-    lv_label_set_text(lbl_status, "Credentials cleared");
-    lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_TEXT), LV_PART_MAIN);
+    ui_job_msg_t msg = { .type = JOB_FORGET };
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_net_info, "Another operation is still running.");
+        return;
+    }
+    lv_label_set_text(lbl_status, "Forgetting network...");
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
     show_panel(panel_main);
 }
 
 /* ---------------- network details / share / dataset QR ---------------- */
 
+static void format_duration(uint32_t seconds, char *out, size_t cap)
+{
+    if (seconds >= 86400) {
+        snprintf(out, cap, "%lud", (unsigned long) (seconds / 86400));
+    } else if (seconds >= 3600) {
+        snprintf(out, cap, "%luh", (unsigned long) (seconds / 3600));
+    } else if (seconds >= 60) {
+        snprintf(out, cap, "%lum", (unsigned long) (seconds / 60));
+    } else {
+        snprintf(out, cap, "%lus", (unsigned long) seconds);
+    }
+}
+
+/* Bounded-width counter values keep the six-line activity card stable even if
+ * the stack has been up for months or counters are unusually busy. */
+static void format_count(uint32_t value, char *out, size_t cap)
+{
+    if (value >= 10000000) {
+        snprintf(out, cap, ">9M");
+    } else if (value >= 1000000) {
+        snprintf(out, cap, "%lu.%luM", (unsigned long) (value / 1000000),
+                 (unsigned long) ((value % 1000000) / 100000));
+    } else if (value >= 10000) {
+        snprintf(out, cap, "%luk", (unsigned long) (value / 1000));
+    } else if (value >= 1000) {
+        snprintf(out, cap, "%lu.%luk", (unsigned long) (value / 1000),
+                 (unsigned long) ((value % 1000) / 100));
+    } else {
+        snprintf(out, cap, "%lu", (unsigned long) value);
+    }
+}
+
+static uint32_t counter_delta(uint32_t newer, uint32_t older)
+{
+    return newer >= older ? newer - older : 0;
+}
+
+static void refresh_thread_activity(void)
+{
+    if (lbl_activity_info == NULL) {
+        return;
+    }
+
+    char line1[64], line2[72], line3[64], line4[72], line5[80], line6[64];
+    if (s_activity_valid) {
+        char duration[16];
+        format_duration(s_activity.attach_duration_s, duration, sizeof(duration));
+        if (s_activity.attached) {
+            snprintf(line1, sizeof(line1), "Attached: %s | %s", s_activity.role, duration);
+        } else {
+            snprintf(line1, sizeof(line1), "Status: %s | not attached", s_activity.role);
+        }
+
+        if (s_activity.parent_valid) {
+            if (s_activity.parent_rssi_valid) {
+                snprintf(line2, sizeof(line2), "Parent: 0x%04X | %d dBm | LQI %u",
+                         s_activity.parent_rloc16, s_activity.parent_rssi,
+                         s_activity.parent_lqi);
+            } else {
+                snprintf(line2, sizeof(line2), "Parent: 0x%04X | signal pending | LQI %u",
+                         s_activity.parent_rloc16, s_activity.parent_lqi);
+            }
+        } else if (s_activity.direct_children_valid) {
+            snprintf(line2, sizeof(line2), "Direct children: %u", s_activity.direct_children);
+        } else {
+            snprintf(line2, sizeof(line2), "Parent/direct children: unavailable");
+        }
+        snprintf(line3, sizeof(line3), "Local table: %u routers", s_activity.known_routers);
+    } else {
+        snprintf(line1, sizeof(line1), "Status: Thread stack unavailable");
+        snprintf(line2, sizeof(line2), "Parent/direct children: unavailable");
+        snprintf(line3, sizeof(line3), "Local table: unavailable");
+    }
+
+    thread_topology_t topology;
+    thread_topology_get(&topology);
+    uint32_t devices_seen = (uint32_t) topology.routers_seen + topology.children_seen;
+    switch (topology.status) {
+    case THREAD_TOPOLOGY_SCANNING:
+        snprintf(line4, sizeof(line4), "Mesh seen: scanning...");
+        snprintf(line6, sizeof(line6), "Topology: waiting for replies");
+        break;
+    case THREAD_TOPOLOGY_COMPLETE:
+    case THREAD_TOPOLOGY_PARTIAL: {
+        snprintf(line4, sizeof(line4), "%s: %lu devices | %uR %uC",
+                 topology.status == THREAD_TOPOLOGY_COMPLETE ? "Mesh seen" : "Seen partial",
+                 (unsigned long) devices_seen, topology.routers_seen, topology.children_seen);
+        uint64_t now_ms = (uint64_t) esp_timer_get_time() / 1000;
+        uint32_t age_s = now_ms >= topology.completed_at_ms
+                             ? (uint32_t) ((now_ms - topology.completed_at_ms) / 1000)
+                             : 0;
+        char age[16];
+        format_duration(age_s, age, sizeof(age));
+        snprintf(line6, sizeof(line6), "Topology: %s | %s ago",
+                 topology.status == THREAD_TOPOLOGY_COMPLETE ? "complete" : "partial", age);
+        break;
+    }
+    case THREAD_TOPOLOGY_FAILED:
+        snprintf(line4, sizeof(line4), "Mesh seen: unavailable");
+        snprintf(line6, sizeof(line6), "Topology: try Refresh mesh");
+        break;
+    case THREAD_TOPOLOGY_NEVER:
+    default:
+        snprintf(line4, sizeof(line4), "Mesh seen: not scanned");
+        snprintf(line6, sizeof(line6), "Topology: tap Refresh mesh");
+        break;
+    }
+
+    if (s_activity_sample_count >= 2) {
+        const activity_sample_t *first = &s_activity_samples[0];
+        const activity_sample_t *last = &s_activity_samples[s_activity_sample_count - 1];
+        uint32_t window_s = (uint32_t) ((last->at_ms - first->at_ms) / 1000);
+        uint32_t tx = counter_delta(last->tx, first->tx);
+        uint32_t rx = counter_delta(last->rx, first->rx);
+        char tx_text[8], rx_text[8];
+        format_count(tx, tx_text, sizeof(tx_text));
+        format_count(rx, rx_text, sizeof(rx_text));
+        snprintf(line5, sizeof(line5), "Frames/%lus: TX %s RX %s",
+                 (unsigned long) window_s, tx_text, rx_text);
+    } else {
+        snprintf(line5, sizeof(line5), "Traffic: collecting a recent sample");
+    }
+
+    lv_label_set_text_fmt(lbl_activity_info, "%s\n%s\n%s\n%s\n%s\n%s",
+                          line1, line2, line3, line4, line5, line6);
+    lv_obj_set_style_text_color(lbl_activity_info,
+                                lv_color_hex(s_activity_valid && s_activity.attached
+                                                 ? COL_OK : COL_ACCENT),
+                                LV_PART_MAIN);
+    if (topology.status == THREAD_TOPOLOGY_SCANNING) {
+        lv_obj_add_state(btn_activity_refresh, LV_STATE_DISABLED);
+    } else {
+        lv_obj_clear_state(btn_activity_refresh, LV_STATE_DISABLED);
+    }
+}
+
 static void refresh_net_info(void)
 {
-    char buf[160];
+    char buf[224];
+    sync_network_from_stack();
+    sample_thread_activity();
     if (!s_have_net) {
         snprintf(buf, sizeof(buf), "No Thread network yet.\n\nScan for a router, or create one.");
+    } else if (!s_activity_valid) {
+        snprintf(buf, sizeof(buf), "%s\nchannel %d   pan 0x%04x\nThread stack unavailable",
+                 s_net_name, s_net_channel, s_net_panid);
     } else {
-        const char *role = thread_role();
-        int n = thread_child_count();
-        int8_t rssi;
-        char link[24] = "";
-        if (thread_link_rssi(&rssi)) {
-            snprintf(link, sizeof(link), "\nparent link %d dBm", rssi);
+        char duration[16];
+        format_duration(s_activity.attach_duration_s, duration, sizeof(duration));
+        if (s_activity.parent_valid) {
+            if (s_activity.parent_rssi_valid) {
+                snprintf(buf, sizeof(buf),
+                         "%s\nchannel %d   pan 0x%04x\nrole: %s | attached %s\n"
+                         "parent 0x%04x | %d dBm | LQI %u",
+                         s_net_name, s_net_channel, s_net_panid, s_activity.role, duration,
+                         s_activity.parent_rloc16, s_activity.parent_rssi,
+                         s_activity.parent_lqi);
+            } else {
+                snprintf(buf, sizeof(buf),
+                         "%s\nchannel %d   pan 0x%04x\nrole: %s | attached %s\n"
+                         "parent 0x%04x | signal pending",
+                         s_net_name, s_net_channel, s_net_panid, s_activity.role, duration,
+                         s_activity.parent_rloc16);
+            }
+        } else if (s_activity.direct_children_valid) {
+            snprintf(buf, sizeof(buf),
+                     "%s\nchannel %d   pan 0x%04x\nrole: %s | attached %s\n"
+                     "%u direct children | %u routers known",
+                     s_net_name, s_net_channel, s_net_panid, s_activity.role, duration,
+                     s_activity.direct_children, s_activity.known_routers);
+        } else {
+            snprintf(buf, sizeof(buf),
+                     "%s\nchannel %d   pan 0x%04x\nrole: %s | not attached\n"
+                     "%u routers known",
+                     s_net_name, s_net_channel, s_net_panid, s_activity.role,
+                     s_activity.known_routers);
         }
-        snprintf(buf, sizeof(buf), "%s\nchannel %d   pan 0x%04x\nrole: %s   %d device%s%s",
-                 s_net_name, s_net_channel, s_net_panid, role, n, n == 1 ? "" : "s", link);
     }
     lv_label_set_text(lbl_net_info, buf);
+
+    bool have_dataset = thread_has_dataset();
+    if (thread_available()) {
+        lv_obj_clear_state(btn_net_activity, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(btn_net_activity, LV_STATE_DISABLED);
+    }
+    if (s_activity_valid && s_activity.attached) {
+        lv_obj_clear_state(btn_net_share, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(btn_net_share, LV_STATE_DISABLED);
+    }
+    if (have_dataset) {
+        lv_obj_clear_state(btn_net_qr, LV_STATE_DISABLED);
+        lv_obj_clear_state(btn_net_forget, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(btn_net_qr, LV_STATE_DISABLED);
+        lv_obj_add_state(btn_net_forget, LV_STATE_DISABLED);
+    }
+}
+
+static void on_activity_refresh(lv_event_t *e)
+{
+    (void) e;
+    thread_topology_refresh();
+    refresh_thread_activity();
+}
+
+static void on_activity_open(lv_event_t *e)
+{
+    (void) e;
+    sample_thread_activity();
+    thread_topology_t topology;
+    thread_topology_get(&topology);
+    if (topology.status == THREAD_TOPOLOGY_NEVER && s_activity_valid &&
+        s_activity.attached) {
+        thread_topology_refresh();
+    }
+    refresh_thread_activity();
+    show_panel(panel_activity);
 }
 
 static void on_net_open(lv_event_t *e)
@@ -460,25 +864,70 @@ static void on_net_open(lv_event_t *e)
     show_panel(panel_net);
 }
 
-static void on_share_open(lv_event_t *e)
+static bool begin_share(void)
 {
-    (void) e;
     if (!thread_attached()) {
         lv_label_set_text(lbl_net_info, "Join or create a network first.");
-        return;
+        return false;
     }
+    if (s_ui_job_busy || s_jobs == NULL) {
+        lv_label_set_text(lbl_share_code, "--- --- ---");
+        lv_label_set_text(lbl_share_state, "Device busy - try again in a moment");
+        show_panel(panel_share);
+        return false;
+    }
+    /* Publish the generation before enqueueing because the worker can preempt
+     * immediately after xQueueSend(). Restore it if the send fails; no other
+     * UI job can be in flight while s_ui_job_busy is clear. */
+    uint32_t previous_id = s_share_request_id;
+    bool previous_stop_pending = s_share_stop_pending;
+    uint32_t request_id = previous_id + 1;
+    s_share_request_id = request_id;
+    s_share_stop_pending = false;
+    ui_job_msg_t msg = {
+        .type = JOB_SHARE,
+        .data.share = {
+            .lifetime_ms = settings_get()->share_minutes * 60000u,
+            .request_id = request_id,
+        },
+    };
     lv_label_set_text(lbl_share_code, "...");
     lv_label_set_text(lbl_share_state, "Opening...");
     show_panel(panel_share);
-    job_t j = JOB_SHARE;
-    xQueueSend(s_jobs, &j, 0);
+    if (!queue_ui_job(&msg)) {
+        s_share_request_id = previous_id;
+        s_share_stop_pending = previous_stop_pending;
+        lv_label_set_text(lbl_share_code, "--- --- ---");
+        lv_label_set_text(lbl_share_state, "Device busy - try again in a moment");
+        return false;
+    }
+    return true;
+}
+
+static void on_share_open(lv_event_t *e)
+{
+    (void) e;
+    begin_share();
+}
+
+static void on_share_retry(lv_event_t *e)
+{
+    (void) e;
+    begin_share();
 }
 
 static void on_share_close(lv_event_t *e)
 {
     (void) e;
     s_share_active = false;
-    thread_share_stop();
+    ++s_share_request_id;   /* invalidates a start that is still in flight */
+    ui_job_msg_t stop = {
+        .type = JOB_SHARE_STOP,
+        .data.share_stop.request_id = s_share_request_id,
+    };
+    if (s_jobs == NULL || xQueueSend(s_jobs, &stop, 0) != pdTRUE) {
+        s_share_stop_pending = true;
+    }
     show_panel(panel_net);
 }
 
@@ -523,7 +972,7 @@ static void on_dsqr_open(lv_event_t *e)
         lv_qrcode_set_size(dsqr_widget, 140);
         lv_qrcode_set_dark_color(dsqr_widget, lv_color_hex(0x000000));
         lv_qrcode_set_light_color(dsqr_widget, lv_color_hex(0xFFFFFF));
-        lv_obj_align(dsqr_widget, LV_ALIGN_TOP_MID, 0, 2);
+        lv_obj_align(dsqr_widget, LV_ALIGN_TOP_LEFT, 2, 2);
     }
     lv_qrcode_update(dsqr_widget, hex, strlen(hex));
     show_panel(panel_dsqr);
@@ -543,14 +992,21 @@ static void on_scan(lv_event_t *e)
 {
     (void) e;
     if (!s_have_wifi) {
-        lv_label_set_text(lbl_status, "No Wi-Fi yet");
+        on_wifi_open(e);
+        return;
+    }
+    ui_job_msg_t msg = { .type = JOB_SCAN };
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_status, "Device busy - try again");
         lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
         return;
     }
-    lv_label_set_text(lbl_status, "Scanning...");
+    lv_label_set_text(lbl_status, "Finding border routers...");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
-    job_t j = JOB_SCAN;
-    xQueueSend(s_jobs, &j, 0);
+    lv_obj_add_flag(ba_list, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(lbl_list_hint, "Scanning for active share codes...");
+    lv_obj_clear_flag(lbl_list_hint, LV_OBJ_FLAG_HIDDEN);
+    show_panel(panel_list);
 }
 
 /*
@@ -605,10 +1061,17 @@ static void on_generate(lv_event_t *e)
     if (!confirm_tap(lv_event_get_target(e))) {
         return;
     }
+    ui_job_msg_t msg = {
+        .type = JOB_FORM,
+        .data.form.channel = settings_get()->new_net_channel,
+    };
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_status, "Device busy - try again");
+        lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+        return;
+    }
     lv_label_set_text(lbl_status, "Creating network...");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
-    job_t j = JOB_FORM;
-    xQueueSend(s_jobs, &j, 0);
 }
 
 static void on_pick(lv_event_t *e)
@@ -650,12 +1113,22 @@ static void on_keypad(lv_event_t *e)
         }
     } else if (strcmp(txt, LV_SYMBOL_OK) == 0) {
         if (len == 9) {
-            job_t j = JOB_JOIN;
-            lv_label_set_text(lbl_result_title, "Connecting...");
+            ui_job_msg_t msg = { .type = JOB_JOIN };
+            msg.data.join.target = s_target;
+            snprintf(msg.data.join.code, sizeof(msg.data.join.code), "%s", s_code);
+            if (!queue_ui_job(&msg)) {
+                lv_label_set_text(lbl_target, "Device busy - try again shortly");
+                return;
+            }
+            lv_label_set_text(lbl_result_title, "Authenticating...");
             lv_obj_set_style_text_color(lbl_result_title, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
-            lv_label_set_text(lbl_result_body, s_target.name);
+            if (s_have_net) {
+                lv_label_set_text_fmt(lbl_result_body, "%s\nWill replace %s", s_target.name,
+                                      s_net_name);
+            } else {
+                lv_label_set_text(lbl_result_body, s_target.name);
+            }
             show_panel(panel_result);
-            xQueueSend(s_jobs, &j, 0);
         }
         return;
     } else if (len < 9 && txt[0] >= '0' && txt[0] <= '9') {
@@ -675,17 +1148,25 @@ static void on_wifi_open(lv_event_t *e)
     lv_label_set_text(lbl_wifi_hint, "Scanning...");
     lv_obj_clear_flag(lbl_wifi_hint, LV_OBJ_FLAG_HIDDEN);
     show_panel(panel_wifi);
-    job_t j = JOB_WIFI_SCAN;
-    xQueueSend(s_jobs, &j, 0);
+    ui_job_msg_t msg = { .type = JOB_WIFI_SCAN };
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_wifi_hint, "Device busy - try Rescan shortly");
+    }
 }
 
 static void on_wifi_leave(lv_event_t *e)
 {
-    (void) e;
-    app_wifi_leave();   /* quick: config write + disconnect, safe from here */
-    lv_label_set_text(lbl_wifi_hint, "Left the network.\nCredentials erased.");
+    if (!confirm_tap(lv_event_get_target(e))) {
+        return;
+    }
+    ui_job_msg_t msg = { .type = JOB_WIFI_LEAVE };
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_wifi_hint, "Device busy - try Leave again shortly");
+        lv_obj_clear_flag(lbl_wifi_hint, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_label_set_text(lbl_wifi_hint, "Leaving Wi-Fi...");
     lv_obj_clear_flag(lbl_wifi_hint, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(wifi_list_w, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void on_wifi_pick(lv_event_t *e)
@@ -710,12 +1191,24 @@ static void on_wpass_kb(lv_event_t *e)
     if (code != LV_EVENT_READY) {
         return;
     }
-    snprintf(s_join_pass, sizeof(s_join_pass), "%s", lv_textarea_get_text(wpass_ta));
+    ui_job_msg_t msg = { .type = JOB_WIFI_JOIN };
+    snprintf(msg.data.wifi_join.ssid, sizeof(msg.data.wifi_join.ssid), "%s", s_join_ssid);
+    snprintf(msg.data.wifi_join.pass, sizeof(msg.data.wifi_join.pass), "%s",
+             lv_textarea_get_text(wpass_ta));
+    msg.data.wifi_join.had_previous = s_have_wifi;
+    if (!queue_ui_job(&msg)) {
+        lv_label_set_text(lbl_wpass_ssid, "Device busy - try again shortly");
+        return;
+    }
     lv_label_set_text(lbl_status, "Connecting to Wi-Fi...");
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
     show_panel(panel_main);
-    job_t j = JOB_WIFI_JOIN;
-    xQueueSend(s_jobs, &j, 0);
+}
+
+static void on_back_list(lv_event_t *e)
+{
+    (void) e;
+    show_panel(panel_list);
 }
 
 static void on_qr_open(lv_event_t *e)
@@ -723,9 +1216,16 @@ static void on_qr_open(lv_event_t *e)
     (void) e;
     s_qr_abort = false;
     lv_label_set_text(lbl_qr_hint, "Point at the QR code");
+    ui_job_msg_t msg = { .type = JOB_QR };
+    if (!queue_ui_job(&msg)) {
+        if (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) {
+            lv_label_set_text(lbl_qr_hint, "Scanner is finishing - try again shortly");
+        } else {
+            lv_label_set_text(lbl_target, "Device busy - try QR again shortly");
+        }
+        return;
+    }
     show_panel(panel_qr);
-    job_t j = JOB_QR;
-    xQueueSend(s_jobs, &j, 0);
 }
 
 static void on_qr_cancel(lv_event_t *e)
@@ -756,12 +1256,18 @@ static void finish_scan(void)
             char row[80];
             snprintf(row, sizeof(row), "%s  (%s)", s_found[i].name, s_found[i].ip);
             lv_obj_t *b = lv_list_add_button(ba_list, LV_SYMBOL_WIFI, row);
+            lv_obj_set_height(b, 40);
             lv_obj_set_style_text_color(b, lv_color_hex(COL_TEXT), LV_PART_MAIN);
             lv_obj_set_style_bg_color(b, lv_color_hex(COL_PANEL), LV_PART_MAIN);
             lv_obj_add_event_cb(b, on_pick, LV_EVENT_CLICKED, (void *) (intptr_t) i);
         }
     }
-    show_panel(panel_list);
+    /* A scan starts on this panel so its progress is visible. If the user has
+     * since tapped Back, refresh the hidden results without dragging them
+     * away from the screen they deliberately chose. */
+    if (!lv_obj_has_flag(panel_list, LV_OBJ_FLAG_HIDDEN)) {
+        show_panel(panel_list);
+    }
     bsp_display_unlock();
 }
 
@@ -781,6 +1287,7 @@ static void finish_wifi_scan(void)
             snprintf(row, sizeof(row), "%s  (%d)", s_aps[i].ssid, s_aps[i].rssi);
             lv_obj_t *b = lv_list_add_button(
                 wifi_list_w, s_aps[i].secured ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_WIFI, row);
+            lv_obj_set_height(b, 40);
             lv_obj_set_style_text_color(b, lv_color_hex(COL_TEXT), LV_PART_MAIN);
             lv_obj_set_style_bg_color(b, lv_color_hex(COL_PANEL), LV_PART_MAIN);
             lv_obj_add_event_cb(b, on_wifi_pick, LV_EVENT_CLICKED, (void *) (intptr_t) i);
@@ -789,26 +1296,37 @@ static void finish_wifi_scan(void)
     bsp_display_unlock();
 }
 
-static void finish_join(bool ok, const char *name, int channel, uint16_t panid)
+static void set_result(uint32_t colour, const char *title, const char *body)
 {
     bsp_display_lock(0);
+    lv_label_set_text(lbl_result_title, title);
+    lv_obj_set_style_text_color(lbl_result_title, lv_color_hex(colour), LV_PART_MAIN);
+    lv_label_set_text(lbl_result_body, body);
+    bsp_display_unlock();
+}
+
+static void finish_join(bool ok, const char *name, int channel, uint16_t panid)
+{
+    char body[176];
     if (ok) {
-        lv_label_set_text(lbl_result_title, "Credentials received");
-        lv_obj_set_style_text_color(lbl_result_title, lv_color_hex(COL_OK), LV_PART_MAIN);
-        char body[128];
         snprintf(body, sizeof(body), "%s\nchannel %d   pan 0x%04x",
                  name && name[0] ? name : "(unnamed)", channel, panid);
-        lv_label_set_text(lbl_result_body, body);
-    } else {
-        lv_label_set_text(lbl_result_title, "Failed");
-        lv_obj_set_style_text_color(lbl_result_title, lv_color_hex(COL_ERROR), LV_PART_MAIN);
-        const char *why = meshcop_last_error();
-        char body[160];
-        snprintf(body, sizeof(body), "%s\n\nKeys are single-use and expire.",
-                 why && why[0] ? why : "Unknown error - see serial log.");
-        lv_label_set_text(lbl_result_body, body);
+        set_result(COL_OK, "Credentials received", body);
+        return;
     }
-    bsp_display_unlock();
+    const char *why = meshcop_last_error();
+    snprintf(body, sizeof(body), "%s\n\nThe code may be used or expired.",
+             why && why[0] ? why : "Unknown error - see Diagnostics.");
+    set_result(COL_ERROR, "Authentication failed", body);
+}
+
+static void set_join_stage(uint32_t colour, const char *title, const char *name,
+                           int channel, uint16_t panid, const char *detail)
+{
+    char body[192];
+    snprintf(body, sizeof(body), "%s\nchannel %d   pan 0x%04x\n\n%s",
+             name && name[0] ? name : "(unnamed)", channel, panid, detail);
+    set_result(colour, title, body);
 }
 
 /*
@@ -882,22 +1400,31 @@ static void worker(void *arg)
 {
     (void) arg;
     static uint8_t dataset[512];
-    job_t job;
+    ui_job_msg_t msg;
 
     for (;;) {
-        if (xQueueReceive(s_jobs, &job, portMAX_DELAY) != pdTRUE) {
+        if (xQueueReceive(s_jobs, &msg, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        job_t job = msg.type;
         if (job == JOB_QR) {
             run_qr_job();
         } else if (job == JOB_CAMTEST) {
             qrscan_selftest();
             xSemaphoreGive(s_camtest_done);
         } else if (job == JOB_SHARE) {
-            const uint32_t lifetime_ms = settings_get()->share_minutes * 60000u;
+            const uint32_t lifetime_ms = msg.data.share.lifetime_ms;
+            /* Retry means replace the previous one-shot key. */
+            thread_share_stop();
             esp_err_t err = thread_share_start(s_share_code, sizeof(s_share_code), lifetime_ms);
+            bool cancelled = msg.data.share.request_id != s_share_request_id;
+            if (cancelled && err == ESP_OK) {
+                thread_share_stop();
+            }
             bsp_display_lock(0);
-            if (err == ESP_OK) {
+            if (cancelled) {
+                s_share_active = false;
+            } else if (err == ESP_OK) {
                 char spaced[16];
                 snprintf(spaced, sizeof(spaced), "%.3s %.3s %.3s",
                          s_share_code, s_share_code + 3, s_share_code + 6);
@@ -905,7 +1432,7 @@ static void worker(void *arg)
                 s_share_left_s = lifetime_ms / 1000;
                 s_share_active = true;
                 lv_label_set_text_fmt(lbl_share_state, "Waiting for a commissioner   %d:00",
-                                      (int) settings_get()->share_minutes);
+                                      (int) (lifetime_ms / 60000u));
             } else {
                 lv_label_set_text(lbl_share_code, "--- --- ---");
                 lv_label_set_text(lbl_share_state,
@@ -913,13 +1440,19 @@ static void worker(void *arg)
                                                                : "Could not start ephemeral key");
             }
             bsp_display_unlock();
+        } else if (job == JOB_SHARE_STOP) {
+            /* A delayed Close must not stop a newer, explicitly opened key. */
+            if (msg.data.share_stop.request_id == s_share_request_id) {
+                thread_share_stop();
+                s_share_active = false;
+            }
         } else if (job == JOB_CALL) {
-            if (s_call_fn) {
-                s_call_fn(s_call_arg);
+            if (msg.data.call.fn) {
+                msg.data.call.fn(msg.data.call.arg);
             }
             xSemaphoreGive(s_call_done);
         } else if (job == JOB_BR_START) {
-            thread_run_border_router_start(s_br_backbone);
+            thread_run_border_router_start(msg.data.br_start.backbone);
             bsp_display_lock(0);
             refresh_network_label();
             bsp_display_unlock();
@@ -927,7 +1460,8 @@ static void worker(void *arg)
             char name[17];
             int ch = 0;
             uint16_t pan = 0;
-            esp_err_t err = thread_form_network(settings_get()->new_net_channel, name, sizeof(name), &ch, &pan);
+            esp_err_t err = thread_form_network(msg.data.form.channel, name, sizeof(name),
+                                                &ch, &pan);
             if (err == ESP_OK) {
                 snprintf(s_net_name, sizeof(s_net_name), "%s", name);
                 s_net_channel = ch;
@@ -941,8 +1475,12 @@ static void worker(void *arg)
             }
             bsp_display_lock(0);
             if (err == ESP_OK) {
-                lv_label_set_text(lbl_status, "Network created");
-                lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_OK), LV_PART_MAIN);
+                bool attached = thread_attached();
+                lv_label_set_text(lbl_status, attached ? "Network ready"
+                                                       : "Network created - attaching...");
+                lv_obj_set_style_text_color(lbl_status,
+                                            lv_color_hex(attached ? COL_OK : COL_ACCENT),
+                                            LV_PART_MAIN);
                 refresh_network_label();
             } else {
                 lv_label_set_text(lbl_status, "Failed to create network");
@@ -953,22 +1491,56 @@ static void worker(void *arg)
             s_aps_n = app_wifi_scan(s_aps, sizeof(s_aps) / sizeof(s_aps[0]));
             finish_wifi_scan();
         } else if (job == JOB_WIFI_JOIN) {
-            bool ok = app_wifi_join(s_join_ssid, s_join_pass, 20000) == ESP_OK;
+            bool ok = app_wifi_join(msg.data.wifi_join.ssid, msg.data.wifi_join.pass,
+                                    20000) == ESP_OK;
             bsp_display_lock(0);
             if (ok) {
                 lv_label_set_text(lbl_status, "Wi-Fi connected");
                 lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_OK), LV_PART_MAIN);
             } else {
-                lv_label_set_text(lbl_status, "Wi-Fi failed - check password");
+                lv_label_set_text(lbl_status, msg.data.wifi_join.had_previous
+                                              ? "Wi-Fi failed - previous network restored"
+                                              : "Wi-Fi failed - check password");
                 lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+            }
+            bsp_display_unlock();
+        } else if (job == JOB_WIFI_LEAVE) {
+            esp_err_t err = app_wifi_leave();
+            bsp_display_lock(0);
+            lv_label_set_text(lbl_wifi_hint, err == ESP_OK
+                                               ? "Left the network.\nCredentials erased."
+                                               : "Could not erase credentials - try again.");
+            lv_obj_set_style_text_color(lbl_wifi_hint,
+                                        lv_color_hex(err == ESP_OK ? COL_OK : COL_ERROR),
+                                        LV_PART_MAIN);
+            lv_obj_clear_flag(lbl_wifi_hint, LV_OBJ_FLAG_HIDDEN);
+            if (err == ESP_OK) {
+                lv_obj_add_flag(wifi_list_w, LV_OBJ_FLAG_HIDDEN);
             }
             bsp_display_unlock();
         } else if (job == JOB_SCAN) {
             s_found_n = discover_border_agents(s_found, BA_MAX, 3000);
             finish_scan();
-        } else {
+        } else if (job == JOB_FORGET) {
+            esp_err_t err = thread_forget();
+            bsp_display_lock(0);
+            if (err == ESP_OK) {
+                network_erase_nvs();
+                refresh_network_label();
+                lv_label_set_text(lbl_status, "Thread network forgotten");
+                lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_OK), LV_PART_MAIN);
+            } else {
+                lv_label_set_text(lbl_status, "Could not forget network");
+                lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+            }
+            bsp_display_unlock();
+        } else if (job == JOB_FACTORY_RESET) {
+            app_factory_reset();   /* reboots; does not normally return */
+        } else if (job == JOB_JOIN) {
             size_t dlen = 0;
-            esp_err_t err = meshcop_fetch_dataset(s_target.ip, s_target.port, s_code,
+            const ba_entry_t *target = &msg.data.join.target;
+            esp_err_t err = meshcop_fetch_dataset(target->ip, target->port,
+                                                  msg.data.join.code,
                                                   dataset, sizeof(dataset), &dlen);
             /* Watermark right after the handshake: this is the deepest the
              * worker stack ever gets, and a reset here looks like a UI bug. */
@@ -979,18 +1551,21 @@ static void worker(void *arg)
                 int ch = 0;
                 uint16_t pan = 0;
                 meshcop_summarize(dataset, dlen, name, sizeof(name), &ch, &pan);
-                finish_join(true, name, ch, pan);
+                set_join_stage(COL_ACCENT, "Credentials received", name, ch, pan,
+                               "Applying the dataset...");
                 printf("\n--- ACTIVE OPERATIONAL DATASET (%u bytes) ---\n", (unsigned) dlen);
                 meshcop_print_tlvs(dataset, dlen, false);
 
-                /* Remember it, then actually attach to that network. */
-                snprintf(s_net_name, sizeof(s_net_name), "%s", name);
-                s_net_channel = ch;
-                s_net_panid = pan;
-                s_have_net = true;
-                network_save();
-
-                if (thread_join(dataset, dlen) == ESP_OK) {
+                esp_err_t join_err = thread_join(dataset, dlen);
+                if (join_err == ESP_OK) {
+                    /* Cache only after OpenThread accepted the dataset. */
+                    snprintf(s_net_name, sizeof(s_net_name), "%s", name);
+                    s_net_channel = ch;
+                    s_net_panid = pan;
+                    s_have_net = true;
+                    network_save();
+                    set_join_stage(COL_ACCENT, "Dataset applied", name, ch, pan,
+                                   "Attaching to the Thread mesh...");
                     /* Attaching to an established mesh can take the better part
                      * of a minute after a fresh erase. The periodic UI timer
                      * keeps updating after this loop gives up, so a slow attach
@@ -999,6 +1574,18 @@ static void worker(void *arg)
                         vTaskDelay(pdMS_TO_TICKS(500));
                     }
                     ESP_LOGI(TAG, "thread role: %s", thread_role());
+                    if (thread_attached()) {
+                        char detail[64];
+                        snprintf(detail, sizeof(detail), "Attached as %s.", thread_role());
+                        set_join_stage(COL_OK, "Thread network joined", name, ch, pan,
+                                       detail);
+                    } else {
+                        set_join_stage(COL_ACCENT, "Credentials saved", name, ch, pan,
+                                       "Still attaching. Check Network or Diagnostics.");
+                    }
+                } else {
+                    set_join_stage(COL_ERROR, "Could not apply dataset", name, ch, pan,
+                                   "OpenThread rejected the new dataset.");
                 }
                 bsp_display_lock(0);
                 refresh_network_label();
@@ -1006,6 +1593,11 @@ static void worker(void *arg)
             } else {
                 finish_join(false, NULL, 0, 0);
             }
+        } else {
+            ESP_LOGW(TAG, "unknown worker job %d", (int) job);
+        }
+        if (is_ui_job(job)) {
+            s_ui_job_busy = false;
         }
     }
 }
@@ -1142,25 +1734,34 @@ static void on_prefer_router(lv_event_t *e)
 
 static void on_rest_api(lv_event_t *e)
 {
-    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (!otbr_rest_request_running(on)) {
+        if (on) {
+            lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        }
+        return;
+    }
     settings_get()->rest_api = on;
     settings_save();
-    if (on) {
-        otbr_rest_start();
-    } else {
-        otbr_rest_stop();
-    }
 }
 
 static void on_rest_epskc(lv_event_t *e)
 {
-    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (!otbr_rest_request_epskc(on)) {
+        if (on) {
+            lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        }
+        return;
+    }
     settings_get()->rest_epskc = on;
     settings_save();
-    /* Turning it on also enables the stack feature, so a client can activate
-     * a key without anyone pressing Share first. */
-    thread_epskc_set_feature_enabled(on);
-    otbr_rest_set_epskc(on);
 }
 
 static void on_channel_choice(lv_event_t *e)
@@ -1244,21 +1845,47 @@ static void refresh_about_info(void)
     uint8_t mac[6] = { 0 };
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     int64_t up = esp_timer_get_time() / 1000000;
-    char buf[320];
-    snprintf(buf, sizeof(buf),
-             "Firmware   %s\n"
-             "ESP-IDF    %s\n"
-             "IP         %s\n"
-             "MAC        %02x:%02x:%02x:%02x:%02x:%02x\n"
-             "Uptime     %lldh %02lldm %02llds\n"
-             "Last reset %s\n"
-             "Free RAM   %u KB internal, %u KB PSRAM",
-             FW_VERSION, esp_get_idf_version(), s_ip_str,
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-             (long long) (up / 3600), (long long) ((up / 60) % 60), (long long) (up % 60),
-             reset_reason_str(),
-             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
-             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    char buf[640];
+    size_t n = 0;
+    wifi_ap_record_t ap;
+    bool wifi_ok = esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+
+    appendf(buf, sizeof(buf), &n, "Wi-Fi     %s\n", wifi_ok ? (char *) ap.ssid : "not connected");
+    if (wifi_ok) {
+        appendf(buf, sizeof(buf), &n, "Signal    %d dBm   channel %u\n", ap.rssi, ap.primary);
+    }
+    appendf(buf, sizeof(buf), &n, "Address   %s\n", s_ip_str);
+    appendf(buf, sizeof(buf), &n, "Thread    %s   %s\n", thread_role(),
+            thread_has_dataset() ? "dataset stored" : "no dataset");
+    if (s_have_net) {
+        appendf(buf, sizeof(buf), &n, "Network   %s   ch %d   PAN %04X\n",
+                s_net_name, s_net_channel, s_net_panid);
+    }
+    appendf(buf, sizeof(buf), &n, "BR start  %s\n", thread_border_router_status());
+    appendf(buf, sizeof(buf), &n, "REST      %s",
+            otbr_rest_running() ? "running on :8081" : "stopped");
+    if (settings_get()->rest_epskc) {
+        appendf(buf, sizeof(buf), &n, "   ePSKc on");
+    }
+    appendf(buf, sizeof(buf), &n, "\n");
+    if (otbr_rest_running()) {
+        appendf(buf, sizeof(buf), &n, "           trusted LAN only (no authentication)\n");
+    }
+    appendf(buf, sizeof(buf), &n,
+            "\nFirmware   %s\n"
+            "ESP-IDF    %s\n"
+            "MAC        %02x:%02x:%02x:%02x:%02x:%02x\n"
+            "Uptime     %lldh %02lldm %02llds\n"
+            "Last reset %s\n"
+            "RAM        %u KB free, %u KB largest\n"
+            "PSRAM      %u KB free",
+            FW_VERSION, esp_get_idf_version(),
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+            (long long) (up / 3600), (long long) ((up / 60) % 60),
+            (long long) (up % 60), reset_reason_str(),
+            (unsigned) (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+            (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
+            (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     lv_label_set_text(lbl_about_info, buf);
 }
 
@@ -1281,9 +1908,16 @@ static void on_reboot(lv_event_t *e)
 
 static void on_factory_reset(lv_event_t *e)
 {
-    if (confirm_tap(lv_event_get_target(e))) {
-        app_factory_reset();
+    if (!confirm_tap(lv_event_get_target(e))) {
+        return;
     }
+    ui_job_msg_t msg = { .type = JOB_FACTORY_RESET };
+    if (!queue_ui_job(&msg)) {
+        return;
+    }
+    lv_label_set_text(lbl_status, "Factory reset...");
+    lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+    show_panel(panel_main);
 }
 
 /* ---------------- construction ---------------- */
@@ -1292,12 +1926,24 @@ static void build_main(void)
 {
     panel_main = mk_panel();
 
-    lbl_status = mk_label(panel_main, &lv_font_montserrat_20, COL_TEXT, "Starting...");
-    lv_obj_align(lbl_status, LV_ALIGN_TOP_MID, 0, 8);
+    lbl_status = mk_label(panel_main, &lv_font_montserrat_16, COL_TEXT, "Starting...");
+    lv_obj_set_width(lbl_status, BSP_LCD_H_RES - 20);
+    lv_label_set_long_mode(lbl_status, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(lbl_status, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_status, LV_ALIGN_TOP_LEFT, 8, 2);
 
-    /* Persisted Thread network, so the device is useful at a glance. */
+    /* A compact live network card: identity on line one, attachment health on
+     * line two. It remains useful as a status surface between operations. */
     lbl_network = mk_label(panel_main, &lv_font_montserrat_14, COL_DIM, "no credentials yet");
-    lv_obj_align(lbl_network, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(lbl_network, BSP_LCD_H_RES - 12, 52);
+    lv_obj_set_style_bg_color(lbl_network, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lbl_network, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(lbl_network, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(lbl_network, lv_color_hex(0x30382D), LV_PART_MAIN);
+    lv_obj_set_style_radius(lbl_network, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(lbl_network, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lbl_network, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_network, LV_ALIGN_TOP_MID, 0, 26);
 
     /*
      * 2x2 grid of identical 148x46 buttons, centred: columns sit at +-78 from
@@ -1305,15 +1951,15 @@ static void build_main(void)
      * ways to get credentials -- from an existing router, or minted fresh.
      */
     const int bw = 148, bh = 46, col = 78;
-    lv_obj_t *b = mk_button(panel_main, "Scan", on_scan, COL_ACCENT, bw, bh);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, -col, -58);
-    lv_obj_t *g = mk_button(panel_main, "New network", on_generate, COL_OK, bw, bh);
+    btn_home_join = mk_button(panel_main, "Join existing", on_scan, COL_ACCENT, bw, bh);
+    lv_obj_align(btn_home_join, LV_ALIGN_BOTTOM_MID, -col, -58);
+    lv_obj_t *g = mk_button(panel_main, "Create network", on_generate, COL_OK, bw, bh);
     lv_obj_align(g, LV_ALIGN_BOTTOM_MID, col, -58);
 
     /* Details, share, dataset QR and forget all live behind "Network": the
      * grid has no room for four more buttons, and the destructive one belongs
      * one tap further away than Scan. */
-    lv_obj_t *f = mk_button(panel_main, "Network", on_net_open, COL_DIM, bw, bh);
+    lv_obj_t *f = mk_button(panel_main, "Manage network", on_net_open, COL_DIM, bw, bh);
     lv_obj_align(f, LV_ALIGN_BOTTOM_MID, -col, -6);
     lv_obj_t *w = mk_button(panel_main, "Settings", on_settings_open, COL_DIM, bw, bh);
     lv_obj_align(w, LV_ALIGN_BOTTOM_MID, col, -6);
@@ -1323,6 +1969,7 @@ static lv_obj_t *settings_row(lv_obj_t *list, const char *txt, lv_event_cb_t cb)
 {
     /* No icon: confirm_tap() relabels child 0, which must be the text. */
     lv_obj_t *b = lv_list_add_button(list, NULL, txt);
+    lv_obj_set_height(b, 40);
     lv_obj_set_style_text_color(b, lv_color_hex(COL_TEXT), LV_PART_MAIN);
     lv_obj_set_style_bg_color(b, lv_color_hex(COL_PANEL), LV_PART_MAIN);
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
@@ -1343,7 +1990,7 @@ static lv_obj_t *settings_row(lv_obj_t *list, const char *txt, lv_event_cb_t cb)
 static lv_obj_t *mk_content(lv_obj_t *panel, bool flex)
 {
     lv_obj_t *box = lv_obj_create(panel);
-    lv_obj_set_size(box, BSP_LCD_H_RES - 12, UI_PANEL_H - UI_BACK_STRIP);
+    lv_obj_set_size(box, BSP_LCD_H_RES - 12, UI_PANEL_H - UI_BACK_STRIP - 6);
     lv_obj_align(box, LV_ALIGN_TOP_MID, 0, 2);
     lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(box, 0, LV_PART_MAIN);
@@ -1400,6 +2047,10 @@ static lv_obj_t *mk_roller(lv_obj_t *row, const char *opts, lv_event_cb_t cb)
 {
     lv_obj_t *r = lv_roller_create(row);
     lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+    /* The default theme uses a 16 px line gap, making a two-row roller 68 px
+     * tall. Tighten it before sizing so the resulting 56 px control fits the
+     * 62 px row without clipping. */
+    lv_obj_set_style_text_line_space(r, 10, LV_PART_MAIN);
     lv_roller_set_visible_row_count(r, 2);
     lv_obj_set_width(r, 118);
     lv_obj_set_style_bg_color(r, lv_color_hex(COL_PANEL), LV_PART_MAIN);
@@ -1414,6 +2065,8 @@ static lv_obj_t *mk_switch(lv_obj_t *row, bool on, lv_event_cb_t cb)
 {
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_size(sw, 50, 26);
+    /* Preserve the compact visual while providing a 40 px finger target. */
+    lv_obj_set_ext_click_area(sw, 7);
     lv_obj_set_style_bg_color(sw, lv_color_hex(COL_OK), LV_PART_INDICATOR | LV_STATE_CHECKED);
     if (on) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
@@ -1427,7 +2080,7 @@ static void build_settings(void)
     panel_settings = mk_panel();
 
     lv_obj_t *list = lv_list_create(panel_settings);
-    lv_obj_set_size(list, BSP_LCD_H_RES - 20, 140);
+    lv_obj_set_size(list, BSP_LCD_H_RES - 20, 134);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 2);
     lv_obj_set_style_bg_color(list, lv_color_hex(COL_PANEL), LV_PART_MAIN);
     lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
@@ -1437,7 +2090,7 @@ static void build_settings(void)
     settings_row(list, "Power", on_power_open);
     settings_row(list, "Thread", on_tset_open);
     settings_row(list, "Device name", on_name_open);
-    settings_row(list, "About", on_about_open);
+    settings_row(list, "Diagnostics", on_about_open);
     lv_obj_t *rb = settings_row(list, "Reboot", on_reboot);
     lv_obj_set_style_text_color(rb, lv_color_hex(COL_ACCENT), LV_PART_MAIN);
     lv_obj_t *fr = settings_row(list, "Factory reset", on_factory_reset);
@@ -1453,13 +2106,14 @@ static void build_screen(void)
 
     lv_obj_t *page = mk_content(panel_screen, true);
 
-    /* 30 px row: the knob overhangs the track, so the row must be taller than
-     * the slider itself or the knob clips into the neighbouring row. */
-    lv_obj_t *r1 = mk_row(page, "Brightness", 30);
+    /* A full 40 px row and extended hit area make the thin slider comfortable
+     * to drag without making its visual track oversized. */
+    lv_obj_t *r1 = mk_row(page, "Brightness", 40);
     lv_obj_t *sl = lv_slider_create(r1);
     lv_slider_set_range(sl, 10, 100);
     lv_slider_set_value(sl, settings_get()->brightness, LV_ANIM_OFF);
     lv_obj_set_size(sl, 150, 8);
+    lv_obj_set_ext_click_area(sl, 16);
     lv_obj_set_style_bg_color(sl, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(sl, lv_color_hex(COL_ACCENT), LV_PART_KNOB);
     lv_obj_add_event_cb(sl, on_brightness, LV_EVENT_VALUE_CHANGED, NULL);
@@ -1469,7 +2123,7 @@ static void build_screen(void)
     lv_obj_t *rl = mk_roller(r2, SETTINGS_SLEEP_OPTIONS, on_sleep_choice);
     lv_roller_set_selected(rl, settings_get()->sleep_idx, LV_ANIM_OFF);
 
-    lv_obj_t *r3 = mk_row(page, "Stay on when plugged in", 34);
+    lv_obj_t *r3 = mk_row(page, "Stay on when plugged in", 40);
     mk_switch(r3, settings_get()->keep_awake_powered, on_keep_awake);
 
     lv_obj_t *bk = mk_button(panel_screen, "Back", on_settings_open, COL_DIM, 110, 40);
@@ -1499,13 +2153,13 @@ static void build_tset(void)
 
     lv_obj_t *page = mk_content(panel_tset, true);
 
-    lv_obj_t *r1 = mk_row(page, "Prefer router role", 34);
+    lv_obj_t *r1 = mk_row(page, "Prefer router role", 40);
     mk_switch(r1, settings_get()->prefer_router, on_prefer_router);
 
-    lv_obj_t *r_rest = mk_row(page, "REST API (port 8081)", 34);
+    lv_obj_t *r_rest = mk_row(page, "REST API (LAN, no auth)", 40);
     mk_switch(r_rest, settings_get()->rest_api, on_rest_api);
 
-    lv_obj_t *r_eps = mk_row(page, "ePSKc over REST", 34);
+    lv_obj_t *r_eps = mk_row(page, "ePSKc over REST", 40);
     mk_switch(r_eps, settings_get()->rest_epskc, on_rest_epskc);
 
     lv_obj_t *r2 = mk_row(page, "New network channel", 62);
@@ -1535,15 +2189,15 @@ static void build_name(void)
     lv_textarea_set_max_length(name_ta, 32);
     lv_textarea_set_accepted_chars(name_ta,
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-");
-    lv_obj_set_size(name_ta, BSP_LCD_H_RES - 24, 36);
+    lv_obj_set_size(name_ta, BSP_LCD_H_RES - 24, 40);
     lv_obj_align(name_ta, LV_ALIGN_TOP_MID, 0, 20);
     lv_obj_set_style_bg_color(name_ta, lv_color_hex(COL_PANEL), LV_PART_MAIN);
     lv_obj_set_style_text_color(name_ta, lv_color_hex(COL_TEXT), LV_PART_MAIN);
 
     lv_obj_t *kb = lv_keyboard_create(panel_name);
     lv_keyboard_set_textarea(kb, name_ta);
-    lv_obj_set_size(kb, BSP_LCD_H_RES - 12, 130);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_size(kb, BSP_LCD_H_RES - 12, 122);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(kb, lv_color_hex(COL_BG), LV_PART_MAIN);
     lv_obj_add_event_cb(kb, on_name_kb, LV_EVENT_ALL, NULL);
 }
@@ -1568,17 +2222,53 @@ static void build_net(void)
     panel_net = mk_panel();
 
     lbl_net_info = mk_label(panel_net, &lv_font_montserrat_14, COL_TEXT, "");
-    lv_obj_align(lbl_net_info, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_set_size(lbl_net_info, BSP_LCD_H_RES - 12, 80);
+    lv_obj_set_style_bg_color(lbl_net_info, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lbl_net_info, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(lbl_net_info, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(lbl_net_info, lv_color_hex(0x30382D), LV_PART_MAIN);
+    lv_obj_set_style_radius(lbl_net_info, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(lbl_net_info, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lbl_net_info, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_net_info, LV_ALIGN_TOP_MID, 0, 2);
 
-    const int w = 72, h = 40, y = -6;
-    lv_obj_t *sh = mk_button(panel_net, "Share", on_share_open, COL_OK, w, h);
-    lv_obj_align(sh, LV_ALIGN_BOTTOM_MID, -117, y);
-    lv_obj_t *qr = mk_button(panel_net, "QR", on_dsqr_open, COL_ACCENT, w, h);
-    lv_obj_align(qr, LV_ALIGN_BOTTOM_MID, -39, y);
-    lv_obj_t *fg = mk_button(panel_net, "Forget", on_forget, COL_ERROR, w, h);
-    lv_obj_align(fg, LV_ALIGN_BOTTOM_MID, 39, y);
-    lv_obj_t *bk = mk_button(panel_net, "Back", on_back_main, COL_DIM, w, h);
-    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 117, y);
+    const int top_w = 96, h = 44, top_col = 104;
+    btn_net_activity = mk_button(panel_net, "Activity", on_activity_open, COL_ACCENT,
+                                 top_w, h);
+    lv_obj_align(btn_net_activity, LV_ALIGN_BOTTOM_MID, -top_col, -56);
+    btn_net_share = mk_button(panel_net, "Share", on_share_open, COL_OK, top_w, h);
+    lv_obj_align(btn_net_share, LV_ALIGN_BOTTOM_MID, 0, -56);
+    btn_net_qr = mk_button(panel_net, "Dataset", on_dsqr_open, COL_ACCENT, top_w, h);
+    lv_obj_align(btn_net_qr, LV_ALIGN_BOTTOM_MID, top_col, -56);
+
+    const int bottom_w = 148, bottom_col = 78;
+    btn_net_forget = mk_button(panel_net, "Forget network", on_forget, COL_ERROR,
+                               bottom_w, h);
+    lv_obj_align(btn_net_forget, LV_ALIGN_BOTTOM_MID, -bottom_col, -6);
+    lv_obj_t *bk = mk_button(panel_net, "Back", on_back_main, COL_DIM, bottom_w, h);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, bottom_col, -6);
+}
+
+static void build_thread_activity(void)
+{
+    panel_activity = mk_panel();
+
+    lbl_activity_info = mk_label(panel_activity, &lv_font_montserrat_14, COL_TEXT, "");
+    lv_obj_set_size(lbl_activity_info, BSP_LCD_H_RES - 12, 124);
+    lv_obj_set_style_bg_color(lbl_activity_info, lv_color_hex(COL_PANEL), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lbl_activity_info, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(lbl_activity_info, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(lbl_activity_info, lv_color_hex(0x30382D), LV_PART_MAIN);
+    lv_obj_set_style_radius(lbl_activity_info, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(lbl_activity_info, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lbl_activity_info, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_activity_info, LV_ALIGN_TOP_MID, 0, 2);
+
+    btn_activity_refresh = mk_button(panel_activity, "Refresh mesh", on_activity_refresh,
+                                     COL_ACCENT, 148, 44);
+    lv_obj_align(btn_activity_refresh, LV_ALIGN_BOTTOM_MID, -78, -6);
+    lv_obj_t *back = mk_button(panel_activity, "Back", on_net_open, COL_DIM, 148, 44);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 78, -6);
 }
 
 static void build_share(void)
@@ -1595,8 +2285,10 @@ static void build_share(void)
     lbl_share_state = mk_label(panel_share, &lv_font_montserrat_14, COL_TEXT, "");
     lv_obj_align(lbl_share_state, LV_ALIGN_TOP_MID, 0, 90);
 
-    lv_obj_t *b = mk_button(panel_share, "Close", on_share_close, COL_DIM, 110, 40);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_t *again = mk_button(panel_share, "New code", on_share_retry, COL_OK, 148, 40);
+    lv_obj_align(again, LV_ALIGN_BOTTOM_MID, -78, -6);
+    lv_obj_t *b = mk_button(panel_share, "Close", on_share_close, COL_DIM, 148, 40);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 78, -6);
 
     lv_timer_create(share_timer_cb, 1000, NULL);
 }
@@ -1607,10 +2299,12 @@ static void build_dsqr(void)
 
     lv_obj_t *hint = mk_label(panel_dsqr, &lv_font_montserrat_14, COL_DIM,
                               "Dataset TLVs - contains the network key");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_obj_set_width(hint, BSP_LCD_H_RES - 166);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_TOP_RIGHT, -2, 8);
 
     lv_obj_t *b = mk_button(panel_dsqr, "Back", on_dsqr_close, COL_DIM, 110, 40);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_RIGHT, -2, -6);
 }
 
 static void build_wifi(void)
@@ -1618,7 +2312,7 @@ static void build_wifi(void)
     panel_wifi = mk_panel();
 
     wifi_list_w = lv_list_create(panel_wifi);
-    lv_obj_set_size(wifi_list_w, BSP_LCD_H_RES - 20, 138);
+    lv_obj_set_size(wifi_list_w, BSP_LCD_H_RES - 20, 134);
     lv_obj_align(wifi_list_w, LV_ALIGN_TOP_MID, 0, 2);
     lv_obj_set_style_bg_color(wifi_list_w, lv_color_hex(COL_PANEL), LV_PART_MAIN);
     lv_obj_set_style_border_width(wifi_list_w, 0, LV_PART_MAIN);
@@ -1640,13 +2334,16 @@ static void build_wpass(void)
     panel_wpass = mk_panel();
 
     lbl_wpass_ssid = mk_label(panel_wpass, &lv_font_montserrat_14, COL_ACCENT, "");
+    lv_obj_set_width(lbl_wpass_ssid, BSP_LCD_H_RES - 24);
+    lv_label_set_long_mode(lbl_wpass_ssid, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(lbl_wpass_ssid, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
     lv_obj_align(lbl_wpass_ssid, LV_ALIGN_TOP_LEFT, 2, 0);
 
     wpass_ta = lv_textarea_create(panel_wpass);
     lv_textarea_set_one_line(wpass_ta, true);
     lv_textarea_set_password_mode(wpass_ta, true);
     lv_textarea_set_max_length(wpass_ta, 64);
-    lv_obj_set_size(wpass_ta, BSP_LCD_H_RES - 24, 36);
+    lv_obj_set_size(wpass_ta, BSP_LCD_H_RES - 24, 40);
     lv_obj_align(wpass_ta, LV_ALIGN_TOP_MID, 0, 20);
     lv_obj_set_style_bg_color(wpass_ta, lv_color_hex(COL_PANEL), LV_PART_MAIN);
     lv_obj_set_style_text_color(wpass_ta, lv_color_hex(COL_TEXT), LV_PART_MAIN);
@@ -1654,8 +2351,8 @@ static void build_wpass(void)
     /* Checkmark joins, close button goes back to the list. */
     lv_obj_t *kb = lv_keyboard_create(panel_wpass);
     lv_keyboard_set_textarea(kb, wpass_ta);
-    lv_obj_set_size(kb, BSP_LCD_H_RES - 12, 130);
-    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_size(kb, BSP_LCD_H_RES - 12, 122);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(kb, lv_color_hex(COL_BG), LV_PART_MAIN);
     lv_obj_add_event_cb(kb, on_wpass_kb, LV_EVENT_ALL, NULL);
 }
@@ -1674,8 +2371,10 @@ static void build_list(void)
     lv_obj_align(lbl_list_hint, LV_ALIGN_TOP_MID, 0, 8);
     lv_obj_add_flag(lbl_list_hint, LV_OBJ_FLAG_HIDDEN);
 
-    mk_button(panel_list, "Back", on_back_main, COL_DIM, 110, 40);
-    lv_obj_align(lv_obj_get_child(panel_list, 2), LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_t *retry = mk_button(panel_list, "Rescan", on_scan, COL_ACCENT, 148, 40);
+    lv_obj_align(retry, LV_ALIGN_BOTTOM_MID, -78, -6);
+    lv_obj_t *back = mk_button(panel_list, "Back", on_back_main, COL_DIM, 148, 40);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 78, -6);
 }
 
 static void build_keypad(void)
@@ -1712,6 +2411,8 @@ static void build_keypad(void)
 
     lv_obj_t *qr = mk_button(panel_keypad, "QR", on_qr_open, COL_OK, 56, 30);
     lv_obj_align(qr, LV_ALIGN_TOP_RIGHT, -2, 26);
+    lv_obj_t *back = mk_button(panel_keypad, "Back", on_back_list, COL_DIM, 56, 30);
+    lv_obj_align(back, LV_ALIGN_TOP_LEFT, 2, 26);
 }
 
 static void build_qr(void)
@@ -1719,22 +2420,24 @@ static void build_qr(void)
     panel_qr = mk_panel();
 
     /* Preview buffer in PSRAM: 320x240x2 is far too big for internal RAM. */
-    s_preview = heap_caps_malloc((size_t) BSP_LCD_H_RES * BSP_LCD_V_RES * 2,
+    s_preview = heap_caps_malloc((size_t) QRSCAN_PREVIEW_W * QRSCAN_PREVIEW_H * 2,
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_preview) {
-        memset(s_preview, 0, (size_t) BSP_LCD_H_RES * BSP_LCD_V_RES * 2);
+        memset(s_preview, 0, (size_t) QRSCAN_PREVIEW_W * QRSCAN_PREVIEW_H * 2);
         qr_canvas = lv_canvas_create(panel_qr);
         lv_canvas_set_buffer(qr_canvas, s_preview, QRSCAN_PREVIEW_W, QRSCAN_PREVIEW_H,
                              LV_COLOR_FORMAT_RGB565);
-        lv_obj_align(qr_canvas, LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_align(qr_canvas, LV_ALIGN_TOP_MID, 0, -6);
     }
 
     lbl_qr_hint = mk_label(panel_qr, &lv_font_montserrat_14, COL_DIM,
                            "Point at the QR code");
     lv_obj_align(lbl_qr_hint, LV_ALIGN_BOTTOM_MID, 0, -50);
 
-    lv_obj_t *b = mk_button(panel_qr, "Cancel", on_qr_cancel, COL_DIM, 110, 40);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 0, -4);
+    lv_obj_t *retry = mk_button(panel_qr, "Retry", on_qr_open, COL_OK, 148, 40);
+    lv_obj_align(retry, LV_ALIGN_BOTTOM_MID, -78, 0);
+    lv_obj_t *b = mk_button(panel_qr, "Cancel", on_qr_cancel, COL_DIM, 148, 40);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 78, 0);
 }
 
 static void build_result(void)
@@ -1750,7 +2453,11 @@ static void build_result(void)
 
 esp_err_t ui_init(void)
 {
-    ESP_ERROR_CHECK(bsp_i2c_init());
+    esp_err_t i2c_err = bsp_i2c_init();
+    if (i2c_err != ESP_OK && i2c_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "I2C init failed: %s", esp_err_to_name(i2c_err));
+        return i2c_err;
+    }
 
     bsp_display_cfg_t cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
@@ -1765,20 +2472,32 @@ esp_err_t ui_init(void)
     bsp_display_backlight_on();
     bsp_display_brightness_set(settings_get()->brightness);
 
-    s_jobs = xQueueCreate(4, sizeof(job_t));
+    s_jobs = xQueueCreate(4, sizeof(ui_job_msg_t));
+    s_call_done = xSemaphoreCreateBinary();
+    s_call_lock = xSemaphoreCreateMutex();
+    if (s_jobs == NULL || s_call_done == NULL || s_call_lock == NULL) {
+        ESP_LOGE(TAG, "could not allocate the operation queue");
+        return ESP_ERR_NO_MEM;
+    }
 
     bsp_display_lock(0);
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
 
-    /* 16 pt, not 20: at 20 pt the centred title runs to ~x270 and anything in
-     * the top-right corner lands on the "...er". At 16 pt it ends near x240,
-     * leaving room for the battery. */
-    lv_obj_t *title = mk_label(scr, &lv_font_montserrat_16, COL_ACCENT, "ePSKc Commissioner");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    /* A contextual, single-line appliance header. The battery owns the final
+     * 70 px, so title and connection text are ellipsised before they can wrap
+     * into it or the page below. */
+    lbl_title = mk_label(scr, &lv_font_montserrat_16, COL_ACCENT, "Thread Commissioner");
+    lv_obj_set_width(lbl_title, BSP_LCD_H_RES - 84);
+    lv_label_set_long_mode(lbl_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(lbl_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_title, LV_ALIGN_TOP_LEFT, 8, 3);
     lbl_wifi = mk_label(scr, &lv_font_montserrat_14, COL_DIM, "wifi: not connected");
-    lv_obj_align(lbl_wifi, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_set_width(lbl_wifi, BSP_LCD_H_RES - 84);
+    lv_label_set_long_mode(lbl_wifi, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(lbl_wifi, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_wifi, LV_ALIGN_TOP_LEFT, 8, 24);
 
     /* Battery drawn as an outline with the percent inside, top-right on the
      * top layer so it rides above every panel. Non-clickable, so touches fall
@@ -1829,6 +2548,7 @@ esp_err_t ui_init(void)
     build_wifi();
     build_wpass();
     build_net();
+    build_thread_activity();
     build_share();
     build_dsqr();
     build_settings();
@@ -1852,7 +2572,14 @@ esp_err_t ui_init(void)
      * than a generous one. Do not lower it: an overflow here corrupts silently
      * and faults minutes later somewhere unrelated.
      */
-    xTaskCreate(worker, "epskc_worker", 28672, NULL, 5, NULL);
+    if (xTaskCreate(worker, "epskc_worker", 28672, NULL, 5, NULL) != pdPASS) {
+        bsp_display_lock(0);
+        lv_label_set_text(lbl_status, "Operation worker unavailable");
+        lv_obj_set_style_text_color(lbl_status, lv_color_hex(COL_ERROR), LV_PART_MAIN);
+        bsp_display_unlock();
+        ESP_LOGE(TAG, "could not start operation worker");
+        return ESP_ERR_NO_MEM;
+    }
 
     s_ready = true;
     ESP_LOGI(TAG, "display up");
@@ -1874,6 +2601,8 @@ void ui_set_wifi(const char *ssid, const char *ip)
     }
     bsp_display_lock(0);
     lv_label_set_text(lbl_wifi, buf);
+    lv_label_set_text(lv_obj_get_child(btn_home_join, 0),
+                      s_have_wifi ? "Join existing" : "Connect Wi-Fi");
     bsp_display_unlock();
 }
 
@@ -1907,36 +2636,44 @@ bool ui_defer_br_start(esp_netif_t *backbone)
     if (!s_ready || s_jobs == NULL || backbone == NULL) {
         return false;
     }
-    s_br_backbone = backbone;
-    job_t j = JOB_BR_START;
-    return xQueueSend(s_jobs, &j, 0) == pdTRUE;
+    ui_job_msg_t msg = {
+        .type = JOB_BR_START,
+        .data.br_start.backbone = backbone,
+    };
+    return xQueueSend(s_jobs, &msg, 0) == pdTRUE;
 }
 
 bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
 {
-    if (!s_ready || s_jobs == NULL || fn == NULL) {
+    if (!s_ready || s_jobs == NULL || s_call_lock == NULL || s_call_done == NULL || fn == NULL) {
         return false;
     }
-    if (s_call_done == NULL) {
-        s_call_done = xSemaphoreCreateBinary();
-        if (s_call_done == NULL) {
-            return false;
-        }
-    }
-    /* Serialise: the slot below is shared, and the worker runs one job at a
-     * time anyway. */
-    if (s_call_busy) {
+    TickType_t wait = pdMS_TO_TICKS(timeout_ms);
+    if (xSemaphoreTake(s_call_lock, wait) != pdTRUE) {
         return false;
     }
-    s_call_busy = true;
-    s_call_fn = fn;
-    s_call_arg = arg;
+    /* No stale completion may leak into the next request. */
+    xSemaphoreTake(s_call_done, 0);
+    ui_job_msg_t msg = {
+        .type = JOB_CALL,
+        .data.call = { .fn = fn, .arg = arg },
+    };
+    if (xQueueSend(s_jobs, &msg, wait) != pdTRUE) {
+        xSemaphoreGive(s_call_lock);
+        return false;
+    }
 
-    job_t j = JOB_CALL;
-    bool ok = xQueueSend(s_jobs, &j, 0) == pdTRUE &&
-              xSemaphoreTake(s_call_done, pdMS_TO_TICKS(timeout_ms)) == pdTRUE;
-    s_call_busy = false;
-    return ok;
+    /* `arg` commonly points to a caller's stack. Once accepted, returning
+     * before the worker finishes would be a use-after-return and could also
+     * make the console execute the operation twice. Warn at the requested
+     * deadline, then preserve ownership until completion. */
+    if (xSemaphoreTake(s_call_done, wait) != pdTRUE) {
+        ESP_LOGW(TAG, "worker call exceeded %u ms; waiting for safe completion",
+                 (unsigned) timeout_ms);
+        xSemaphoreTake(s_call_done, portMAX_DELAY);
+    }
+    xSemaphoreGive(s_call_lock);
+    return true;
 }
 
 bool ui_run_camtest(void)
@@ -1950,8 +2687,8 @@ bool ui_run_camtest(void)
             return false;
         }
     }
-    job_t j = JOB_CAMTEST;
-    if (xQueueSend(s_jobs, &j, 0) != pdTRUE) {
+    ui_job_msg_t msg = { .type = JOB_CAMTEST };
+    if (xQueueSend(s_jobs, &msg, 0) != pdTRUE) {
         return false;
     }
     /* The selftest captures 40 frames with a decode attempt on each, so it can

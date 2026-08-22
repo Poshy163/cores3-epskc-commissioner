@@ -15,6 +15,9 @@
  */
 esp_err_t thread_init(void);
 
+/* True once the host stack and RCP are available. */
+bool thread_available(void);
+
 /*
  * Promote to a full Border Router: publishes _meshcop._udp on the Wi-Fi side
  * (which is what makes it appear in Home Assistant's Thread panel) and routes
@@ -33,6 +36,10 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone);
  * fragmented at boot -- the border router then never starts.
  */
 void thread_run_border_router_start(esp_netif_t *backbone);
+
+/* Latest border-router startup outcome, retained after the boot logs scroll
+ * past. The returned string has static lifetime. */
+const char *thread_border_router_status(void);
 
 /* Apply a freshly retrieved dataset and attach to that network. */
 esp_err_t thread_join(const uint8_t *dataset_tlvs, size_t len);
@@ -64,6 +71,59 @@ bool thread_attached(void);
  * INVALID_STATE for those roles.
  */
 bool thread_link_rssi(int8_t *rssi);
+
+/*
+ * One coherent, lock-protected view of the local Thread attachment. MAC frame
+ * and IPv6 packet counters run since stack start; callers can retain samples
+ * to calculate a recent traffic window without resetting the stack.
+ */
+typedef struct {
+    char role[9];
+    bool attached;
+    uint32_t attach_duration_s;
+    bool parent_valid;
+    uint16_t parent_rloc16;
+    bool parent_rssi_valid;
+    int8_t parent_rssi;
+    uint8_t parent_lqi;
+    uint8_t known_routers;
+    bool direct_children_valid;
+    uint16_t direct_children;
+    uint32_t mac_tx_total;
+    uint32_t mac_rx_total;
+    uint32_t ip_tx_success;
+    uint32_t ip_rx_success;
+    uint32_t ip_tx_failure;
+    uint32_t ip_rx_failure;
+    uint16_t parent_changes;
+} thread_activity_t;
+
+bool thread_activity_get(thread_activity_t *activity);
+
+/*
+ * Network-wide Mesh Diagnostics are asynchronous and best-effort. "Seen"
+ * counts describe devices whose routers answered this scan; they must never be
+ * presented as an exact census of every device connected to the network.
+ */
+typedef enum {
+    THREAD_TOPOLOGY_NEVER,
+    THREAD_TOPOLOGY_SCANNING,
+    THREAD_TOPOLOGY_COMPLETE,
+    THREAD_TOPOLOGY_PARTIAL,
+    THREAD_TOPOLOGY_FAILED,
+} thread_topology_status_t;
+
+typedef struct {
+    thread_topology_status_t status;
+    uint16_t routers_seen;
+    uint16_t children_seen;
+    uint16_t border_routers_seen;
+    bool includes_self;
+    uint64_t completed_at_ms;
+} thread_topology_t;
+
+esp_err_t thread_topology_refresh(void);
+void thread_topology_get(thread_topology_t *topology);
 
 /*
  * Share this device's network over ePSKc: generates a 9-digit code, opens the

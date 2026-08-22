@@ -1,5 +1,5 @@
-# Rebuilds the firmware on every push and commits the merged Launchpad binary
-# back to firmware/, so the ESP Launchpad link always serves the latest build.
+# Validates the display layout, rebuilds the firmware on every source push and
+# publishes both update-safe component images and the compatibility merged image.
 name: build
 
 on:
@@ -14,11 +14,18 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check display layout
+        run: python3 -B tools/layout_check.py "$RUNNER_TEMP/layout.svg"
 
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
@@ -28,21 +35,30 @@ jobs:
           command: |
             idf.py build
             mkdir -p firmware
+            cp build/bootloader/bootloader.bin firmware/bootloader.bin
+            cp build/partition_table/partition-table.bin firmware/partition-table.bin
+            cp build/epskc_commissioner.bin firmware/epskc-commissioner-app.bin
             cd build
             python -m esptool --chip esp32s3 merge_bin -o ../firmware/cores3-epskc-commissioner.bin @flash_args
 
-      - name: Commit merged binary
+      - name: Publish firmware images
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add firmware/cores3-epskc-commissioner.bin
+          git add \
+            firmware/bootloader.bin \
+            firmware/partition-table.bin \
+            firmware/epskc-commissioner-app.bin \
+            firmware/cores3-epskc-commissioner.bin
           git diff --cached --quiet && exit 0
-          git commit -m "ci: rebuild Launchpad firmware binary"
-          # The branch can move while this job builds, so rebase and retry
-          # rather than failing the run outright.
-          for i in 1 2 3; do
-            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" && git push && exit 0
-            echo "push attempt $i failed, retrying"
-            sleep 5
-          done
-          echo "could not push the rebuilt binary"; exit 1
+
+          # Never attach artifacts built from an older revision to a newer one.
+          # A push during the build starts a replacement run via concurrency.
+          git fetch --no-tags origin "${GITHUB_REF_NAME}"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$GITHUB_SHA" ]; then
+            echo "Branch moved; the newer workflow run will publish its artifacts."
+            exit 0
+          fi
+
+          git commit -m "ci: rebuild firmware images"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

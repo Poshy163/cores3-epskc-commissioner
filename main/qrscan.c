@@ -184,12 +184,20 @@ esp_err_t qrscan_start(void)
             };
             if (ioctl(s_fd, VIDIOC_QBUF, &buf) != 0) {
                 ESP_LOGE(TAG, "warm restart QBUF %d failed", i);
+                /* The stopped pipeline is already inconsistent; close it so a
+                 * later Retry can reopen cleanly instead of repeating this
+                 * partial queue state forever. */
+                qrscan_teardown();
                 return ESP_FAIL;
             }
         }
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
             ESP_LOGE(TAG, "warm restart STREAMON failed");
+            /* STREAMON cleans up a controller it could not create, but the
+             * V4L2 buffers above remain queued. Reset the stopped userspace
+             * pipeline so a future attempt gets a genuinely clean start. */
+            qrscan_teardown();
             return ESP_FAIL;
         }
         s_running = true;
@@ -244,7 +252,8 @@ esp_err_t qrscan_start(void)
             goto fail;
         }
         s_buf[i] = mmap(NULL, buf.length, PROT_READ | PROT_WRITE, MAP_SHARED, s_fd, buf.m.offset);
-        if (s_buf[i] == NULL) {
+        if (s_buf[i] == MAP_FAILED) {
+            s_buf[i] = NULL;
             ESP_LOGE(TAG, "mmap %d failed", i);
             goto fail;
         }
@@ -306,8 +315,9 @@ void qrscan_stop(void)
     if (!s_running) {
         return;
     }
-    /* Streaming off only -- fd, mmaps and the decoder stay alive. See
-     * qrscan_teardown() for why full teardown is reserved for init failure. */
+    /* Keep the fd, mmaps and decoder, but STREAMOFF releases the DVP controller
+     * and its internal DMA storage.  The low-bandwidth Wi-Fi memory profile
+     * leaves enough contiguous DMA-capable SRAM for the next STREAMON. */
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(s_fd, VIDIOC_STREAMOFF, &type);
     s_running = false;

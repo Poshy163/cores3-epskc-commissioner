@@ -7,3 +7,4 @@ sdkconfig.debug
 .idea/
 cmake-build-*/
 dist/
+__pycache__/

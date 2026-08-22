@@ -16,11 +16,19 @@ CONFIG_SPIRAM_USE_MALLOC=y
 # OpenThread stack for internal RAM and UDP sends start failing with
 # MBEDTLS_ERR_NET_SEND_FAILED (-0x004E) long before any crypto runs.
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# This appliance carries only control-plane HTTP, mDNS and Thread backbone
+# traffic; it does not need the iperf-oriented 16+16 permanent Wi-Fi buffer
+# profile selected when PSRAM is present. Eight RX/TX buffers still match the
+# AMPDU receive window while returning roughly 25 KB of DMA-capable SRAM to the
+# camera and other hardware drivers.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_RX_BA_WIN=8
 # Keep 64 KB (default 32) of internal RAM out of reach of ordinary malloc():
 # once free internal drops below this, small allocations go to PSRAM instead.
-# Task stacks and DMA buffers can only live internally, and with LVGL, mbedTLS
-# and OpenThread all competing, the default left the camera's 8 KB DMA buffer
-# and the border-router task with no contiguous block to allocate.
+# DMA buffers and latency-sensitive stacks still need internal RAM; with LVGL,
+# mbedTLS and OpenThread competing, the default left the camera staging block
+# and border-router work with no contiguous space to allocate.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 
 # Camera + quirc + LVGL + mbedTLS outgrew the 1.5 MB default app partition.
@@ -95,9 +103,10 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 # The DVP controller wants a single contiguous DMA buffer, and DMA can only come
 # from internal RAM. The 32 KB default never fits next to the Thread stack, and
 # 8192 is the Kconfig minimum (range 8192 32768 -- a smaller value is silently
-# replaced by the 32 KB default, which then fails every time). Because 8 KB
-# contiguous stops existing once the device is Thread leader, main.c claims the
-# camera pipeline at boot and keeps it for the life of the process.
+# replaced by the 32 KB default, which then fails every time). For 320x240 GREY
+# the driver derives a 7680-byte staging buffer and recreates it on every
+# STREAMON. The reduced Wi-Fi RX/TX footprint above leaves that contiguous
+# internal block available while cache-sensitive task stacks remain internal.
 CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE=8192
 
 CONFIG_CAMERA_GC0308=y

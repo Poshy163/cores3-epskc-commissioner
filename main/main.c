@@ -40,11 +40,14 @@ static const char *TAG = "epskc";
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
+#define WIFI_DISCONNECTED_BIT BIT2
 
 static EventGroupHandle_t s_wifi_events;
+static SemaphoreHandle_t s_wifi_op_lock; /* serialises UI, console and reset callers */
 static esp_netif_t *s_sta_netif;   /* backbone for the border router */
 static bool s_reveal = false;
 static char s_ip[16] = "-";
+static char s_ip6[46] = "-";       /* backbone link-local, for RS on the infra link */
 static char s_ssid[33] = "";
 static int s_retries;
 static bool s_wifi_hold;   /* true after an intentional leave: no auto-reconnect */
@@ -62,8 +65,23 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        /*
+         * The border router sends Router Solicitations on the backbone to learn
+         * the LAN's on-link prefixes, and that needs a link-local address on
+         * this netif. ESP-IDF only creates one on request, so without this
+         * OpenThread logs "Failed to send RS" every few seconds and never sees
+         * the infra prefixes. Link-local needs no DHCP, so claim it as soon as
+         * the link is up rather than waiting for GOT_IP.
+         */
+        esp_err_t err = esp_netif_create_ip6_linklocal(s_sta_netif);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "no backbone IPv6 link-local: %s", esp_err_to_name(err));
+        }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
         strcpy(s_ip, "-");
+        strcpy(s_ip6, "-");
         ui_set_wifi(NULL, NULL);
         if (s_wifi_hold) {
             /* deliberate leave: stay down */
@@ -73,11 +91,16 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         } else {
             xEventGroupSetBits(s_wifi_events, WIFI_FAIL_BIT);
         }
+        /* Acknowledge only after the handler has consumed s_wifi_hold. The
+         * config-switching task can then release the hold without racing this
+         * event into an unwanted reconnect. */
+        xEventGroupSetBits(s_wifi_events, WIFI_DISCONNECTED_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *) data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
         s_retries = 0;
         refresh_wifi_ui();
+        xEventGroupClearBits(s_wifi_events, WIFI_FAIL_BIT);
         xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
         /* Backbone is up, so the border router can start and (if credentials
          * are stored) re-attach to its network. Idempotent on reconnects. */
@@ -86,59 +109,183 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         /* Idempotent, so reconnects are harmless. */
         if (settings_get()->rest_api) {
-            otbr_rest_start();
+            if (!otbr_rest_request_running(true)) {
+                ESP_LOGE(TAG, "could not queue REST start after Wi-Fi connect");
+            }
         }
+    } else if (base == IP_EVENT && id == IP_EVENT_GOT_IP6) {
+        /* The Thread netif raises this too, so only record the backbone's. */
+        ip_event_got_ip6_t *e = (ip_event_got_ip6_t *) data;
+        if (e->esp_netif == s_sta_netif) {
+            snprintf(s_ip6, sizeof(s_ip6), IPV6STR, IPV62STR(e->ip6_info.ip));
+            ESP_LOGI(TAG, "backbone IPv6 %s", s_ip6);
+        }
+    }
+}
+
+/* Stop the current station attempt without letting the disconnect handler
+ * immediately reconnect it. Waiting for the event closes the race where the
+ * handler could otherwise observe s_wifi_hold=false after a config switch. */
+static void wifi_disconnect_for_config_switch(void)
+{
+    s_wifi_hold = true;
+    xEventGroupClearBits(s_wifi_events, WIFI_DISCONNECTED_BIT);
+    esp_err_t err = esp_wifi_disconnect();
+    if (err == ESP_OK) {
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_DISCONNECTED_BIT,
+                                               pdTRUE, pdFALSE, pdMS_TO_TICKS(1500));
+        if (!(bits & WIFI_DISCONNECTED_BIT)) {
+            ESP_LOGW(TAG, "timed out waiting for Wi-Fi disconnect event");
+        }
+    } else {
+        /* Common when a failed candidate has already exhausted its retries. */
+        ESP_LOGD(TAG, "Wi-Fi already disconnected (%s)", esp_err_to_name(err));
     }
 }
 
 esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
 {
+    if (ssid == NULL || pass == NULL || ssid[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_wifi_op_lock == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_wifi_op_lock, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGW(TAG, "another Wi-Fi operation is still running");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* WIFI_STORAGE_FLASH makes esp_wifi_set_config() persistent immediately.
+     * Snapshot the known-good config first so a typo does not strand a device
+     * that was already provisioned. */
+    wifi_config_t previous = { 0 };
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &previous);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cannot snapshot current Wi-Fi config: %s", esp_err_to_name(err));
+        goto done;
+    }
+    const bool had_previous = previous.sta.ssid[0] != '\0';
+
     wifi_config_t cfg = { 0 };
     strncpy((char *) cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
     strncpy((char *) cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
 
-    s_wifi_hold = false;
-    s_retries = 0;
-    xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    /* Stop the old station attempt before replacing its config. IDF can reject
+     * esp_wifi_set_config() with ESP_ERR_WIFI_STATE while STA is connecting.
+     * Clear result bits after the disconnect acknowledgement so a late GOT_IP
+     * from the old AP cannot make the candidate look successful. */
+    wifi_disconnect_for_config_switch();
+    xEventGroupClearBits(s_wifi_events,
+                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | WIFI_DISCONNECTED_BIT);
+    err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
     if (err != ESP_OK) {
-        return err;
+        ESP_LOGE(TAG, "could not stage Wi-Fi config for \"%s\": %s",
+                 ssid, esp_err_to_name(err));
+        goto rollback;
     }
-    esp_wifi_disconnect();
-    esp_wifi_connect();
+
+    s_retries = 0;
+    s_wifi_hold = false;
+    err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "could not start Wi-Fi candidate \"%s\": %s",
+                 ssid, esp_err_to_name(err));
+        goto rollback;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_events,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
-    return (bits & WIFI_CONNECTED_BIT) ? ESP_OK : ESP_FAIL;
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "Wi-Fi candidate \"%s\" connected and retained", ssid);
+        err = ESP_OK;
+        goto done;
+    }
+
+    err = ESP_FAIL;
+    ESP_LOGW(TAG, "Wi-Fi candidate \"%s\" failed%s; rolling back",
+             ssid, (bits & WIFI_FAIL_BIT) ? " after retries" : " by timeout");
+
+rollback:
+    {
+        wifi_disconnect_for_config_switch();
+        wifi_config_t empty = { 0 };
+        wifi_config_t *restore = had_previous ? &previous : &empty;
+        esp_err_t restore_err = esp_wifi_set_config(WIFI_IF_STA, restore);
+        if (restore_err != ESP_OK) {
+            ESP_LOGE(TAG, "Wi-Fi rollback failed: %s", esp_err_to_name(restore_err));
+            /* Do not reconnect the rejected candidate if persistence failed. */
+            s_wifi_hold = true;
+            goto done;
+        }
+
+        s_retries = 0;
+        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+        if (had_previous) {
+            s_wifi_hold = false;
+            esp_err_t reconnect_err = esp_wifi_connect();
+            if (reconnect_err == ESP_OK) {
+                ESP_LOGI(TAG, "restored previous Wi-Fi config for \"%.*s\"",
+                         (int) sizeof(previous.sta.ssid),
+                         (const char *) previous.sta.ssid);
+            } else {
+                ESP_LOGW(TAG, "previous Wi-Fi config restored but reconnect failed: %s",
+                         esp_err_to_name(reconnect_err));
+            }
+        } else {
+            /* First-time provisioning failed: ensure the rejected candidate is
+             * erased and leave the station intentionally idle. */
+            s_wifi_hold = true;
+            ESP_LOGI(TAG, "failed first Wi-Fi candidate erased; no prior config to restore");
+        }
+    }
+done:
+    xSemaphoreGive(s_wifi_op_lock);
+    return err;
 }
 
-void app_wifi_leave(void)
+esp_err_t app_wifi_leave(void)
 {
-    s_wifi_hold = true;
+    if (s_wifi_op_lock == NULL || xSemaphoreTake(s_wifi_op_lock, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Wi-Fi operation lock unavailable; credentials not changed");
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* As with replacement, the driver can reject set_config while STA is
+     * connecting. Stop and acknowledge the old attempt before erasing it. */
+    wifi_disconnect_for_config_switch();
     wifi_config_t cfg = { 0 };
-    esp_wifi_set_config(WIFI_IF_STA, &cfg);   /* zeroed = credentials erased */
-    esp_wifi_disconnect();
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg); /* zeroed = erased */
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not erase Wi-Fi credentials: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_wifi_op_lock);
+    return err;
 }
 
 int app_wifi_scan(wifi_scan_rec_t *out, int max)
 {
+    if (out == NULL || max <= 0 || s_wifi_op_lock == NULL ||
+        xSemaphoreTake(s_wifi_op_lock, portMAX_DELAY) != pdTRUE) {
+        return 0;
+    }
+    int m = 0;
+    wifi_ap_record_t *recs = NULL;
     wifi_scan_config_t sc = { 0 };   /* all channels, active scan */
     if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
-        return 0;
+        goto done;
     }
     uint16_t n = 0;
     esp_wifi_scan_get_ap_num(&n);
     if (n == 0) {
-        return 0;
+        goto done;
     }
-    wifi_ap_record_t *recs = calloc(n, sizeof(*recs));
+    recs = calloc(n, sizeof(*recs));
     if (recs == NULL) {
-        return 0;
+        goto done;
     }
     esp_wifi_scan_get_ap_records(&n, recs);   /* already strongest-first */
 
-    int m = 0;
     for (int i = 0; i < n && m < max; i++) {
         if (recs[i].ssid[0] == '\0') {
             continue;
@@ -155,7 +302,9 @@ int app_wifi_scan(wifi_scan_rec_t *out, int max)
         out[m].secured = recs[i].authmode != WIFI_AUTH_OPEN;
         m++;
     }
+done:
     free(recs);
+    xSemaphoreGive(s_wifi_op_lock);
     return m;
 }
 
@@ -184,6 +333,7 @@ static int cmd_status(int argc, char **argv)
         printf("wifi   : not connected\n");
     }
     printf("ip     : %s\n", s_ip);
+    printf("ipv6   : %s\n", s_ip6);
     printf("reveal : %s\n", s_reveal ? "on" : "off");
     printf("fw     : %s\n", FW_VERSION);
     return 0;
@@ -263,21 +413,31 @@ static void do_share_start(void *arg)
     a->result = thread_share_start(a->code, sizeof(a->code), a->lifetime_ms);
 }
 
+struct share_stop_args {
+    bool done;
+};
+
+static void do_share_stop(void *arg)
+{
+    struct share_stop_args *a = arg;
+    thread_share_stop();
+    a->done = true;
+}
+
 static void do_thread_forget(void *arg)
 {
     *(esp_err_t *) arg = thread_forget();
 }
 
-/* Falls back to running inline when the worker is unavailable (headless
- * boot); better a deep call than no call, and the UI is absent anyway. */
+/* Never fall back to the 6 KB console stack: these calls are known to need
+ * much more, and an unavailable/busy worker is safer than a delayed panic. */
 static bool run_off_console(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
 {
     if (ui_run_on_worker(fn, arg, timeout_ms)) {
         return true;
     }
-    ESP_LOGW(TAG, "worker unavailable; running inline on the console stack");
-    fn(arg);
-    return true;
+    ESP_LOGE(TAG, "operation worker unavailable; command was not run");
+    return false;
 }
 
 static int cmd_join(int argc, char **argv)
@@ -303,7 +463,11 @@ static int cmd_join(int argc, char **argv)
         .addr = argv[1], .port = (uint16_t) atoi(argv[2]), .passcode = argv[3],
         .dataset = dataset, .cap = sizeof(dataset), .result = ESP_FAIL,
     };
-    run_off_console(do_fetch_dataset, &fa, 60000);
+    if (!run_off_console(do_fetch_dataset, &fa, 60000)) {
+        ui_set_status(UI_STATE_ERROR, "Device busy");
+        printf("operation worker unavailable - try again\n");
+        return 1;
+    }
     esp_err_t err = fa.result;
     dlen = fa.len;
     if (err != ESP_OK) {
@@ -325,7 +489,10 @@ static int cmd_join(int argc, char **argv)
 
     /* Same as the touch flow: apply it and actually attach. */
     struct tlv_args ja = { .tlvs = dataset, .len = dlen, .result = ESP_FAIL };
-    run_off_console(do_thread_join, &ja, 30000);
+    if (!run_off_console(do_thread_join, &ja, 30000)) {
+        printf(">>> dataset retrieved, but worker could not apply it <<<\n");
+        return 1;
+    }
     if (ja.result == ESP_OK) {
         for (int i = 0; i < 40 && !thread_attached(); i++) {
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -337,16 +504,89 @@ static int cmd_join(int argc, char **argv)
     return 0;
 }
 
+static const char *topology_status_name(thread_topology_status_t status)
+{
+    switch (status) {
+    case THREAD_TOPOLOGY_NEVER:    return "not scanned";
+    case THREAD_TOPOLOGY_SCANNING: return "scanning";
+    case THREAD_TOPOLOGY_COMPLETE: return "complete";
+    case THREAD_TOPOLOGY_PARTIAL:  return "partial";
+    case THREAD_TOPOLOGY_FAILED:   return "failed";
+    default:                       return "unknown";
+    }
+}
+
 static int cmd_thread(int argc, char **argv)
 {
-    (void) argc; (void) argv;
-    printf("role       : %s\n", thread_role());
+    if (argc > 2 || (argc == 2 && strcmp(argv[1], "scan") != 0)) {
+        printf("usage: thread [scan]\n");
+        return 1;
+    }
+
+    thread_topology_t topology;
+    thread_topology_get(&topology);
+    if (argc == 2 && topology.status != THREAD_TOPOLOGY_SCANNING) {
+        esp_err_t err = thread_topology_refresh();
+        if (err != ESP_OK) {
+            printf("topology scan could not start: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("topology scan started; waiting for mesh replies...\n");
+    }
+    if (argc == 2) {
+        for (int i = 0; i < 70; i++) {
+            thread_topology_get(&topology);
+            if (topology.status != THREAD_TOPOLOGY_SCANNING) {
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    thread_activity_t activity;
+    bool have_activity = thread_activity_get(&activity);
+    printf("role       : %s\n", have_activity ? activity.role : thread_role());
     printf("credentials: %s\n", thread_has_dataset() ? "stored" : "none");
-    extern const char *g_br_boot_status;
-    printf("br boot    : %s\n", g_br_boot_status);
-    int8_t rssi;
-    if (thread_link_rssi(&rssi)) {
-        printf("parent rssi: %d dBm\n", rssi);
+    printf("br boot    : %s\n", thread_border_router_status());
+    if (have_activity) {
+        printf("attached   : %s", activity.attached ? "yes" : "no");
+        if (activity.attached) {
+            printf(" (%lu seconds)", (unsigned long) activity.attach_duration_s);
+        }
+        printf("\n");
+        if (activity.parent_valid) {
+            printf("parent     : 0x%04x, ", activity.parent_rloc16);
+            if (activity.parent_rssi_valid) {
+                printf("%d dBm, ", activity.parent_rssi);
+            } else {
+                printf("signal pending, ");
+            }
+            printf("LQI %u\n", activity.parent_lqi);
+        }
+        printf("routers    : %u known locally\n", activity.known_routers);
+        if (activity.direct_children_valid) {
+            printf("children   : %u directly attached here\n", activity.direct_children);
+        }
+        printf("radio      : TX %lu, RX %lu frames since start\n",
+               (unsigned long) activity.mac_tx_total,
+               (unsigned long) activity.mac_rx_total);
+        printf("IPv6       : TX %lu ok/%lu fail, RX %lu ok/%lu fail\n",
+               (unsigned long) activity.ip_tx_success,
+               (unsigned long) activity.ip_tx_failure,
+               (unsigned long) activity.ip_rx_success,
+               (unsigned long) activity.ip_rx_failure);
+        printf("parent moves: %u\n", activity.parent_changes);
+    }
+    thread_topology_get(&topology);
+    printf("topology   : %s\n", topology_status_name(topology.status));
+    if (topology.status == THREAD_TOPOLOGY_COMPLETE ||
+        topology.status == THREAD_TOPOLOGY_PARTIAL) {
+        printf("mesh seen  : %u routers, %u children, %u border routers"
+               " (%lu devices%s)\n",
+               topology.routers_seen, topology.children_seen,
+               topology.border_routers_seen,
+               (unsigned long) topology.routers_seen + topology.children_seen,
+               topology.includes_self ? ", including this one" : "");
     }
     return 0;
 }
@@ -355,7 +595,10 @@ static int cmd_forget(int argc, char **argv)
 {
     (void) argc; (void) argv;
     esp_err_t ferr = ESP_FAIL;
-    run_off_console(do_thread_forget, &ferr, 30000);
+    if (!run_off_console(do_thread_forget, &ferr, 30000)) {
+        printf("operation worker unavailable - try again\n");
+        return 1;
+    }
     if (ferr != ESP_OK) {
         printf("failed to erase\n");
         return 1;
@@ -436,14 +679,34 @@ void app_reboot(void)
 void app_factory_reset(void)
 {
     ESP_LOGW(TAG, "factory reset");
-    thread_forget();
-    app_wifi_leave();
-    settings_erase();
+    /* Fail closed: never reboot and claim a reset while a credential store
+     * reports failure. A retry can finish any stores already cleared. */
+    if (thread_forget() != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset aborted: Thread credentials remain");
+        ui_set_status(UI_STATE_ERROR, "Factory reset failed - Thread data remains");
+        return;
+    }
+    if (app_wifi_leave() != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset aborted: Wi-Fi credentials remain");
+        ui_set_status(UI_STATE_ERROR, "Factory reset failed - try again");
+        return;
+    }
+
     nvs_handle_t h;
-    if (nvs_open("epskc", NVS_READWRITE, &h) == ESP_OK) {   /* remembered network */
-        nvs_erase_all(h);
-        nvs_commit(h);
+    esp_err_t err = nvs_open("epskc", NVS_READWRITE, &h);   /* remembered network */
+    if (err == ESP_OK) {
+        err = nvs_erase_all(h);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
         nvs_close(h);
+    }
+    esp_err_t settings_err = err == ESP_OK ? settings_erase() : ESP_FAIL;
+    if (err != ESP_OK || settings_err != ESP_OK) {
+        ESP_LOGE(TAG, "factory reset aborted: NVS erase failed (network=%s settings=%s)",
+                 esp_err_to_name(err), esp_err_to_name(settings_err));
+        ui_set_status(UI_STATE_ERROR, "Factory reset incomplete - try again");
+        return;
     }
     app_reboot();
 }
@@ -451,28 +714,39 @@ void app_factory_reset(void)
 static int cmd_rest(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
-        otbr_rest_stop();
+        if (!otbr_rest_request_running(false)) {
+            printf("could not queue REST stop\n");
+            return 1;
+        }
         settings_get()->rest_api = false;
         settings_save();
-        printf("REST API stopped\n");
+        printf("REST API stop requested\n");
         return 0;
     }
     if (argc >= 3 && strcmp(argv[1], "epskc") == 0) {
+        if (strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0) {
+            printf("usage: rest epskc <on|off>\n");
+            return 1;
+        }
         bool on = strcmp(argv[2], "on") == 0;
+        if (!otbr_rest_request_epskc(on)) {
+            printf("could not queue ba-epskc change\n");
+            return 1;
+        }
         settings_get()->rest_epskc = on;
         settings_save();
-        thread_epskc_set_feature_enabled(on);
-        otbr_rest_set_epskc(on);
-        printf("ba-epskc endpoints %s\n", on ? "registered" : "removed");
+        printf("ba-epskc endpoint change requested: %s\n", on ? "on" : "off");
         return 0;
     }
     if (argc >= 2 && strcmp(argv[1], "start") == 0) {
-        settings_get()->rest_api = true;
-        settings_save();
-        if (otbr_rest_start() != ESP_OK) {
-            printf("could not start (see log)\n");
+        if (!otbr_rest_request_running(true)) {
+            printf("could not queue REST start\n");
             return 1;
         }
+        settings_get()->rest_api = true;
+        settings_save();
+        printf("REST API start requested\n");
+        return 0;
     }
     printf("REST API : %s\n", otbr_rest_running() ? "running" : "stopped");
     printf("URL      : http://%s:%d\n", s_ip, OTBR_REST_PORT);
@@ -529,7 +803,11 @@ static int cmd_settings(int argc, char **argv)
 static int cmd_share(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
-        thread_share_stop();
+        struct share_stop_args a = { 0 };
+        if (!run_off_console(do_share_stop, &a, 20000) || !a.done) {
+            printf("operation worker unavailable - key state unchanged\n");
+            return 1;
+        }
         printf("ephemeral key stopped\n");
         return 0;
     }
@@ -541,7 +819,10 @@ static int cmd_share(int argc, char **argv)
     struct share_args sa = {
         .lifetime_ms = settings_get()->share_minutes * 60000u, .result = ESP_FAIL,
     };
-    run_off_console(do_share_start, &sa, 30000);
+    if (!run_off_console(do_share_start, &sa, 30000)) {
+        printf("operation worker unavailable - try again\n");
+        return 1;
+    }
     esp_err_t err = sa.result;
     snprintf(code, sizeof(code), "%s", sa.code);
     if (err == ESP_ERR_INVALID_STATE) {
@@ -564,7 +845,10 @@ static int cmd_newnet(int argc, char **argv)
     int ch = 0;
     uint16_t pan = 0;
     struct form_args na = { .channel = settings_get()->new_net_channel, .result = ESP_FAIL };
-    run_off_console(do_form_network, &na, 40000);
+    if (!run_off_console(do_form_network, &na, 40000)) {
+        printf("operation worker unavailable - try again\n");
+        return 1;
+    }
     if (na.result != ESP_OK) {
         printf("failed to create network\n");
         return 1;
@@ -612,7 +896,7 @@ static void register_commands(void)
         { .command = "batt", .help = "battery %, voltage and charge state", .func = cmd_batt },
         { .command = "name", .help = "name <hostname> - set the mDNS/border-router name", .func = cmd_name },
         { .command = "camtest", .help = "start the camera and try 30 frames", .func = cmd_camtest },
-        { .command = "thread", .help = "show Thread role and stored credentials", .func = cmd_thread },
+        { .command = "thread", .help = "thread [scan] - activity and best-effort mesh topology", .func = cmd_thread },
         { .command = "forget", .help = "erase stored Thread credentials", .func = cmd_forget },
         { .command = "wifi", .help = "wifi <ssid> <password>", .func = cmd_wifi },
         { .command = "status", .help = "show wifi/ip state", .func = cmd_status },
@@ -643,6 +927,14 @@ void app_main(void)
 
 
     s_wifi_events = xEventGroupCreate();
+    s_wifi_op_lock = xSemaphoreCreateMutex();
+    if (s_wifi_events == NULL || s_wifi_op_lock == NULL) {
+        ESP_LOGE(TAG, "could not allocate Wi-Fi synchronisation primitives");
+        ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    }
+    if (otbr_rest_control_init() != ESP_OK) {
+        ESP_LOGE(TAG, "REST controls unavailable");
+    }
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_sta_netif = esp_netif_create_default_wifi_sta();
@@ -653,6 +945,8 @@ void app_main(void)
         WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &on_wifi, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_GOT_IP6, &on_wifi, NULL, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH)); /* reuse saved creds */
     ESP_ERROR_CHECK(esp_wifi_start());
@@ -693,6 +987,14 @@ void app_main(void)
     }
     thread_set_prefer_router(settings_get()->prefer_router);
     thread_epskc_set_feature_enabled(settings_get()->rest_epskc);
+    /* A saved AP can deliver GOT_IP before the RCP finishes initializing. The
+     * event's early BR job then correctly skips, so retry once the Thread stack
+     * is authoritative; both paths are idempotent if the event was slower. */
+    if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) {
+        if (!ui_defer_br_start(s_sta_netif)) {
+            thread_start_border_router(s_sta_netif);
+        }
+    }
 
     esp_console_repl_t *repl = NULL;
     esp_console_repl_config_t rcfg = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
@@ -728,17 +1030,21 @@ void app_main(void)
                  esp_err_to_name(cerr));
     }
 
-    /*
-     * Camera pipeline: after the console (its 12 KB REPL stack must win the
-     * contiguous-memory race -- claimed first, the console silently fails to
-     * start), before Wi-Fi/Thread bring-up finishes fragmenting the heap. The
-     * pipeline then stays alive for the life of the process (see qrscan.c),
-     * so this is a one-time claim of the 8 KB DVP DMA buffer.
-     */
+    /* Probe the camera only after the console and network stacks have settled.
+     * STREAMOFF retains the V4L2 buffers and decoder but intentionally releases
+     * the DVP controller, including its 7680-byte DMA staging block. The compact
+     * Wi-Fi buffer profile keeps enough contiguous internal RAM available when
+     * a later QR scan recreates the controller. */
     if (qrscan_start() == ESP_OK) {
         qrscan_stop();
     } else {
         ESP_LOGW(TAG, "camera unavailable - QR scanning disabled");
+    }
+    /* Start the REST lifecycle task after the camera probe; its queue already
+     * captured any early GOT_IP. Its stack and HTTPD's stay in internal RAM so
+     * flash-backed operations remain cache-safe. */
+    if (otbr_rest_control_start() != ESP_OK) {
+        ESP_LOGE(TAG, "REST lifecycle task unavailable");
     }
 
     ui_set_status(UI_STATE_IDLE, "Ready");

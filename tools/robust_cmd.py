@@ -17,6 +17,11 @@ def open_port():
     s = serial.Serial()
     s.port, s.baudrate, s.timeout = PORT, 115200, 0.2
     s.dsrdtr = s.rtscts = False
+    # USB-Serial/JTAG maps these lines to reset/boot.  Set their inactive
+    # levels before opening so repeated smoke-test commands do not reboot the
+    # device and invalidate continuity checks.
+    s.dtr = False
+    s.rts = False
     s.open()
     return s
 

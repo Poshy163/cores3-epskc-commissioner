@@ -30,6 +30,7 @@
 #include "openthread/dataset_ftd.h"
 #include "openthread/instance.h"
 #include "openthread/link.h"
+#include "openthread/mesh_diag.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
 
@@ -42,7 +43,144 @@ static const char *TAG = "thread";
 static bool s_ready;
 static bool s_br_started;
 static bool s_br_starting;
+static portMUX_TYPE s_br_start_lock = portMUX_INITIALIZER_UNLOCKED;
 static esp_netif_t *s_netif;
+
+/* Mesh Diagnostics calls back on OpenThread's own task with the OT API lock
+ * already held. Keep that callback tiny: copy aggregate values behind a
+ * spinlock, then let the UI poll the published snapshot. */
+static portMUX_TYPE s_topology_lock = portMUX_INITIALIZER_UNLOCKED;
+static thread_topology_t s_topology;
+static uint64_t s_topology_router_ids;
+static bool s_topology_missing_child_table;
+
+static void topology_reset(thread_topology_status_t status)
+{
+    taskENTER_CRITICAL(&s_topology_lock);
+    memset(&s_topology, 0, sizeof(s_topology));
+    s_topology.status = status;
+    s_topology_router_ids = 0;
+    s_topology_missing_child_table = false;
+    taskEXIT_CRITICAL(&s_topology_lock);
+}
+
+static void topology_discover_cb(otError error, otMeshDiagRouterInfo *router, void *context)
+{
+    (void) context;
+    uint16_t children = 0;
+    uint16_t child_border_routers = 0;
+    bool child_is_self = false;
+
+    /* Iterators are valid only during this callback. Consume the child table
+     * before publishing anything, and do not call any locking wrapper here. */
+    if (router != NULL && router->mChildIterator != NULL) {
+        otMeshDiagChildInfo child;
+        while (otMeshDiagGetNextChildInfo(router->mChildIterator, &child) == OT_ERROR_NONE) {
+            children++;
+            child_border_routers += child.mIsBorderRouter ? 1 : 0;
+            child_is_self = child_is_self || child.mIsThisDevice;
+        }
+    }
+
+    bool finished = error != OT_ERROR_PENDING;
+    taskENTER_CRITICAL(&s_topology_lock);
+    if (s_topology.status == THREAD_TOPOLOGY_SCANNING && router != NULL &&
+        router->mRouterId < 64) {
+        uint64_t bit = UINT64_C(1) << router->mRouterId;
+        if ((s_topology_router_ids & bit) == 0) {
+            s_topology_router_ids |= bit;
+            s_topology_missing_child_table = s_topology_missing_child_table ||
+                                             router->mChildIterator == NULL;
+            s_topology.routers_seen++;
+            s_topology.children_seen += children;
+            s_topology.border_routers_seen +=
+                (router->mIsBorderRouter ? 1 : 0) + child_border_routers;
+            s_topology.includes_self = s_topology.includes_self ||
+                                       router->mIsThisDevice || child_is_self;
+        }
+    }
+    if (s_topology.status == THREAD_TOPOLOGY_SCANNING && finished) {
+        bool saw_any = s_topology.routers_seen != 0 || s_topology.children_seen != 0;
+        if (error == OT_ERROR_NONE && !s_topology_missing_child_table) {
+            s_topology.status = THREAD_TOPOLOGY_COMPLETE;
+        } else if (saw_any) {
+            s_topology.status = THREAD_TOPOLOGY_PARTIAL;
+        } else {
+            s_topology.status = THREAD_TOPOLOGY_FAILED;
+        }
+        s_topology.completed_at_ms = (uint64_t) esp_timer_get_time() / 1000;
+    }
+    taskEXIT_CRITICAL(&s_topology_lock);
+}
+
+esp_err_t thread_topology_refresh(void)
+{
+    if (!s_ready) {
+        topology_reset(THREAD_TOPOLOGY_FAILED);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* OT -> topology is the lock order used by callbacks and cancellation.
+     * Claim both sides atomically so a concurrent join cannot reset the state
+     * between marking it SCANNING and starting the diagnostic query. */
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    taskENTER_CRITICAL(&s_topology_lock);
+    if (s_topology.status == THREAD_TOPOLOGY_SCANNING) {
+        taskEXIT_CRITICAL(&s_topology_lock);
+        esp_openthread_lock_release();
+        return ESP_ERR_INVALID_STATE;
+    }
+    memset(&s_topology, 0, sizeof(s_topology));
+    s_topology.status = THREAD_TOPOLOGY_SCANNING;
+    s_topology_router_ids = 0;
+    s_topology_missing_child_table = false;
+    taskEXIT_CRITICAL(&s_topology_lock);
+
+    const otMeshDiagDiscoverConfig config = {
+        .mDiscoverIp6Addresses = false,
+        .mDiscoverChildTable = true,
+    };
+    otError error = otMeshDiagDiscoverTopology(esp_openthread_get_instance(), &config,
+                                                topology_discover_cb, NULL);
+    if (error != OT_ERROR_NONE) {
+        taskENTER_CRITICAL(&s_topology_lock);
+        memset(&s_topology, 0, sizeof(s_topology));
+        s_topology.status = THREAD_TOPOLOGY_FAILED;
+        s_topology_router_ids = 0;
+        s_topology_missing_child_table = false;
+        taskEXIT_CRITICAL(&s_topology_lock);
+    }
+    esp_openthread_lock_release();
+
+    if (error == OT_ERROR_NONE) {
+        ESP_LOGI(TAG, "topology scan started");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "topology scan could not start (%d)", error);
+    if (error == OT_ERROR_NO_BUFS) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (error == OT_ERROR_INVALID_STATE || error == OT_ERROR_BUSY) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_FAIL;
+}
+
+void thread_topology_get(thread_topology_t *topology)
+{
+    if (topology == NULL) {
+        return;
+    }
+    taskENTER_CRITICAL(&s_topology_lock);
+    *topology = s_topology;
+    taskEXIT_CRITICAL(&s_topology_lock);
+}
+
+bool thread_available(void)
+{
+    return s_ready;
+}
 
 bool thread_has_dataset(void)
 {
@@ -150,19 +288,42 @@ esp_err_t thread_init(void)
 /* Boot-time BR outcome, queryable later: the logs of this task land in the
  * USB re-enumeration blackout after a port-open reset, so nothing printed
  * here is ever seen. */
-const char *g_br_boot_status = "not started";
+static const char *s_br_boot_status = "not started";
 
-void thread_run_border_router_start(esp_netif_t *backbone)
+const char *thread_border_router_status(void)
+{
+    return s_br_boot_status;
+}
+
+static bool claim_border_router_start(void)
+{
+    bool claimed = false;
+    taskENTER_CRITICAL(&s_br_start_lock);
+    if (!s_br_started && !s_br_starting) {
+        s_br_starting = true;
+        claimed = true;
+    }
+    taskEXIT_CRITICAL(&s_br_start_lock);
+    return claimed;
+}
+
+static void finish_border_router_start(bool started)
+{
+    taskENTER_CRITICAL(&s_br_start_lock);
+    s_br_started = started;
+    s_br_starting = false;
+    taskEXIT_CRITICAL(&s_br_start_lock);
+}
+
+/* Run after the caller has atomically reserved s_br_starting. */
+static void run_border_router_start_claimed(esp_netif_t *backbone)
 {
     if (!s_ready || backbone == NULL) {
-        g_br_boot_status = "br start skipped (thread not ready)";
+        s_br_boot_status = "br start skipped (thread not ready)";
+        finish_border_router_start(false);
         return;
     }
-    if (s_br_started || s_br_starting) {
-        return;
-    }
-    s_br_starting = true;
-    g_br_boot_status = "br start running";
+    s_br_boot_status = "br start running";
 
     esp_openthread_lock_acquire(portMAX_DELAY);
     esp_openthread_set_backbone_netif(backbone);
@@ -170,8 +331,8 @@ void thread_run_border_router_start(esp_netif_t *backbone)
     if (err != ESP_OK) {
         esp_openthread_lock_release();
         ESP_LOGE(TAG, "border_router_init failed: %s", esp_err_to_name(err));
-        g_br_boot_status = "border_router_init FAILED";
-        s_br_starting = false;
+        s_br_boot_status = "border_router_init FAILED";
+        finish_border_router_start(false);
         return;
     }
 
@@ -186,29 +347,40 @@ void thread_run_border_router_start(esp_netif_t *backbone)
     otError oterr = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &ds);
     if (oterr == OT_ERROR_NONE && ds.mLength > 0) {
         ESP_LOGI(TAG, "stored credentials found, re-attaching");
-        g_br_boot_status = "re-attach started";
+        s_br_boot_status = "border router up; re-attach started";
         err = esp_openthread_auto_start(&ds);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "auto_start failed: %s", esp_err_to_name(err));
-            g_br_boot_status = "auto_start FAILED";
+            s_br_boot_status = "border router up; auto_start FAILED";
         }
     } else {
         ESP_LOGI(TAG, "border router up; no credentials stored yet");
-        g_br_boot_status = "no stored credentials";
+        s_br_boot_status = "border router up; no stored credentials";
     }
     esp_openthread_lock_release();
 
-    s_br_started = true;
-    g_br_boot_status = "border router up";
+    finish_border_router_start(true);
     /* Note: meshcop is published by the stack on attach, not here -- watch for
      * "Failed to publish meshcop mdns service" rather than trusting this line. */
     ESP_LOGI(TAG, "border router init done");
 }
 
+void thread_run_border_router_start(esp_netif_t *backbone)
+{
+    if (!s_ready || backbone == NULL) {
+        s_br_boot_status = "br start skipped (thread not ready)";
+        return;
+    }
+    if (!claim_border_router_start()) {
+        return;
+    }
+    run_border_router_start_claimed(backbone);
+}
+
 /* Fallback for headless boots (no UI worker): own task, own stack. */
 static void br_start_task(void *arg)
 {
-    thread_run_border_router_start((esp_netif_t *) arg);
+    run_border_router_start_claimed((esp_netif_t *) arg);
     vTaskDelete(NULL);
 }
 
@@ -217,7 +389,7 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
     if (!s_ready || backbone == NULL) {
         return ESP_FAIL;
     }
-    if (s_br_started || s_br_starting) {
+    if (!claim_border_router_start()) {
         return ESP_OK;
     }
 
@@ -228,11 +400,12 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
      * reboots the board.
      */
     if (xTaskCreate(br_start_task, "ot_br_start", 8192, backbone, 4, NULL) != pdPASS) {
-        g_br_boot_status = "br task spawn FAILED (no internal RAM)";
+        finish_border_router_start(false);
+        s_br_boot_status = "br task spawn FAILED (no internal RAM)";
         ESP_LOGE(TAG, "could not start border router task");
         return ESP_ERR_NO_MEM;
     }
-    g_br_boot_status = "br task spawned";
+    s_br_boot_status = "br task spawned";
     return ESP_OK;
 }
 
@@ -243,6 +416,8 @@ esp_err_t thread_forget(void)
     }
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *ins = esp_openthread_get_instance();
+    otMeshDiagCancel(ins);
+    topology_reset(THREAD_TOPOLOGY_NEVER);
     otThreadSetEnabled(ins, false);
     otIp6SetEnabled(ins, false);
     otError err = otInstanceErasePersistentInfo(ins);
@@ -272,8 +447,34 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     memcpy(ds.mTlvs, tlvs, len);
     ds.mLength = (uint8_t) len;
 
+    /* This OpenThread release validates TLV framing, values and duplicates in
+     * otDatasetParseTlvs(), but predates otDatasetIsValid(). Check the complete
+     * Active Dataset contract explicitly before touching the working network. */
+    otOperationalDataset parsed;
+    otError parse_err = otDatasetParseTlvs(&ds, &parsed);
+    const otOperationalDatasetComponents *c = &parsed.mComponents;
+    bool complete = parse_err == OT_ERROR_NONE &&
+                    c->mIsActiveTimestampPresent && c->mIsChannelPresent &&
+                    c->mIsChannelMaskPresent && c->mIsExtendedPanIdPresent &&
+                    c->mIsMeshLocalPrefixPresent && c->mIsNetworkKeyPresent &&
+                    c->mIsNetworkNamePresent && c->mIsPanIdPresent &&
+                    c->mIsPskcPresent && c->mIsSecurityPolicyPresent;
+    if (!complete) {
+        ESP_LOGE(TAG, "invalid operational dataset (%d)", parse_err);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *ins = esp_openthread_get_instance();
+    otMeshDiagCancel(ins);
+    topology_reset(THREAD_TOPOLOGY_NEVER);
+
+    /* Keep an in-memory rollback copy. WIFI_STORAGE_FLASH has an equivalent
+     * safeguard in app_wifi_join(); Thread replacement should be no easier to
+     * strand than Wi-Fi replacement. */
+    otOperationalDatasetTlvs previous;
+    bool had_previous = otDatasetGetActiveTlvs(ins, &previous) == OT_ERROR_NONE &&
+                        previous.mLength > 0;
 
     /*
      * Wipe stored network info before applying the new dataset.
@@ -288,12 +489,42 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     otIp6SetEnabled(ins, false);
     otError oterr = otInstanceErasePersistentInfo(ins);
     if (oterr != OT_ERROR_NONE) {
-        ESP_LOGW(TAG, "could not erase stored network info (%d); attaching anyway", oterr);
+        ESP_LOGE(TAG, "could not erase stored network info (%d); candidate not applied", oterr);
+        if (had_previous) {
+            esp_err_t restore_err = esp_openthread_auto_start(&previous);
+            if (restore_err != ESP_OK) {
+                ESP_LOGE(TAG, "could not resume previous dataset: %s",
+                         esp_err_to_name(restore_err));
+            }
+        }
+        esp_openthread_lock_release();
+        return ESP_FAIL;
     }
 
     /* auto_start sets the dataset and brings the interface up, and is the same
      * path used on reboot -- keeping both routes identical. */
     esp_err_t err = esp_openthread_auto_start(&ds);
+    if (err != ESP_OK) {
+        if (had_previous) {
+            esp_err_t restore_err = esp_openthread_auto_start(&previous);
+            if (restore_err == ESP_OK) {
+                ESP_LOGW(TAG, "new dataset rejected; previous dataset restored");
+            } else {
+                ESP_LOGE(TAG, "new dataset and rollback both failed: %s",
+                         esp_err_to_name(restore_err));
+            }
+        } else {
+            /* auto_start may persist the candidate before a later enable step
+             * fails. With no previous dataset, erase it so a reported failure
+             * cannot become the next boot's credentials. */
+            otThreadSetEnabled(ins, false);
+            otIp6SetEnabled(ins, false);
+            otError erase_err = otInstanceErasePersistentInfo(ins);
+            if (erase_err != OT_ERROR_NONE) {
+                ESP_LOGE(TAG, "failed candidate could not be erased: %d", erase_err);
+            }
+        }
+    }
     esp_openthread_lock_release();
 
     if (err != ESP_OK) {
@@ -349,15 +580,8 @@ esp_err_t thread_form_network(uint8_t channel, char *name, size_t name_len,
     return thread_join(tlvs.mTlvs, tlvs.mLength);
 }
 
-const char *thread_role(void)
+static const char *role_name(otDeviceRole role)
 {
-    if (!s_ready) {
-        return "disabled";
-    }
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
-    esp_openthread_lock_release();
-
     switch (role) {
     case OT_DEVICE_ROLE_DISABLED: return "disabled";
     case OT_DEVICE_ROLE_DETACHED: return "detached";
@@ -366,6 +590,31 @@ const char *thread_role(void)
     case OT_DEVICE_ROLE_LEADER:   return "leader";
     default:                      return "?";
     }
+}
+
+/* Caller holds the OpenThread API lock. */
+static uint16_t count_children_locked(otInstance *instance)
+{
+    uint16_t count = 0;
+    uint16_t max = otThreadGetMaxAllowedChildren(instance);
+    for (uint16_t i = 0; i < max; i++) {
+        otChildInfo child;
+        if (otThreadGetChildInfoByIndex(instance, i, &child) == OT_ERROR_NONE) {
+            count++;
+        }
+    }
+    return count;
+}
+
+const char *thread_role(void)
+{
+    if (!s_ready) {
+        return "disabled";
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otDeviceRole role = otThreadGetDeviceRole(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    return role_name(role);
 }
 
 bool thread_attached(void)
@@ -386,6 +635,70 @@ bool thread_link_rssi(int8_t *rssi)
     /* 127 is OpenThread's "no measurement yet" sentinel, which shows up in the
      * window between attaching and the first parent frame. */
     return err == OT_ERROR_NONE && *rssi != 127;
+}
+
+bool thread_activity_get(thread_activity_t *activity)
+{
+    if (!s_ready || activity == NULL) {
+        return false;
+    }
+
+    memset(activity, 0, sizeof(*activity));
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *instance = esp_openthread_get_instance();
+    otDeviceRole role = otThreadGetDeviceRole(instance);
+    activity->attached = role == OT_DEVICE_ROLE_CHILD ||
+                         role == OT_DEVICE_ROLE_ROUTER ||
+                         role == OT_DEVICE_ROLE_LEADER;
+    snprintf(activity->role, sizeof(activity->role), "%s", role_name(role));
+
+    if (activity->attached) {
+        activity->attach_duration_s = otThreadGetCurrentAttachDuration(instance);
+        uint8_t max_router_id = otThreadGetMaxRouterId(instance);
+        for (uint16_t router_id = 0; router_id <= max_router_id; router_id++) {
+            otRouterInfo router_info;
+            if (otThreadGetRouterInfo(instance, router_id, &router_info) == OT_ERROR_NONE &&
+                router_info.mAllocated) {
+                activity->known_routers++;
+            }
+        }
+    }
+
+    if (role == OT_DEVICE_ROLE_CHILD) {
+        otRouterInfo parent;
+        if (otThreadGetParentInfo(instance, &parent) == OT_ERROR_NONE) {
+            activity->parent_valid = true;
+            activity->parent_rloc16 = parent.mRloc16;
+            activity->parent_lqi = parent.mLinkQualityIn;
+        }
+        int8_t rssi;
+        if (otThreadGetParentAverageRssi(instance, &rssi) == OT_ERROR_NONE && rssi != 127) {
+            activity->parent_rssi_valid = true;
+            activity->parent_rssi = rssi;
+        }
+    } else if (role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER) {
+        activity->direct_children_valid = true;
+        activity->direct_children = count_children_locked(instance);
+    }
+
+    const otMacCounters *mac = otLinkGetCounters(instance);
+    if (mac != NULL) {
+        activity->mac_tx_total = mac->mTxTotal;
+        activity->mac_rx_total = mac->mRxTotal;
+    }
+    const otIpCounters *ip = otThreadGetIp6Counters(instance);
+    if (ip != NULL) {
+        activity->ip_tx_success = ip->mTxSuccess;
+        activity->ip_rx_success = ip->mRxSuccess;
+        activity->ip_tx_failure = ip->mTxFailure;
+        activity->ip_rx_failure = ip->mRxFailure;
+    }
+    const otMleCounters *mle = otThreadGetMleCounters(instance);
+    if (mle != NULL) {
+        activity->parent_changes = mle->mParentChanges;
+    }
+    esp_openthread_lock_release();
+    return true;
 }
 
 /* ---------------- sharing (ePSKc border-agent side) ---------------- */
@@ -519,15 +832,8 @@ int thread_child_count(void)
         return 0;
     }
     otInstance *ins = esp_openthread_get_instance();
-    int n = 0;
     esp_openthread_lock_acquire(portMAX_DELAY);
-    uint16_t max = otThreadGetMaxAllowedChildren(ins);
-    for (uint16_t i = 0; i < max; i++) {
-        otChildInfo ci;
-        if (otThreadGetChildInfoByIndex(ins, i, &ci) == OT_ERROR_NONE) {
-            n++;
-        }
-    }
+    int n = count_children_locked(ins);
     esp_openthread_lock_release();
     return n;
 }
@@ -691,6 +997,10 @@ esp_err_t thread_set_enabled(bool on)
     }
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *ins = esp_openthread_get_instance();
+    if (!on) {
+        otMeshDiagCancel(ins);
+        topology_reset(THREAD_TOPOLOGY_NEVER);
+    }
     otError err = otIp6SetEnabled(ins, on);
     if (err == OT_ERROR_NONE) {
         err = otThreadSetEnabled(ins, on);

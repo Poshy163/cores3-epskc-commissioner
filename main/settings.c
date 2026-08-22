@@ -77,12 +77,17 @@ void settings_save(void)
     nvs_close(h);
 }
 
-void settings_erase(void)
+esp_err_t settings_erase(void)
 {
     nvs_handle_t h;
-    if (nvs_open(NS, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_erase_all(h);
-        nvs_commit(h);
-        nvs_close(h);
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
     }
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
 }

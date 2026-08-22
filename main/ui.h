@@ -46,7 +46,10 @@ bool ui_defer_br_start(esp_netif_t *backbone);
  * motivating case: esp_http_server gives them ~4 KB, and OpenThread calls that
  * reach the spinel layer need far more, so calling them directly overflowed
  * the HTTP task and corrupted FreeRTOS' task lists. False if the worker is not
- * running or the call did not finish inside timeout_ms.
+ * running or the request could not be accepted inside timeout_ms. Once the
+ * request is accepted this function retains the caller-owned `arg` until the
+ * worker finishes; it logs if execution exceeds timeout_ms rather than
+ * returning early and leaving a dangling stack pointer.
  */
 typedef void (*ui_worker_fn)(void *arg);
 bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms);

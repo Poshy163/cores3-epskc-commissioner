@@ -7,6 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_err.h"
+
 typedef struct {
     uint8_t brightness;       /* 10..100 */
     uint8_t sleep_idx;        /* index into settings_sleep_ms[] */
@@ -27,4 +29,4 @@ void settings_save(void);
 settings_t *settings_get(void);
 
 /* Wipe this namespace. Used by Factory reset. */
-void settings_erase(void);
+esp_err_t settings_erase(void);
