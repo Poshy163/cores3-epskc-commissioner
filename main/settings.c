@@ -1,5 +1,7 @@
 #include "settings.h"
 
+#include <string.h>
+
 #include "esp_log.h"
 #include "nvs.h"
 
@@ -22,6 +24,61 @@ static settings_t s_cfg = {
 settings_t *settings_get(void)
 {
     return &s_cfg;
+}
+
+esp_err_t settings_get_device_name(char *name, size_t name_size)
+{
+    if (name == NULL || name_size < sizeof(SETTINGS_DEFAULT_DEVICE_NAME)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memcpy(name, SETTINGS_DEFAULT_DEVICE_NAME, sizeof(SETTINGS_DEFAULT_DEVICE_NAME));
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char stored[SETTINGS_DEVICE_NAME_BUFFER_SIZE];
+    size_t stored_size = sizeof(stored);
+    err = nvs_get_str(h, "host", stored, &stored_size);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK || stored_size <= 1 || stored_size > sizeof(stored) ||
+        stored_size > name_size) {
+        ESP_LOGW(TAG, "ignoring invalid saved device name");
+        return err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
+    }
+    memcpy(name, stored, stored_size);
+    return ESP_OK;
+}
+
+esp_err_t settings_set_device_name(const char *name)
+{
+    if (name == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t length = strlen(name);
+    if (length == 0 || length > SETTINGS_DEVICE_NAME_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_str(h, "host", name);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
 }
 
 void settings_load(void)

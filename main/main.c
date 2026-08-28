@@ -10,6 +10,7 @@
  * Credentials are entered at runtime and never compiled in.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_console.h"
@@ -25,6 +26,7 @@
 #include "nvs_flash.h"
 
 #include "discover.h"
+#include "matter.h"
 #include "meshcop.h"
 #include "otbr_rest.h"
 #include "power.h"
@@ -41,6 +43,7 @@ static const char *TAG = "epskc";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 #define WIFI_DISCONNECTED_BIT BIT2
+#define WIFI_BACKBONE_READY_BIT BIT3
 
 static EventGroupHandle_t s_wifi_events;
 static SemaphoreHandle_t s_wifi_op_lock; /* serialises UI, console and reset callers */
@@ -79,7 +82,7 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
             ESP_LOGW(TAG, "no backbone IPv6 link-local: %s", esp_err_to_name(err));
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_BACKBONE_READY_BIT);
         strcpy(s_ip, "-");
         strcpy(s_ip6, "-");
         ui_set_wifi(NULL, NULL);
@@ -101,7 +104,7 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_retries = 0;
         refresh_wifi_ui();
         xEventGroupClearBits(s_wifi_events, WIFI_FAIL_BIT);
-        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_BACKBONE_READY_BIT);
         /* Backbone is up, so the border router can start and (if credentials
          * are stored) re-attach to its network. Idempotent on reconnects. */
         if (!ui_defer_br_start(s_sta_netif)) {
@@ -119,6 +122,13 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (e->esp_netif == s_sta_netif) {
             snprintf(s_ip6, sizeof(s_ip6), IPV6STR, IPV62STR(e->ip6_info.ip));
             ESP_LOGI(TAG, "backbone IPv6 %s", s_ip6);
+            xEventGroupSetBits(s_wifi_events, WIFI_BACKBONE_READY_BIT);
+            /* IPv4 is not a prerequisite for Thread border routing.  Start on
+             * a usable backbone IPv6 address too; the operation is idempotent
+             * if the IPv4 event already queued it. */
+            if (!ui_defer_br_start(s_sta_netif)) {
+                thread_start_border_router(s_sta_netif);
+            }
         }
     }
 }
@@ -334,6 +344,10 @@ static int cmd_status(int argc, char **argv)
     }
     printf("ip     : %s\n", s_ip);
     printf("ipv6   : %s\n", s_ip6);
+    printf("matter : %s (endpoint %u, window %s)\n",
+           matter_status_string(matter_get_status()),
+           (unsigned) matter_get_thread_border_router_endpoint_id(),
+           matter_is_commissioning_window_open() ? "open" : "closed");
     printf("lvgl st: %u bytes free (min)\n", (unsigned) ui_lvgl_stack_free());
     printf("reveal : %s\n", s_reveal ? "on" : "off");
     printf("fw     : %s\n", FW_VERSION);
@@ -349,6 +363,61 @@ static int cmd_reveal(int argc, char **argv)
     s_reveal = (argv[1][0] == '1');
     printf("secrets will be %s\n", s_reveal ? "SHOWN" : "masked");
     return 0;
+}
+
+static int cmd_matter(int argc, char **argv)
+{
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
+        matter_runtime_status_t status = matter_get_status();
+        printf("state   : %s\n", matter_status_string(status));
+        printf("endpoint: %u (Thread Border Router 0x0091)\n",
+               (unsigned) matter_get_thread_border_router_endpoint_id());
+        printf("fabric  : %s\n", matter_is_commissioned() ? "commissioned" : "not commissioned");
+        printf("window  : %s\n", matter_is_commissioning_window_open() ? "open" : "closed");
+        if (status == MATTER_RUNTIME_ERROR) {
+            printf("error   : %s\n", esp_err_to_name(matter_get_last_error()));
+        }
+        return 0;
+    }
+
+    if (argc == 2 && strcmp(argv[1], "code") == 0) {
+        char qr[MATTER_QR_CODE_BUFFER_SIZE];
+        char manual[MATTER_MANUAL_CODE_BUFFER_SIZE];
+        esp_err_t err = matter_get_onboarding_codes(qr, sizeof(qr), manual, sizeof(manual));
+        if (err != ESP_OK) {
+            printf("pairing code unavailable: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("manual  : %s\n", manual);
+        printf("QR data : %s\n", qr);
+        return 0;
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "open") == 0) {
+        unsigned long seconds = 900;
+        if (argc == 3) {
+            char *end = NULL;
+            seconds = strtoul(argv[2], &end, 10);
+            if (end == argv[2] || *end != '\0' || seconds > UINT16_MAX) {
+                printf("usage: matter open [180..900]\n");
+                return 1;
+            }
+        }
+        esp_err_t err = matter_open_commissioning_window((uint16_t) seconds);
+        if (err != ESP_OK) {
+            printf("could not open Matter window: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        for (int i = 0; i < 20 && !matter_is_commissioning_window_open(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        printf("Matter commissioning window %s for %lu seconds\n",
+               matter_is_commissioning_window_open() ? "open" : "requested", seconds);
+        return 0;
+    }
+
+    printf("usage: matter [status|code|open [180..900]]\n");
+    return 1;
 }
 
 /*
@@ -650,19 +719,16 @@ static int cmd_camtest(int argc, char **argv)
 
 static int cmd_name(int argc, char **argv)
 {
-    if (argc < 2 || strlen(argv[1]) > 32) {
-        printf("usage: name <mdns-hostname>   (max 32 chars)\n");
+    if (argc < 2 || strlen(argv[1]) > SETTINGS_DEVICE_NAME_MAX_LEN) {
+        printf("usage: name <border-router-name>   (max 32 chars)\n");
         return 1;
     }
-    nvs_handle_t h;
-    if (nvs_open("cfg", NVS_READWRITE, &h) != ESP_OK) {
-        printf("nvs open failed\n");
+    esp_err_t err = settings_set_device_name(argv[1]);
+    if (err != ESP_OK) {
+        printf("could not save name: %s\n", esp_err_to_name(err));
         return 1;
     }
-    nvs_set_str(h, "host", argv[1]);
-    nvs_commit(h);
-    nvs_close(h);
-    printf("mDNS name set to \"%s\" - reboot to re-publish\n", argv[1]);
+    printf("Matter/MeshCoP name set to \"%s\" - reboot to re-publish\n", argv[1]);
     return 0;
 }
 
@@ -709,7 +775,23 @@ void app_factory_reset(void)
         ui_set_status(UI_STATE_ERROR, "Factory reset incomplete - try again");
         return;
     }
-    app_reboot();
+    /* Matter owns a separate NVS partition.  Its factory-reset path removes
+     * every fabric and CHIP key, then schedules the reboot. */
+    esp_err_t matter_err = matter_factory_reset();
+    if (matter_err == ESP_ERR_INVALID_STATE) {
+        /* Matter never started, so there are no live CHIP users of the
+         * partition. Erase it directly and use the normal reboot path. */
+        matter_err = nvs_flash_erase_partition("matter_nvs");
+        if (matter_err == ESP_OK) {
+            app_reboot();
+            return;
+        }
+    }
+    if (matter_err != ESP_OK) {
+        ESP_LOGE(TAG, "Matter factory reset incomplete: %s", esp_err_to_name(matter_err));
+        ui_set_status(UI_STATE_ERROR, "Factory reset incomplete - Matter data remains");
+    }
+    /* On success esp_matter::factory_reset() reboots asynchronously. */
 }
 
 static int cmd_rest(int argc, char **argv)
@@ -896,9 +978,10 @@ static void register_commands(void)
         { .command = "settings", .help = "show persisted settings", .func = cmd_settings },
         { .command = "share", .help = "share [stop|state] - ePSKc code so a commissioner can pull our credentials", .func = cmd_share },
         { .command = "batt", .help = "battery %, voltage and charge state", .func = cmd_batt },
-        { .command = "name", .help = "name <hostname> - set the mDNS/border-router name", .func = cmd_name },
+        { .command = "name", .help = "name <name> - set the Matter/MeshCoP border-router name", .func = cmd_name },
         { .command = "camtest", .help = "start the camera and try 30 frames", .func = cmd_camtest },
         { .command = "thread", .help = "thread [scan] - activity and best-effort mesh topology", .func = cmd_thread },
+        { .command = "matter", .help = "matter [status|code|open [seconds]]", .func = cmd_matter },
         { .command = "forget", .help = "erase stored Thread credentials", .func = cmd_forget },
         { .command = "wifi", .help = "wifi <ssid> <password>", .func = cmd_wifi },
         { .command = "status", .help = "show wifi/ip state", .func = cmd_status },
@@ -980,10 +1063,14 @@ void app_main(void)
         ESP_LOGW(TAG, "mDNS init failed - discovery and meshcop publishing will not work");
     }
 
-    /* OpenThread must come up AFTER esp_netif_init() and the default event
-     * loop: its netif attach registers event handlers and fails with
-     * ESP_ERR_INVALID_STATE otherwise. Non-fatal -- without the radio this is
-     * still a working commissioner, it just cannot attach to the network. */
+    /* Matter owns the one OpenThread host task, exposes this appliance as the
+     * standard Matter Thread Border Router device type, and uses the existing
+     * application-controlled Wi-Fi connection as its infrastructure link. */
+    if (matter_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Matter startup failed - Matter and Thread unavailable");
+    }
+
+    /* Adopt Matter's OpenThread instance; never launch a second radio task. */
     if (thread_init() != ESP_OK) {
         ESP_LOGW(TAG, "OpenThread unavailable - credential retrieval still works");
     }
@@ -992,7 +1079,7 @@ void app_main(void)
     /* A saved AP can deliver GOT_IP before the RCP finishes initializing. The
      * event's early BR job then correctly skips, so retry once the Thread stack
      * is authoritative; both paths are idempotent if the event was slower. */
-    if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) {
+    if (xEventGroupGetBits(s_wifi_events) & WIFI_BACKBONE_READY_BIT) {
         if (!ui_defer_br_start(s_sta_netif)) {
             thread_start_border_router(s_sta_netif);
         }

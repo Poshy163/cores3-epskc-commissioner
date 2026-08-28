@@ -11,19 +11,16 @@
 
 #include <string.h>
 
-#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_lock.h"
-#include "esp_openthread_netif_glue.h"
-#include "esp_openthread_types.h"
-#include "esp_vfs_eventfd.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mdns.h"
+#include "nvs.h"
 #include "openthread/border_agent.h"
 #include "openthread/border_agent_ephemeral_key.h"
 #include "openthread/dataset.h"
@@ -33,18 +30,15 @@
 #include "openthread/mesh_diag.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
+#include "settings.h"
 
 static const char *TAG = "thread";
-
-#define PIN_RCP_RX    10   /* S3 receives here */
-#define PIN_RCP_TX    17   /* S3 transmits here */
-#define PIN_RCP_RESET 7
 
 static bool s_ready;
 static bool s_br_started;
 static bool s_br_starting;
 static portMUX_TYPE s_br_start_lock = portMUX_INITIALIZER_UNLOCKED;
-static esp_netif_t *s_netif;
+static char s_border_router_name[SETTINGS_DEVICE_NAME_BUFFER_SIZE] = SETTINGS_DEFAULT_DEVICE_NAME;
 
 /* Mesh Diagnostics calls back on OpenThread's own task with the OT API lock
  * already held. Keep that callback tiny: copy aggregate values behind a
@@ -194,95 +188,26 @@ bool thread_has_dataset(void)
     return err == OT_ERROR_NONE && ds.mLength > 0;
 }
 
-static void rcp_reset(void)
-{
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << PIN_RCP_RESET,
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    gpio_config(&io);
-    gpio_set_level(PIN_RCP_RESET, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(PIN_RCP_RESET, 1);
-    vTaskDelay(pdMS_TO_TICKS(200));
-}
-
-static void ot_task(void *arg)
-{
-    (void) arg;
-    esp_openthread_platform_config_t cfg = {
-        .radio_config = {
-            .radio_mode = RADIO_MODE_UART_RCP,
-            .radio_uart_config = {
-                .port = UART_NUM_1,
-                .uart_config = {
-                    .baud_rate = 460800,
-                    .data_bits = UART_DATA_8_BITS,
-                    .parity = UART_PARITY_DISABLE,
-                    .stop_bits = UART_STOP_BITS_1,
-                    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-                    .rx_flow_ctrl_thresh = 0,
-                    .source_clk = UART_SCLK_DEFAULT,
-                },
-                .rx_pin = PIN_RCP_RX,
-                .tx_pin = PIN_RCP_TX,
-            },
-        },
-        .host_config = { .host_connection_mode = HOST_CONNECTION_MODE_NONE },
-        .port_config = { .storage_partition_name = "nvs", .netif_queue_size = 10, .task_queue_size = 10 },
-    };
-
-    if (esp_openthread_init(&cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "esp_openthread_init failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_OPENTHREAD();
-    s_netif = esp_netif_new(&netif_cfg);
-    /* Not fatal: aborting here takes the whole device down over a radio that
-     * the commissioner half does not need. */
-    esp_err_t aerr = s_netif ? esp_netif_attach(s_netif, esp_openthread_netif_glue_init(&cfg))
-                             : ESP_FAIL;
-    if (aerr != ESP_OK) {
-        ESP_LOGE(TAG, "netif attach failed (%s) - Thread disabled", esp_err_to_name(aerr));
-        esp_openthread_deinit();
-        vTaskDelete(NULL);
-        return;
-    }
-
-    s_ready = true;
-    ESP_LOGI(TAG, "OpenThread stack running (RCP over UART%d)", UART_NUM_1);
-
-    esp_openthread_launch_mainloop();   /* does not return */
-
-    esp_openthread_netif_glue_deinit();
-    esp_netif_destroy(s_netif);
-    esp_openthread_deinit();
-    vTaskDelete(NULL);
-}
-
 esp_err_t thread_init(void)
 {
     if (s_ready) {
         return ESP_OK;
     }
-    esp_vfs_eventfd_config_t ev = { .max_fds = 3 };
-    esp_err_t err = esp_vfs_eventfd_register(&ev);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        return err;
-    }
 
-    rcp_reset();
-
-    if (xTaskCreate(ot_task, "ot_main", 10240, NULL, 5, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "could not start OpenThread task");
-        return ESP_ERR_NO_MEM;
-    }
-    for (int i = 0; i < 100 && !s_ready; i++) {
+    /* ESP-Matter owns the single OpenThread host instance and task.  The rest
+     * of this module deliberately only adopts that instance: starting the old
+     * standalone mainloop here as well would put two tasks on the H2's UART. */
+    otInstance *instance = esp_openthread_get_instance();
+    for (int i = 0; i < 100 && !otInstanceIsInitialized(instance); i++) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    return s_ready ? ESP_OK : ESP_FAIL;
+    if (!otInstanceIsInitialized(instance)) {
+        ESP_LOGE(TAG, "Matter-owned OpenThread stack did not become ready");
+        return ESP_ERR_TIMEOUT;
+    }
+    s_ready = true;
+    ESP_LOGI(TAG, "adopted Matter OpenThread stack (H2 RCP over UART1)");
+    return ESP_OK;
 }
 
 /* Boot-time BR outcome, queryable later: the logs of this task land in the
@@ -325,9 +250,21 @@ static void run_border_router_start_claimed(esp_netif_t *backbone)
     }
     s_br_boot_status = "br start running";
 
+    esp_err_t err = settings_get_device_name(s_border_router_name, sizeof(s_border_router_name));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "using default border-router name: %s", esp_err_to_name(err));
+    }
+    err = esp_openthread_set_meshcop_instance_name(s_border_router_name);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not set MeshCoP instance name: %s", esp_err_to_name(err));
+        s_br_boot_status = "MeshCoP name setup FAILED";
+        finish_border_router_start(false);
+        return;
+    }
+
     esp_openthread_lock_acquire(portMAX_DELAY);
     esp_openthread_set_backbone_netif(backbone);
-    esp_err_t err = esp_openthread_border_router_init();
+    err = esp_openthread_border_router_init();
     if (err != ESP_OK) {
         esp_openthread_lock_release();
         ESP_LOGE(TAG, "border_router_init failed: %s", esp_err_to_name(err));
@@ -411,11 +348,27 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
 
 esp_err_t thread_forget(void)
 {
-    if (!s_ready) {
-        return ESP_FAIL;
+    otInstance *ins = esp_openthread_get_instance();
+    if (!otInstanceIsInitialized(ins)) {
+        /* Recovery path for a failed Matter/RCP startup: erase only the
+         * OpenThread namespace, leaving unrelated legacy NVS data alone. */
+        nvs_handle_t h;
+        esp_err_t err = nvs_open_from_partition("nvs", "openthread", NVS_READWRITE, &h);
+        if (err != ESP_OK) {
+            return err;
+        }
+        err = nvs_erase_all(h);
+        if (err == ESP_OK) {
+            err = nvs_commit(h);
+        }
+        nvs_close(h);
+        if (err == ESP_OK) {
+            topology_reset(THREAD_TOPOLOGY_NEVER);
+            ESP_LOGI(TAG, "offline Thread credentials erased");
+        }
+        return err;
     }
     esp_openthread_lock_acquire(portMAX_DELAY);
-    otInstance *ins = esp_openthread_get_instance();
     otMeshDiagCancel(ins);
     topology_reset(THREAD_TOPOLOGY_NEVER);
     otThreadSetEnabled(ins, false);

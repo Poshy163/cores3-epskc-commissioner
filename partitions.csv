@@ -1,5 +1,8 @@
 # Name,   Type, SubType, Offset,  Size
-# Single large app: camera + quirc + LVGL + mbedTLS outgrew the 1.5 MB default.
+# Large factory app: camera/UI plus Matter 1.5 and the full Thread BR stack.
+# The original NVS offsets stay unchanged so a normal sparse flash preserves
+# the saved Wi-Fi and Thread operational dataset.
 nvs,       data, nvs,     0x9000,  0x6000,
 phy_init,  data, phy,     0xf000,  0x1000,
-factory,   app,  factory, 0x10000, 0x400000,
+factory,   app,  factory, 0x10000, 0x700000,
+matter_nvs,data, nvs,     0x710000,0x10000,

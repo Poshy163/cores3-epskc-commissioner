@@ -35,7 +35,6 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
-#include "mdns.h"
 
 static const char *TAG = "ui";
 
@@ -1795,13 +1794,8 @@ static void on_share_choice(lv_event_t *e)
 static void on_name_open(lv_event_t *e)
 {
     (void) e;
-    char host[33] = "cores3-thread-br";
-    nvs_handle_t h;
-    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) {
-        size_t len = sizeof(host);
-        nvs_get_str(h, "host", host, &len);
-        nvs_close(h);
-    }
+    char host[SETTINGS_DEVICE_NAME_BUFFER_SIZE];
+    settings_get_device_name(host, sizeof(host));
     lv_textarea_set_text(name_ta, host);
     show_panel(panel_name);
 }
@@ -1820,15 +1814,11 @@ static void on_name_kb(lv_event_t *e)
     if (name[0] == '\0') {
         return;
     }
-    nvs_handle_t h;
-    if (nvs_open("cfg", NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_str(h, "host", name);
-        nvs_commit(h);
-        nvs_close(h);
+    if (settings_set_device_name(name) != ESP_OK) {
+        ESP_LOGE(TAG, "could not save device name");
+        return;
     }
-    /* Takes effect for anything published from now on; the meshcop record
-     * re-publishes on the next attach or reboot. */
-    mdns_hostname_set(name);
+    /* Both Matter and MeshCoP publish this value during boot. */
     show_panel(panel_settings);
 }
 
@@ -2193,7 +2183,7 @@ static void build_name(void)
 {
     panel_name = mk_panel();
 
-    mk_caption(panel_name, "Device name (mDNS)", 0);
+    mk_caption(panel_name, "Border router name (reboot)", 0);
 
     name_ta = lv_textarea_create(panel_name);
     lv_textarea_set_one_line(name_ta, true);

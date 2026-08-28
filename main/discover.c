@@ -5,7 +5,6 @@
 
 #include "esp_log.h"
 #include "mdns.h"
-#include "nvs.h"
 
 static const char *TAG = "discover";
 static bool s_started;
@@ -20,17 +19,8 @@ esp_err_t discover_init(void)
         ESP_LOGE(TAG, "mdns_init: %s", esp_err_to_name(err));
         return err;
     }
-    /* The hostname doubles as the meshcop instance name in HA's Thread panel,
-     * so it is user-settable (console `name` command). Namespace "cfg", not
-     * "epskc": the latter is erased wholesale by Forget network. */
-    char host[33] = "cores3-thread-br";
-    nvs_handle_t h;
-    if (nvs_open("cfg", NVS_READONLY, &h) == ESP_OK) {
-        size_t len = sizeof(host);
-        nvs_get_str(h, "host", host, &len);
-        nvs_close(h);
-    }
-    mdns_hostname_set(host);
+    /* Matter owns the responder's global host label. The saved user-facing
+     * name is applied to the MeshCoP service instance and TBR cluster instead. */
     s_started = true;
     return ESP_OK;
 }

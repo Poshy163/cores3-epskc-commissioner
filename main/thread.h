@@ -13,6 +13,7 @@
  * The H2 still runs the RCP firmware from the stock border-router image; only
  * the S3 application was replaced, so the radio side is untouched.
  */
+/* Adopt the Matter-owned OpenThread stack. Matter must be started first. */
 esp_err_t thread_init(void);
 
 /* True once the host stack and RCP are available. */

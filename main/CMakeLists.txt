@@ -1,9 +1,13 @@
 idf_component_register(
-    SRCS "main.c" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c" "settings.c" "otbr_rest.c"
+    SRCS "main.c" "matter.cpp" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c" "settings.c" "otbr_rest.c"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_netif nvs_flash console mbedtls esp_timer lwip
              openthread driver vfs esp_driver_tsens esp_timer esp_http_server
+             espressif__esp_matter
+    LDFRAGMENTS "linker.lf"
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE "-DCHIP_HAVE_CONFIG_H")
 
 # Bake the git revision into the binary so the board can say which build it
 # runs. Falls back to a version.txt dropped next to the sources (the Docker

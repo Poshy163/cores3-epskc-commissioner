@@ -1,0 +1,23 @@
+[mapping:esp_matter]
+archive: libespressif__esp_matter.a
+entries:
+  if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+    * (extram_bss)
+  else:
+    * (default)
+
+[mapping:main]
+archive: libmain.a
+entries:
+  if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y:
+    * (extram_bss)
+  else:
+    * (default)
+
+[mapping:openthread_bss]
+archive: libopenthread.a
+entries:
+  if SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY = y && OPENTHREAD_ENABLED = y:
+    * (extram_bss)
+  else:
+    * (default)
