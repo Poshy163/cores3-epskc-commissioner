@@ -226,15 +226,12 @@ esp_err_t validate_storage_configuration()
 
 esp_err_t init_matter_nvs()
 {
-    esp_err_t error = nvs_flash_init_partition(kMatterNvsPartition);
+    const esp_err_t error = nvs_flash_init_partition(kMatterNvsPartition);
     if (error == ESP_ERR_NVS_NO_FREE_PAGES || error == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        /* This erases Matter state only. The legacy NVS partition, including
-         * Wi-Fi credentials and the Thread dataset, remains untouched. */
-        ESP_LOGW(kTag, "repairing the dedicated Matter NVS partition");
-        error = nvs_flash_erase_partition(kMatterNvsPartition);
-        if (error == ESP_OK) {
-            error = nvs_flash_init_partition(kMatterNvsPartition);
-        }
+        /* This partition contains fabrics and attributes. Automatic repair by
+         * erasing it would silently decommission the device; leave recovery
+         * to the explicit Matter factory-reset path. */
+        ESP_LOGE(kTag, "Matter NVS needs explicit recovery; preserving fabrics");
     }
     return error;
 }
@@ -587,8 +584,13 @@ extern "C" esp_err_t matter_set_border_router_name(const char *name)
     if (!s_started.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* Copies the name and schedules the attribute report on the CHIP loop. */
-    s_tbr_delegate.SetThreadBorderRouterName(chip::CharSpan(name, std::strlen(name)));
+    /* The delegate's backing array is read by the CHIP loop. Serialize the
+     * copy with those reads; SetThreadBorderRouterName then schedules its
+     * attribute report on that loop. */
+    {
+        esp_matter::lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
+        s_tbr_delegate.SetThreadBorderRouterName(chip::CharSpan(name, std::strlen(name)));
+    }
     return apply_node_label(name);
 }
 

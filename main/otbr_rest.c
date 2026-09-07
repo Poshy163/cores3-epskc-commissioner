@@ -1,4 +1,5 @@
 #include "otbr_rest.h"
+#include "otbr_rest_wire.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -47,8 +48,10 @@ static esp_err_t send_json(httpd_req_t *r, const char *json)
 
 static esp_err_t send_quoted(httpd_req_t *r, const char *value)
 {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "\"%s\"", value);
+    char buf[128];
+    if (!otbr_rest_quote_json_string(value, buf, sizeof(buf))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     return send_json(r, buf);
 }
 
@@ -71,8 +74,7 @@ static bool recv_body(httpd_req_t *r, char *buf, size_t cap)
         }
         total += (size_t) n;
     }
-    buf[total] = '\0';
-    return true;
+    return otbr_rest_terminate_body(buf, total, cap);
 }
 
 static esp_err_t err_404(httpd_req_t *r, const char *why)
@@ -150,29 +152,8 @@ static void do_set_dataset(void *arg)
     a->result = thread_set_dataset_hex(a->hex);
 }
 
-static bool parse_toggle(const char *body, bool *on)
-{
-    const unsigned char *p = (const unsigned char *) body;
-    while (isspace(*p) || *p == '"') {
-        p++;
-    }
-    size_t len;
-    if (strncmp((const char *) p, "enable", 6) == 0) {
-        len = 6;
-        *on = true;
-    } else if (strncmp((const char *) p, "disable", 7) == 0) {
-        len = 7;
-        *on = false;
-    } else {
-        return false;
-    }
-    p += len;
-    while (isspace(*p) || *p == '"') {
-        p++;
-    }
-    return *p == '\0';
-}
-
+/* Return the payload from either bare hex or a JSON string. JSON escapes are
+ * deliberately rejected: a dataset is hexadecimal and never needs them. */
 struct share_start_args {
     char code[10];
     uint32_t lifetime_ms;
@@ -230,7 +211,7 @@ static esp_err_t h_state(httpd_req_t *r)
             return httpd_resp_sendstr(r, "\"could not read body\"");
         }
         bool on;
-        if (!parse_toggle(body, &on)) {
+        if (!otbr_rest_parse_toggle(body, &on)) {
             httpd_resp_set_status(r, "400 Bad Request");
             return httpd_resp_sendstr(r, "\"expected enable or disable\"");
         }
@@ -264,13 +245,10 @@ static esp_err_t h_dataset_active(httpd_req_t *r)
             return httpd_resp_sendstr(r, "\"could not read dataset body\"");
         }
         /* Tolerate a quoted JSON string as well as bare hex. */
-        char *p = body;
-        if (*p == '"') {
-            p++;
-            char *q = strchr(p, '"');
-            if (q) {
-                *q = '\0';
-            }
+        char *p = otbr_rest_parse_dataset_hex_body(body);
+        if (p == NULL || *p == '\0') {
+            httpd_resp_set_status(r, "400 Bad Request");
+            return httpd_resp_sendstr(r, "\"malformed dataset string\"");
         }
         /* A JSON body means create_active_dataset(), which builds a network
          * from named fields rather than TLVs. Not supported here; say so
@@ -303,13 +281,16 @@ static esp_err_t h_dataset_active(httpd_req_t *r)
         return httpd_resp_sendstr(r, hex);
     }
 
-    char pan[20] = "", name[20];
+    char pan[20] = "", name[20], quoted_name[128];
     thread_ext_panid_hex(pan, sizeof(pan));
     snprintf(name, sizeof(name), "%s", thread_network_name());
+    if (!otbr_rest_quote_json_string(name, quoted_name, sizeof(quoted_name))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     static char json[220];
     snprintf(json, sizeof(json),
-             "{\"NetworkName\":\"%s\",\"ExtPanId\":\"%s\",\"ActiveTimestamp\":{\"Seconds\":0}}",
-             name, pan);
+             "{\"NetworkName\":%s,\"ExtPanId\":\"%s\",\"ActiveTimestamp\":{\"Seconds\":0}}",
+             quoted_name, pan);
     return send_json(r, json);
 }
 
@@ -347,93 +328,6 @@ static esp_err_t h_dataset_pending(httpd_req_t *r)
  */
 /* Parse the intentionally tiny ePSKc options object without accepting
  * substring matches, malformed values, unknown fields or trailing garbage. */
-static bool parse_epskc_options(const char *body, long *lifetime, long *port)
-{
-    const char *p = body;
-    while (isspace((unsigned char) *p)) {
-        p++;
-    }
-    if (*p == '\0') {
-        return true; /* POST with no body uses both defaults. */
-    }
-    if (*p++ != '{') {
-        return false;
-    }
-
-    bool saw_lifetime = false;
-    bool saw_port = false;
-    for (;;) {
-        while (isspace((unsigned char) *p)) {
-            p++;
-        }
-        if (*p == '}') {
-            p++;
-            break;
-        }
-        if (*p++ != '"') {
-            return false;
-        }
-        const char *key = p;
-        while (*p && *p != '"') {
-            p++;
-        }
-        if (*p != '"') {
-            return false;
-        }
-        size_t key_len = (size_t) (p - key);
-        p++;
-        while (isspace((unsigned char) *p)) {
-            p++;
-        }
-        if (*p++ != ':') {
-            return false;
-        }
-        while (isspace((unsigned char) *p)) {
-            p++;
-        }
-
-        errno = 0;
-        char *end = NULL;
-        long value = strtol(p, &end, 10);
-        if (end == p || errno == ERANGE) {
-            return false;
-        }
-        if (key_len == 8 && strncmp(key, "lifetime", key_len) == 0 && !saw_lifetime) {
-            *lifetime = value;
-            saw_lifetime = true;
-        } else if (key_len == 4 && strncmp(key, "port", key_len) == 0 && !saw_port) {
-            *port = value;
-            saw_port = true;
-        } else {
-            return false;
-        }
-        p = end;
-        while (isspace((unsigned char) *p)) {
-            p++;
-        }
-        if (*p == ',') {
-            p++;
-            const char *next = p;
-            while (isspace((unsigned char) *next)) {
-                next++;
-            }
-            if (*next == '}') {
-                return false;
-            }
-            continue;
-        }
-        if (*p == '}') {
-            p++;
-            break;
-        }
-        return false;
-    }
-    while (isspace((unsigned char) *p)) {
-        p++;
-    }
-    return *p == '\0';
-}
-
 static esp_err_t h_epskc_state(httpd_req_t *r)
 {
     if (r->method == HTTP_PUT) {
@@ -447,7 +341,7 @@ static esp_err_t h_epskc_state(httpd_req_t *r)
             return httpd_resp_sendstr(r, "\"could not read body\"");
         }
         bool on;
-        if (!parse_toggle(body, &on)) {
+        if (!otbr_rest_parse_toggle(body, &on)) {
             httpd_resp_set_status(r, "400 Bad Request");
             return httpd_resp_sendstr(r, "\"expected enable or disable\"");
         }
@@ -481,7 +375,7 @@ static esp_err_t h_epskc_key(httpd_req_t *r)
         /* OpenThread caps lifetime at 10 min; default to the UI's setting. */
         long lifetime = settings_get()->share_minutes * 60000L;
         long port = 0;
-        if (!parse_epskc_options(body, &lifetime, &port)) {
+        if (!otbr_rest_parse_epskc_options(body, &lifetime, &port)) {
             httpd_resp_set_status(r, "400 Bad Request");
             return httpd_resp_sendstr(r, "\"expected JSON lifetime and/or port\"");
         }
@@ -530,11 +424,15 @@ static esp_err_t h_node(httpd_req_t *r)
     thread_border_agent_id_hex(ba, sizeof(ba));
     thread_ext_address_hex(ext, sizeof(ext));
     thread_ext_panid_hex(pan, sizeof(pan));
+    char quoted_name[128];
+    if (!otbr_rest_quote_json_string(thread_network_name(), quoted_name, sizeof(quoted_name))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
     static char json[320];
     snprintf(json, sizeof(json),
-             "{\"State\":\"%s\",\"NetworkName\":\"%s\",\"ExtAddress\":\"%s\","
+             "{\"State\":\"%s\",\"NetworkName\":%s,\"ExtAddress\":\"%s\","
              "\"ExtPanId\":\"%s\",\"Rloc16\":%u,\"BorderAgentId\":\"%s\"}",
-             thread_role(), thread_network_name(), ext, pan, thread_rloc16(), ba);
+             thread_role(), quoted_name, ext, pan, thread_rloc16(), ba);
     return send_json(r, json);
 }
 

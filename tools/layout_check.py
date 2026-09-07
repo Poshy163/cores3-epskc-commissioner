@@ -400,6 +400,7 @@ PANEL_TITLES = {
     "border_agents": "Join a network",
     "keypad": "Enter share code",
     "qr_camera": "Scan share code",
+    "camera_test": "Camera test",
     "result": "Commissioning",
     "wifi": "Wi-Fi networks",
     "wifi_password": "Wi-Fi password",
@@ -490,6 +491,17 @@ def panels() -> dict[str, list[Box]]:
         button("Cancel", "BOTTOM_MID", 78, 0, 148, 40),
     ]
     p["qr_camera"][1].allow_overlap.add("camera preview")
+
+    p["camera_test"] = [
+        Box("camera preview", preview_x, preview_y, 320, 150, "media"),
+        label(
+            "camera hint", "Live 400  L 0-255 avg 128  QR 99", 14,
+            "BOTTOM_MID", 0, -50,
+        ),
+        button("Repeat", "BOTTOM_MID", -78, 0, 148, 40),
+        button("Back", "BOTTOM_MID", 78, 0, 148, 40),
+    ]
+    p["camera_test"][1].allow_overlap.add("camera preview")
 
     p["result"] = [
         label("result title", "Credentials saved", 20, "TOP_MID", 0, 16),
@@ -592,9 +604,9 @@ def panels() -> dict[str, list[Box]]:
     add_list_rows(
         p["settings"], "settings:list",
         [
-            "Wi-Fi", "Screen", "Power", "Thread", "Device name", "Diagnostics",
+            "Wi-Fi", "Screen", "Camera test", "Power", "Thread", "Device name", "Diagnostics",
             "Reboot", "Factory reset",
-        ], 258, label_offset=8,
+        ], 298, label_offset=8,
     )
 
     p["display"] = flex_settings("display", [
@@ -728,7 +740,7 @@ def check(boxes: list[Box], *, width: int = W, height: int = PANEL_H) -> tuple[l
 
 
 MODELED_BUILDERS = {
-    "build_main", "build_list", "build_keypad", "build_result", "build_qr",
+    "build_main", "build_list", "build_keypad", "build_result", "build_qr", "build_camera",
     "build_wifi", "build_wpass", "build_net", "build_thread_activity",
     "build_share", "build_dsqr",
     "build_settings", "build_screen", "build_power", "build_tset",
@@ -834,6 +846,11 @@ def source_sync_problems() -> list[str]:
         r"p\s*==\s*panel_activity\)\s*title\s*=\s*\"Thread activity\"", source,
     ) is None:
         problems.append("  SOURCE  Thread activity header title is not synchronized")
+
+    if re.search(
+        r"p\s*==\s*panel_camera\)\s*title\s*=\s*\"Camera test\"", source,
+    ) is None:
+        problems.append("  SOURCE  Camera-test header title is not synchronized")
 
     if len(re.findall(
         r"lv_obj_set_size\(kb,\s*BSP_LCD_H_RES\s*-\s*12,\s*122\)", source,

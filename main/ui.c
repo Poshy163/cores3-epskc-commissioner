@@ -64,7 +64,7 @@ static const char *TAG = "ui";
 #define COL_ERROR   0xF0798F
 
 typedef enum {
-    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE, JOB_CAMTEST,
+    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_CAMERA_PREVIEW, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE, JOB_CAMTEST,
     JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_SHARE_STOP, JOB_FORGET,
     JOB_FACTORY_RESET, JOB_CALL, JOB_RENAME
 } job_t;
@@ -128,7 +128,8 @@ static bool s_share_active;
 static volatile uint32_t s_share_request_id;
 static volatile bool s_share_stop_pending;
 /* Settings screens. */
-static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *panel_name, *panel_about;
+static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *panel_name, *panel_about,
+                *panel_camera;
 static lv_obj_t *lbl_power_info, *lbl_about_info, *name_ta;
 static lv_obj_t *s_sleep_shield;   /* full-screen tap catcher while asleep */
 static bool s_asleep;
@@ -151,7 +152,7 @@ static int s_aps_n;
 static char s_join_ssid[33];
 static lv_obj_t *lbl_title, *lbl_wifi, *lbl_status, *lbl_list_hint, *lbl_code, *lbl_target;
 static lv_obj_t *lbl_result_title, *lbl_result_body, *ba_list;
-static lv_obj_t *qr_canvas, *lbl_qr_hint, *lbl_network;
+static lv_obj_t *qr_canvas, *camera_canvas, *lbl_qr_hint, *lbl_camera_hint, *lbl_network;
 static lv_obj_t *batt_body, *batt_fill, *batt_nub, *lbl_batt;
 static lv_obj_t *btn_home_join;
 static lv_obj_t *btn_net_activity, *btn_net_share, *btn_net_qr, *btn_net_forget;
@@ -171,6 +172,9 @@ static TaskHandle_t s_lvgl_task;
 #define BATT_INNER_W (BATT_W - 8)
 static uint16_t *s_preview;
 static volatile bool s_qr_abort;
+static portMUX_TYPE s_qr_abort_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile bool s_camera_abort;
+static portMUX_TYPE s_camera_abort_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* Last successfully retrieved network, persisted so it survives a reboot. */
 #define NVS_NS "epskc"
@@ -369,7 +373,8 @@ static void role_timer_cb(lv_timer_t *t)
     uint32_t timeout = settings_sleep_ms[settings_get()->sleep_idx];
     bool sharing = panel_share && !lv_obj_has_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
     bool showing_secret = panel_dsqr && !lv_obj_has_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
-    bool camera_open = panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
+    bool camera_open = (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) ||
+                       (panel_camera && !lv_obj_has_flag(panel_camera, LV_OBJ_FLAG_HIDDEN));
     bool held_awake = settings_get()->keep_awake_powered && s_on_external_power;
     if (timeout && !s_asleep && !sharing && !showing_secret && !camera_open &&
         !s_ui_job_busy && !held_awake &&
@@ -526,6 +531,7 @@ static void refresh_header_title(lv_obj_t *p)
     else if (p == panel_keypad)   title = "Enter share code";
     else if (p == panel_result)   title = "Commissioning";
     else if (p == panel_qr)       title = "Scan share code";
+    else if (p == panel_camera)   title = "Camera test";
     else if (p == panel_wifi)     title = "Wi-Fi networks";
     else if (p == panel_wpass)    title = "Wi-Fi password";
     else if (p == panel_net)      title = "Thread network";
@@ -563,6 +569,9 @@ static void show_panel(lv_obj_t *p)
     if (panel_qr) {
         lv_obj_add_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     }
+    if (panel_camera) {
+        lv_obj_add_flag(panel_camera, LV_OBJ_FLAG_HIDDEN);
+    }
     lv_obj_clear_flag(p, LV_OBJ_FLAG_HIDDEN);
     refresh_header_title(p);
 }
@@ -584,9 +593,29 @@ static bool queue_ui_job(const ui_job_msg_t *msg)
     return true;
 }
 
+/* The QR worker is on a different task. Keep an enqueue failure from exposing
+ * a transient cleared abort flag to the scan it is meant to cancel. */
+static bool qr_abort_requested(void)
+{
+    bool abort;
+    taskENTER_CRITICAL(&s_qr_abort_lock);
+    abort = s_qr_abort;
+    taskEXIT_CRITICAL(&s_qr_abort_lock);
+    return abort;
+}
+
+static bool camera_abort_requested(void)
+{
+    bool abort;
+    taskENTER_CRITICAL(&s_camera_abort_lock);
+    abort = s_camera_abort;
+    taskEXIT_CRITICAL(&s_camera_abort_lock);
+    return abort;
+}
+
 static bool is_ui_job(job_t type)
 {
-    return type == JOB_SCAN || type == JOB_JOIN || type == JOB_QR ||
+    return type == JOB_SCAN || type == JOB_JOIN || type == JOB_QR || type == JOB_CAMERA_PREVIEW ||
            type == JOB_WIFI_SCAN || type == JOB_WIFI_JOIN || type == JOB_WIFI_LEAVE ||
            type == JOB_FORM ||
            type == JOB_SHARE || type == JOB_FORGET || type == JOB_FACTORY_RESET;
@@ -1228,10 +1257,29 @@ static void on_back_list(lv_event_t *e)
 static void on_qr_open(lv_event_t *e)
 {
     (void) e;
+    /* A cancelling QR job keeps s_ui_job_busy set until its worker has stopped.
+     * Refuse Retry before clearing its flag, so an enqueue failure cannot
+     * resurrect that scan. */
+    if (s_ui_job_busy || s_jobs == NULL) {
+        if (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) {
+            lv_label_set_text(lbl_qr_hint, "Scanner is finishing - try again shortly");
+        } else {
+            lv_label_set_text(lbl_target, "Device busy - try QR again shortly");
+        }
+        return;
+    }
+    taskENTER_CRITICAL(&s_qr_abort_lock);
     s_qr_abort = false;
-    lv_label_set_text(lbl_qr_hint, "Point at the QR code");
+    taskEXIT_CRITICAL(&s_qr_abort_lock);
     ui_job_msg_t msg = { .type = JOB_QR };
+    lv_label_set_text(lbl_qr_hint, "Point at the QR code");
     if (!queue_ui_job(&msg)) {
+        /* The only remaining failure is a full queue of control-plane work;
+         * there is no previous UI job to revive. Restore the idle flag anyway
+         * so a future QR request starts from the normal cancelled state. */
+        taskENTER_CRITICAL(&s_qr_abort_lock);
+        s_qr_abort = true;
+        taskEXIT_CRITICAL(&s_qr_abort_lock);
         if (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) {
             lv_label_set_text(lbl_qr_hint, "Scanner is finishing - try again shortly");
         } else {
@@ -1245,8 +1293,44 @@ static void on_qr_open(lv_event_t *e)
 static void on_qr_cancel(lv_event_t *e)
 {
     (void) e;
+    taskENTER_CRITICAL(&s_qr_abort_lock);
     s_qr_abort = true;
+    taskEXIT_CRITICAL(&s_qr_abort_lock);
     show_panel(panel_keypad);
+}
+
+/* The camera test deliberately uses the same acquisition path as QR scanning,
+ * but discards every decoded payload. It is a sensor/preview diagnostic, never
+ * a provisioning path. */
+static void on_camera_open(lv_event_t *e)
+{
+    (void) e;
+    if (s_ui_job_busy || s_jobs == NULL) {
+        lv_label_set_text(lbl_camera_hint, "Device busy - try again shortly");
+        show_panel(panel_camera);
+        return;
+    }
+    taskENTER_CRITICAL(&s_camera_abort_lock);
+    s_camera_abort = false;
+    taskEXIT_CRITICAL(&s_camera_abort_lock);
+    ui_job_msg_t msg = { .type = JOB_CAMERA_PREVIEW };
+    lv_label_set_text(lbl_camera_hint, "Starting preview (no code is used)");
+    if (!queue_ui_job(&msg)) {
+        taskENTER_CRITICAL(&s_camera_abort_lock);
+        s_camera_abort = true;
+        taskEXIT_CRITICAL(&s_camera_abort_lock);
+        lv_label_set_text(lbl_camera_hint, "Device busy - try again shortly");
+    }
+    show_panel(panel_camera);
+}
+
+static void on_camera_cancel(lv_event_t *e)
+{
+    (void) e;
+    taskENTER_CRITICAL(&s_camera_abort_lock);
+    s_camera_abort = true;
+    taskEXIT_CRITICAL(&s_camera_abort_lock);
+    show_panel(panel_settings);
 }
 
 /* ---------------- worker ---------------- */
@@ -1378,7 +1462,7 @@ static void run_qr_job(void)
     const int max_frames = 400;
     bool got = false;
 
-    for (int i = 0; i < max_frames && !s_qr_abort && !got; i++) {
+    for (int i = 0; i < max_frames && !qr_abort_requested() && !got; i++) {
         if (!qrscan_poll(payload, sizeof(payload), s_preview)) {
             if ((i % 2) == 0 && s_preview) {
                 bsp_display_lock(0);
@@ -1404,10 +1488,48 @@ static void run_qr_job(void)
     if (got) {
         redraw_code();
         show_panel(panel_keypad);
-    } else if (!s_qr_abort) {
+    } else if (!qr_abort_requested()) {
         lv_label_set_text(lbl_qr_hint, "No code found - try again");
     }
     bsp_display_unlock();
+}
+
+static void run_camera_preview_job(void)
+{
+    if (s_preview == NULL || qrscan_start() != ESP_OK) {
+        bsp_display_lock(0);
+        lv_label_set_text(lbl_camera_hint, s_preview ? "Camera unavailable - tap Back"
+                                                     : "Preview buffer unavailable - tap Back");
+        bsp_display_unlock();
+        return;
+    }
+
+    char ignored_payload[2];
+    const int max_frames = 400;
+    for (int frame = 1; frame <= max_frames && !camera_abort_requested(); frame++) {
+        /* qrscan_poll always fills the preview before attempting a decode. Any
+         * decoded content goes into this throw-away two-byte buffer and is
+         * never copied into the passcode field or any settings. */
+        (void) qrscan_poll(ignored_payload, sizeof(ignored_payload), s_preview);
+        if ((frame % 2) == 0) {
+            uint8_t min, max, mean;
+            int candidates;
+            qrscan_last_frame_stats(&min, &max, &mean, &candidates);
+            bsp_display_lock(0);
+            lv_obj_invalidate(camera_canvas);
+            lv_label_set_text_fmt(lbl_camera_hint, "Live %d  L %u-%u avg %u  QR %d",
+                                  frame, min, max, mean, candidates);
+            bsp_display_unlock();
+        }
+        vTaskDelay(pdMS_TO_TICKS(15));
+    }
+    qrscan_stop();
+
+    if (!camera_abort_requested()) {
+        bsp_display_lock(0);
+        lv_label_set_text(lbl_camera_hint, "Test complete - tap Repeat (no code used)");
+        bsp_display_unlock();
+    }
 }
 
 static void worker(void *arg)
@@ -1423,6 +1545,8 @@ static void worker(void *arg)
         job_t job = msg.type;
         if (job == JOB_QR) {
             run_qr_job();
+        } else if (job == JOB_CAMERA_PREVIEW) {
+            run_camera_preview_job();
         } else if (job == JOB_CAMTEST) {
             qrscan_selftest();
             xSemaphoreGive(s_camtest_done);
@@ -2106,6 +2230,7 @@ static void build_settings(void)
 
     settings_row(list, "Wi-Fi", on_wifi_open);
     settings_row(list, "Screen", on_screen_open);
+    settings_row(list, "Camera test", on_camera_open);
     settings_row(list, "Power", on_power_open);
     settings_row(list, "Thread", on_tset_open);
     settings_row(list, "Device name", on_name_open);
@@ -2459,6 +2584,31 @@ static void build_qr(void)
     lv_obj_align(b, LV_ALIGN_BOTTOM_MID, 78, 0);
 }
 
+static void build_camera(void)
+{
+    panel_camera = mk_panel();
+
+    /* Both camera pages are mutually exclusive UI jobs. Sharing the existing
+     * PSRAM frame buffer avoids a second 96 KB allocation and preserves the
+     * established display-DMA memory budget. */
+    if (s_preview) {
+        camera_canvas = lv_canvas_create(panel_camera);
+        lv_canvas_set_buffer(camera_canvas, s_preview, QRSCAN_PREVIEW_W, QRSCAN_PREVIEW_H,
+                             LV_COLOR_FORMAT_RGB565);
+        lv_obj_align(camera_canvas, LV_ALIGN_TOP_MID, 0, -6);
+    }
+
+    lbl_camera_hint = mk_label(panel_camera, &lv_font_montserrat_14, COL_DIM,
+                                s_preview ? "Tap Repeat to start the preview"
+                                          : "Preview buffer unavailable");
+    lv_obj_align(lbl_camera_hint, LV_ALIGN_BOTTOM_MID, 0, -50);
+
+    lv_obj_t *retry = mk_button(panel_camera, "Repeat", on_camera_open, COL_OK, 148, 40);
+    lv_obj_align(retry, LV_ALIGN_BOTTOM_MID, -78, 0);
+    lv_obj_t *back = mk_button(panel_camera, "Back", on_camera_cancel, COL_DIM, 148, 40);
+    lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 78, 0);
+}
+
 static void build_result(void)
 {
     panel_result = mk_panel();
@@ -2564,6 +2714,7 @@ esp_err_t ui_init(void)
     build_keypad();
     build_result();
     build_qr();
+    build_camera();
     build_wifi();
     build_wpass();
     build_net();

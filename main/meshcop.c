@@ -7,6 +7,7 @@
  * secrets are masked by default when printing.
  */
 #include "meshcop.h"
+#include "meshcop_codec.h"
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -120,11 +121,6 @@ static size_t coap_post(uint8_t *buf, const char *uri,
  * one of these and then sends the real response as a separate message, so a
  * naive read-once treats the next request's reply as belonging to this one.
  */
-static bool coap_is_empty_ack(const uint8_t *buf, int len)
-{
-    return len == 4 && buf[1] == 0x00;
-}
-
 /* Read until a message with an actual payload arrives, skipping empty ACKs. */
 static int read_real_response(mbedtls_ssl_context *ssl, uint8_t *buf, size_t cap)
 {
@@ -133,33 +129,12 @@ static int read_real_response(mbedtls_ssl_context *ssl, uint8_t *buf, size_t cap
         if (ret <= 0) {
             return ret;
         }
-        if (!coap_is_empty_ack(buf, ret)) {
+        if (!meshcop_coap_is_empty_ack(buf, ret)) {
             return ret;
         }
         ESP_LOGD(TAG, "empty ACK, waiting for separate response");
     }
     return -1;
-}
-
-static const uint8_t *coap_payload(const uint8_t *buf, size_t len, size_t *out_len)
-{
-    if (len < 4) {
-        return NULL;
-    }
-    size_t i = 4 + (buf[0] & 0x0f);
-    while (i < len && buf[i] != 0xFF) {
-        uint8_t d = (buf[i] >> 4) & 0x0f, l = buf[i] & 0x0f;
-        i++;
-        if (d == 13) { i += 1; } else if (d == 14) { i += 2; }
-        if (l == 13) { l = buf[i] + 13; i += 1; } else if (l == 14) { i += 2; }
-        i += l;
-    }
-    if (i >= len || buf[i] != 0xFF) {
-        return NULL;
-    }
-    i++;
-    *out_len = len - i;
-    return buf + i;
 }
 
 void meshcop_print_tlvs(const uint8_t *p, size_t len, bool reveal)
@@ -247,8 +222,14 @@ const char *meshcop_last_error(void)
 esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *passcode,
                                 uint8_t *dataset, size_t dataset_cap, size_t *dataset_len)
 {
-    int ret;
     s_last_error[0] = '\0';
+    if (addr == NULL || addr[0] == '\0' || port == 0 || passcode == NULL ||
+        passcode[0] == '\0' || dataset == NULL || dataset_len == NULL || dataset_cap == 0) {
+        snprintf(s_last_error, sizeof(s_last_error), "Invalid connection details");
+        return ESP_ERR_INVALID_ARG;
+    }
+    int ret;
+    *dataset_len = 0;
     esp_err_t err = ESP_FAIL;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
@@ -341,7 +322,8 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
     ESP_LOGI(TAG, "handshake OK: %s", mbedtls_ssl_get_ciphersuite(&ssl));
 
     {
-        /* static: 1.25 KB of buffers off the console task's stack */
+        /* static: 1.25 KB of buffers off the console task's stack. Fetches are
+         * serialized through the application's single worker task. */
         static uint8_t out[256], in[1024];
         const char *cid = "esp32-epskc";
         uint8_t pl[48];
@@ -363,7 +345,19 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
             set_err("No reply to petition (-0x%04x)", ret);
             goto done;
         }
-        ESP_LOGI(TAG, "petition accepted (%d bytes)", ret);
+        if (!meshcop_coap_is_success(in, ret)) {
+            ESP_LOGE(TAG, "petition rejected or malformed");
+            snprintf(s_last_error, sizeof(s_last_error), "Router rejected petition");
+            goto done;
+        }
+        /* CoAP success can still carry MeshCoP State Reject when another
+         * commissioner is active. */
+        if (!meshcop_petition_was_accepted(in, (size_t) ret)) {
+            ESP_LOGE(TAG, "petition declined by border agent");
+            snprintf(s_last_error, sizeof(s_last_error), "Router declined petition");
+            goto done;
+        }
+        ESP_LOGI(TAG, "petition response accepted (%d bytes)", ret);
 
         n = coap_post(out, URI_ACTIVE_GET, NULL, 0);
         if ((ret = mbedtls_ssl_write(&ssl, out, n)) <= 0) {
@@ -378,8 +372,14 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
             goto done;
         }
 
+        if (!meshcop_coap_is_success(in, ret)) {
+            ESP_LOGE(TAG, "dataset request rejected or malformed");
+            snprintf(s_last_error, sizeof(s_last_error), "Router rejected dataset request");
+            goto done;
+        }
+
         size_t plen = 0;
-        const uint8_t *p = coap_payload(in, (size_t) ret, &plen);
+        const uint8_t *p = meshcop_coap_payload(in, (size_t) ret, &plen);
         if (!p || plen == 0) {
             ESP_LOGE(TAG, "no dataset payload in response");
             snprintf(s_last_error, sizeof(s_last_error), "Router sent no dataset");

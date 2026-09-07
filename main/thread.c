@@ -118,7 +118,23 @@ static void meshcop_txt_apply_locked(otInstance *instance, const char *service_t
 static void meshcop_service_changed_cb(void *context)
 {
     (void) context;
-    meshcop_txt_apply_locked(esp_openthread_get_instance(), "_meshcop");
+    otInstance *instance = esp_openthread_get_instance();
+    if (otBorderAgentIsActive(instance)) {
+        if (!mdns_service_exists("_meshcop", "_udp", NULL)) {
+            esp_err_t err = esp_openthread_publish_meshcop_mdns(s_border_router_name);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "MeshCoP publication retry failed: %s", esp_err_to_name(err));
+                return;
+            }
+        }
+        /* An early role notification can precede the Border Agent socket.
+         * IDF refreshes TXT on subsequent changes but not the SRV port. */
+        esp_err_t err = mdns_service_port_set("_meshcop", "_udp", otBorderAgentGetUdpPort(instance));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "MeshCoP port refresh failed: %s", esp_err_to_name(err));
+        }
+    }
+    meshcop_txt_apply_locked(instance, "_meshcop");
     if (s_meshcop_e_published) {
         meshcop_txt_apply_locked(esp_openthread_get_instance(), "_meshcop-e");
     }
@@ -356,9 +372,12 @@ static void run_border_router_start_claimed(esp_netif_t *backbone)
         finish_border_router_start(false);
         return;
     }
-    /* OpenThread invokes this once immediately and then on every change to
-     * the record; the notifier runs it after IDF's own publish, so the
-     * corrected entries always land on top. */
+    /* Matter may restore/attach Thread before this deferred BR startup. Drop
+     * any early publication so its default instance name or pre-agent port
+     * cannot survive after the saved name has been applied. */
+    esp_openthread_remove_meshcop_mdns();
+    /* OpenThread invokes this immediately and on record changes. Reconcile
+     * publication as well as TXT so startup ordering cannot strand discovery. */
     otBorderAgentSetMeshCoPServiceChangedCallback(esp_openthread_get_instance(),
                                                   meshcop_service_changed_cb, NULL);
     /* border_router_init installed the library's own ephemeral-key callback,
@@ -467,6 +486,10 @@ esp_err_t thread_set_border_router_name(const char *name)
     otInstance *ins = esp_openthread_get_instance();
     /* Withdraw the old instance first: the responder treats a renamed service
      * as a new one, and two records for one border agent confuse clients. */
+    if (s_meshcop_e_published) {
+        mdns_service_remove("_meshcop-e", "_udp");
+        s_meshcop_e_published = false;
+    }
     esp_openthread_remove_meshcop_mdns();
     esp_err_t err = esp_openthread_set_meshcop_instance_name(s_border_router_name);
     otDeviceRole role = otThreadGetDeviceRole(ins);
@@ -478,6 +501,9 @@ esp_err_t thread_set_border_router_name(const char *name)
             meshcop_txt_apply_locked(ins, "_meshcop");
         }
     }
+    /* If a share is active, re-publish it under the requested instance name
+     * instead of leaving the old discovery record behind. */
+    share_state_cb(NULL);
     esp_openthread_lock_release();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "could not re-publish MeshCoP as \"%s\": %s", name, esp_err_to_name(err));
@@ -807,7 +833,10 @@ static void share_state_cb(void *ctx)
     otInstance *ins = esp_openthread_get_instance();
     otBorderAgentEphemeralKeyState st = otBorderAgentEphemeralKeyGetState(ins);
 
-    if (st == OT_BORDER_AGENT_STATE_STARTED && !s_meshcop_e_published) {
+    bool active = st == OT_BORDER_AGENT_STATE_STARTED ||
+                  st == OT_BORDER_AGENT_STATE_CONNECTED ||
+                  st == OT_BORDER_AGENT_STATE_ACCEPTED;
+    if (active && !s_meshcop_e_published) {
         uint16_t port = otBorderAgentEphemeralKeyGetUdpPort(ins);
         const char *nn = otThreadGetNetworkName(ins);
         mdns_txt_item_t txt[] = {

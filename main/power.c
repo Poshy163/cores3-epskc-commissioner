@@ -139,6 +139,9 @@ static int percent_from_mv(int mv)
 
 esp_err_t power_read(power_status_t *out)
 {
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     out->percent = -1;
     out->batt_mv = -1;
     out->vbus_mv = -1;
@@ -161,7 +164,12 @@ esp_err_t power_read(power_status_t *out)
     if (err != ESP_OK) {
         return err;
     }
-    reg_read(AXP2101_REG_STATUS2, &st2);
+    /* Status 2 carries the charge phase. Do not turn a failed read into a
+     * plausible-looking "trickle" status in diagnostics or the UI. */
+    err = reg_read(AXP2101_REG_STATUS2, &st2);
+    if (err != ESP_OK) {
+        return err;
+    }
 
     out->present = st1 & (1 << 3);
     out->vbus = st1 & (1 << 5);
@@ -208,6 +216,9 @@ static bool s_tsens_failed;
 
 bool power_esp_temp(float *celsius)
 {
+    if (celsius == NULL) {
+        return false;
+    }
     if (s_tsens == NULL && !s_tsens_failed) {
         temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
         if (temperature_sensor_install(&cfg, &s_tsens) != ESP_OK ||

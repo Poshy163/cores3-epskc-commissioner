@@ -325,7 +325,10 @@ void qrscan_stop(void)
 
 bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
 {
-    if (!s_running) {
+    /* A decoded payload needs a destination and room for its NUL terminator.
+     * Checking this before capture also keeps invalid callers from consuming a
+     * frame that a valid caller could have used. */
+    if (!s_running || out == NULL || cap == 0) {
         return false;
     }
 

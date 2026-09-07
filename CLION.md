@@ -78,11 +78,13 @@ never touches the saved Wi-Fi, Thread or Matter data:
 .\build-native.ps1 -Port COM5
 ```
 
-Note that editing `sdkconfig.defaults` does not update an existing `sdkconfig`;
-either change both or run `.\build-native.ps1 -Clean`.
+Note that editing `sdkconfig.defaults` does not update an existing `sdkconfig`.
+Change both, or back up and remove `sdkconfig` before rebuilding to regenerate
+it from defaults. `-Clean` clears build output but retains `sdkconfig`.
 
-Serial is 115200. Opening the port resets the board, so the first thing you see
-is a boot log.
+Serial is 115200. Some terminals assert DTR/RTS and reset the board when opening
+the port. `tools/robust_cmd.py` leaves both inactive for read-only diagnostics
+that preserve uptime.
 
 ## The Docker build still works
 

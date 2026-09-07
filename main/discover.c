@@ -27,12 +27,16 @@ esp_err_t discover_init(void)
 
 int discover_border_agents(ba_entry_t *out, int max, uint32_t timeout_ms)
 {
+    if (out == NULL || max <= 0) {
+        return 0;
+    }
     if (discover_init() != ESP_OK) {
         return 0;
     }
 
     mdns_result_t *results = NULL;
-    esp_err_t err = mdns_query_ptr("_meshcop-e", "_udp", timeout_ms, BA_MAX, &results);
+    size_t result_limit = (size_t) (max < BA_MAX ? max : BA_MAX);
+    esp_err_t err = mdns_query_ptr("_meshcop-e", "_udp", timeout_ms, result_limit, &results);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "query failed: %s", esp_err_to_name(err));
         return 0;

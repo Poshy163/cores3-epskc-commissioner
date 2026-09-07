@@ -24,6 +24,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test production parsers and failure paths on host
+        run: python3 -B tools/run_host_tests.py --cc gcc
+
       - name: Check display layout
         run: python3 -B tools/layout_check.py "$RUNNER_TEMP/layout.svg"
 

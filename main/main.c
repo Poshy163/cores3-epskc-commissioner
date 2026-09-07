@@ -37,6 +37,7 @@
 #include "ui.h"
 #include "wifi_ctl.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "nvs.h"
 
 static const char *TAG = "epskc";
@@ -203,15 +204,11 @@ static void reconnect_timer_cb(void *arg)
  */
 static esp_timer_handle_t s_watchdog_timer;
 #define WIFI_WATCHDOG_PERIOD_US (15 * 1000 * 1000)
-/* A hold that outlives this much downtime with credentials still in flash is
- * a stuck hold, not a deliberate one: app_wifi_leave() erases the credentials
- * it holds down for, so the two cases cannot be confused. */
-#define WIFI_HOLD_RECOVERY_US   (120 * 1000 * 1000)
 
 static void wifi_watchdog_cb(void *arg)
 {
     (void) arg;
-    if (!s_supervisor_on || s_join_active || s_wifi_events == NULL) {
+    if (!s_supervisor_on || s_join_active || s_wifi_hold || s_wifi_events == NULL) {
         return;
     }
     if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) {
@@ -226,18 +223,9 @@ static void wifi_watchdog_cb(void *arg)
         return;   /* nothing to reconnect to */
     }
 
-    if (s_wifi_hold) {
-        /* The only path that leaves a hold set with credentials still in
-         * flash is a rollback whose restore write failed. Recovering beats
-         * staying dark forever on a border router. */
-        const int64_t down_us = esp_timer_get_time() - s_last_disc_us;
-        if (s_last_disc_us == 0 || down_us < WIFI_HOLD_RECOVERY_US) {
-            return;
-        }
-        ESP_LOGW(TAG, "clearing a Wi-Fi hold stuck for %llds with credentials stored",
-                 (long long) (down_us / 1000000));
-        s_wifi_hold = false;
-    }
+    /* get_config reads the current driver configuration, including a failed
+     * RAM-only candidate. It cannot prove what is persisted in NVS, so never
+     * use it to release a hold after a failed rollback or deliberate leave. */
 
     if (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer)) {
         return;
@@ -462,7 +450,9 @@ static void wifi_disconnect_for_config_switch(void)
 
 esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
 {
-    if (ssid == NULL || pass == NULL || ssid[0] == '\0') {
+    if (ssid == NULL || pass == NULL || ssid[0] == '\0' ||
+        strlen(ssid) > sizeof(((wifi_config_t *)0)->sta.ssid) ||
+        strlen(pass) > sizeof(((wifi_config_t *)0)->sta.password)) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_wifi_op_lock == NULL) {
@@ -488,17 +478,17 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
      * flash holding the last configuration that actually worked until this
      * one has proved itself.
      */
-    esp_err_t storage_err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (storage_err != ESP_OK) {
-        ESP_LOGW(TAG, "could not switch Wi-Fi storage to RAM (%s); the candidate "
-                 "will be written to flash before it is tested",
-                 esp_err_to_name(storage_err));
+    esp_err_t err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "cannot test Wi-Fi safely in RAM: %s; configuration unchanged",
+                 esp_err_to_name(err));
+        goto done;
     }
 
     /* Snapshot the known-good config so a typo does not strand a device that
      * was already provisioned, even within this call. */
     wifi_config_t previous = { 0 };
-    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &previous);
+    err = esp_wifi_get_config(WIFI_IF_STA, &previous);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "cannot snapshot current Wi-Fi config: %s", esp_err_to_name(err));
         goto done;
@@ -506,8 +496,10 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
     const bool had_previous = previous.sta.ssid[0] != '\0';
 
     wifi_config_t cfg = { 0 };
-    strncpy((char *) cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
-    strncpy((char *) cfg.sta.password, pass, sizeof(cfg.sta.password) - 1);
+    /* IDF accepts full-width 32-byte SSIDs and 64-byte hexadecimal PSKs.
+     * These fixed-width driver arrays need no trailing NUL when full. */
+    memcpy(cfg.sta.ssid, ssid, strlen(ssid));
+    memcpy(cfg.sta.password, pass, strlen(pass));
 
     /* Stop the old station attempt before replacing its config. IDF can reject
      * esp_wifi_set_config() with ESP_ERR_WIFI_STATE while STA is connecting.
@@ -537,7 +529,8 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
                                            pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
     if (bits & WIFI_CONNECTED_BIT) {
         /* Proved itself: only now commit it to flash. */
-        if (esp_wifi_set_storage(WIFI_STORAGE_FLASH) == ESP_OK) {
+        err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+        if (err == ESP_OK) {
             esp_err_t commit_err = esp_wifi_set_config(WIFI_IF_STA, &cfg);
             if (commit_err != ESP_OK) {
                 ESP_LOGE(TAG, "\"%s\" is connected but could not be saved: %s",
@@ -545,6 +538,10 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
                 err = commit_err;
                 goto done;
             }
+        } else {
+            ESP_LOGE(TAG, "Wi-Fi connected but storage could not be enabled: %s",
+                     esp_err_to_name(err));
+            goto done;
         }
         ESP_LOGI(TAG, "Wi-Fi candidate \"%s\" connected and saved", ssid);
         s_have_credentials = true;
@@ -565,9 +562,8 @@ rollback:
         if (restore_err != ESP_OK) {
             ESP_LOGE(TAG, "Wi-Fi rollback failed: %s", esp_err_to_name(restore_err));
             /* The driver still holds the rejected candidate, so do not
-             * reconnect it. Flash was never touched, so a reboot recovers --
-             * and so does the watchdog, which clears a hold that outlives two
-             * minutes with credentials still stored. */
+             * reconnect it. Flash was never touched, so a reboot recovers.
+             * Keep the hold until an explicit new join/leave or reboot. */
             s_wifi_hold = true;
             goto done;
         }
@@ -595,11 +591,15 @@ rollback:
             ESP_LOGI(TAG, "failed first Wi-Fi candidate discarded; none was stored");
         }
     }
-done:
+done:;
     /* Every exit restores flash-backed storage, so the next successful
      * association and the boot-time load behave normally. Idempotent. */
-    if (esp_wifi_set_storage(WIFI_STORAGE_FLASH) != ESP_OK) {
+    esp_err_t final_storage_err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if (final_storage_err != ESP_OK) {
         ESP_LOGE(TAG, "could not restore flash-backed Wi-Fi storage");
+        if (err == ESP_OK) {
+            err = final_storage_err;
+        }
     }
     /* Hand the radio back to the supervisor before releasing the lock. */
     s_join_active = false;
@@ -617,7 +617,10 @@ esp_err_t app_wifi_leave(void)
      * connecting. Stop and acknowledge the old attempt before erasing it. */
     wifi_disconnect_for_config_switch();
     wifi_config_t cfg = { 0 };
-    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &cfg); /* zeroed = erased */
+    esp_err_t err = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &cfg); /* zeroed = erased */
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "could not erase Wi-Fi credentials: %s", esp_err_to_name(err));
     } else {
@@ -635,21 +638,25 @@ int app_wifi_scan(wifi_scan_rec_t *out, int max)
         return 0;
     }
     int m = 0;
+    bool scan_results_owned = false;
     wifi_ap_record_t *recs = NULL;
     wifi_scan_config_t sc = { 0 };   /* all channels, active scan */
     if (esp_wifi_scan_start(&sc, true) != ESP_OK) {
         goto done;
     }
+    scan_results_owned = true;
     uint16_t n = 0;
-    esp_wifi_scan_get_ap_num(&n);
-    if (n == 0) {
+    if (esp_wifi_scan_get_ap_num(&n) != ESP_OK || n == 0) {
         goto done;
     }
     recs = calloc(n, sizeof(*recs));
     if (recs == NULL) {
         goto done;
     }
-    esp_wifi_scan_get_ap_records(&n, recs);   /* already strongest-first */
+    if (esp_wifi_scan_get_ap_records(&n, recs) != ESP_OK) {
+        goto done;
+    }
+    scan_results_owned = false; /* get_ap_records freed the driver's list */
 
     for (int i = 0; i < n && m < max; i++) {
         if (recs[i].ssid[0] == '\0') {
@@ -668,6 +675,9 @@ int app_wifi_scan(wifi_scan_rec_t *out, int max)
         m++;
     }
 done:
+    if (scan_results_owned) {
+        esp_wifi_clear_ap_list();
+    }
     free(recs);
     xSemaphoreGive(s_wifi_op_lock);
     return m;
@@ -702,16 +712,15 @@ static int cmd_status(int argc, char **argv)
     } else {
         printf("wifi   : not connected\n");
     }
-    /* The stored SSID is what separates "credentials were lost" from
-     * "credentials are fine but we are not using them", which is the whole
-     * question when a border router turns up offline. */
+    /* This is the driver's current configuration. A RAM-only trial or a
+     * failed save can differ from NVS; do not claim persistence from it. */
     wifi_config_t stored_cfg = { 0 };
     if (esp_wifi_get_config(WIFI_IF_STA, &stored_cfg) == ESP_OK &&
         stored_cfg.sta.ssid[0] != '\0') {
-        printf("stored : \"%.*s\" in NVS\n", (int) sizeof(stored_cfg.sta.ssid),
+        printf("config : \"%.*s\" (driver; persistence not verified)\n", (int) sizeof(stored_cfg.sta.ssid),
                (const char *) stored_cfg.sta.ssid);
     } else {
-        printf("stored : no credentials\n");
+        printf("config : no driver credentials\n");
     }
     printf("link   : %lu disconnect(s)", (unsigned long) s_disconnect_count);
     if (s_disconnect_count != 0) {
@@ -746,6 +755,13 @@ static int cmd_status(int argc, char **argv)
            (long long) ((up_s / 60) % 60), (long long) (up_s % 60));
     printf("reveal : %s\n", s_reveal ? "on" : "off");
     printf("fw     : %s\n", FW_VERSION);
+    const esp_app_desc_t *desc = esp_app_get_description();
+    printf("idf    : %s\n", desc->idf_ver);
+    printf("elf sha: ");
+    for (size_t i = 0; i < sizeof(desc->app_elf_sha256); ++i) {
+        printf("%02x", desc->app_elf_sha256[i]);
+    }
+    printf("\n");
     return 0;
 }
 
@@ -810,7 +826,7 @@ static int cmd_link(int argc, char **argv)
     printf("state     : %s\n",
            (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) ? "connected"
            : s_wifi_hold ? "held down (deliberate leave)" : "disconnected");
-    printf("credential: %s\n", s_have_credentials ? "stored" : "none");
+    printf("credential: %s\n", s_have_credentials ? "configured (driver)" : "none");
     printf("supervisor: %s, backoff step %d, next delay %lu ms\n",
            s_supervisor_on ? "on" : "off", s_backoff_step,
            (unsigned long) backoff_delay_ms());
@@ -990,11 +1006,38 @@ static bool run_off_console(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
     return false;
 }
 
+static bool parse_udp_port(const char *text, uint16_t *port)
+{
+    if (text == NULL || port == NULL || *text == '\0') {
+        return false;
+    }
+    unsigned value = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        value = value * 10 + (*p - '0');
+        if (value > UINT16_MAX) {
+            return false;
+        }
+    }
+    if (value == 0) {
+        return false;
+    }
+    *port = (uint16_t)value;
+    return true;
+}
+
 static int cmd_join(int argc, char **argv)
 {
     if (argc != 4) {
         printf("usage: join <addr> <port> <passcode>\n");
         printf("  e.g. join 192.168.1.59 49156 874213905\n");
+        return 1;
+    }
+    uint16_t port;
+    if (!parse_udp_port(argv[2], &port)) {
+        printf("port must be an integer from 1 to 65535\n");
         return 1;
     }
     if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
@@ -1010,7 +1053,7 @@ static int cmd_join(int argc, char **argv)
     ui_set_status(UI_STATE_BUSY, "Connecting...");
 
     struct fetch_args fa = {
-        .addr = argv[1], .port = (uint16_t) atoi(argv[2]), .passcode = argv[3],
+        .addr = argv[1], .port = port, .passcode = argv[3],
         .dataset = dataset, .cap = sizeof(dataset), .result = ESP_FAIL,
     };
     if (!run_off_console(do_fetch_dataset, &fa, 60000)) {
@@ -1040,6 +1083,7 @@ static int cmd_join(int argc, char **argv)
     /* Same as the touch flow: apply it and actually attach. */
     struct tlv_args ja = { .tlvs = dataset, .len = dlen, .result = ESP_FAIL };
     if (!run_off_console(do_thread_join, &ja, 30000)) {
+        ui_set_status(UI_STATE_ERROR, "Credentials received; dataset not applied");
         printf(">>> dataset retrieved, but worker could not apply it <<<\n");
         return 1;
     }
@@ -1048,8 +1092,16 @@ static int cmd_join(int argc, char **argv)
             vTaskDelay(pdMS_TO_TICKS(500));
         }
         printf(">>> THREAD ROLE: %s <<<\n", thread_role());
+        if (!thread_attached()) {
+            ui_set_status(UI_STATE_BUSY, "Dataset saved; still attaching");
+            printf(">>> dataset saved; attachment not confirmed within 20s <<<\n");
+            return 1;
+        }
+        ui_set_status(UI_STATE_OK, "Thread attached");
     } else {
-        printf(">>> thread attach not attempted (radio unavailable) <<<\n");
+        ui_set_status(UI_STATE_ERROR, "Credentials received; dataset apply failed");
+        printf(">>> dataset apply failed: %s <<<\n", esp_err_to_name(ja.result));
+        return 1;
     }
     return 0;
 }
@@ -1494,9 +1546,9 @@ void app_main(void)
     apply_quiet_log_profile();
 
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed (%s); saved provisioning preserved. "
+                 "Back up flash before explicit recovery.", esp_err_to_name(err));
     }
     ESP_ERROR_CHECK(err);
     settings_load();
@@ -1563,8 +1615,8 @@ void app_main(void)
     power_status_t boot_power;
     app_wifi_set_power_profile(power_read(&boot_power) != ESP_OK || boot_power.vbus);
 
-    /* Cached so the watchdog, which runs on the LVGL task, never has to call
-     * into the Wi-Fi driver while the display lock is held. */
+    /* Cache availability for link diagnostics; the timer watchdog refreshes
+     * this from the driver without holding the display lock. */
     wifi_config_t boot_cfg = { 0 };
     s_have_credentials = esp_wifi_get_config(WIFI_IF_STA, &boot_cfg) == ESP_OK &&
                          boot_cfg.sta.ssid[0] != '\0';

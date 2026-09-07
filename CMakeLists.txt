@@ -11,7 +11,7 @@ execute_process(
     OUTPUT_VARIABLE FW_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
 if(FW_VERSION)
     execute_process(
-        COMMAND git diff --quiet
+        COMMAND git diff --quiet HEAD
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         RESULT_VARIABLE FW_DIRTY ERROR_QUIET)
     if(FW_DIRTY)

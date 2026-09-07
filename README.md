@@ -44,7 +44,7 @@ A border router is only useful while its backbone is up, so the device keeps try
 
 A new password is tested in RAM and only written to flash once it has actually connected, so a reset or a power cut while a wrong one is being tried can no longer destroy the credentials that were working. A failed attempt leaves the previous network in flash untouched.
 
-`status` reports the stored SSID separately from the live connection, so "the credentials were lost" and "the credentials are fine but we are not connected" are distinguishable at a glance. `link` shows the same detail plus the disconnect count and the reason code the access point last sent.
+`status` reports the driver's configured SSID separately from the live connection. This is not a readback of NVS: during a trial or after a failed save it can differ from persisted credentials. A failed rollback keeps reconnection held until a new explicit join or reboot; the watchdog never retries an unverified candidate as though it were the saved network. `link` also shows the disconnect count and the reason code the access point last sent.
 
 `link drop [n]` forces `n` rapid disconnects to simulate an outage, and `link supervisor off` restores the old give-up-after-five-attempts behaviour. Both are diagnostics, neither is persisted, and the supervisor is on again at every boot.
 
@@ -138,7 +138,9 @@ Wi-Fi power management follows the power source. On USB the radio never dozes, w
 | `reveal 1` | unmask the network key in output. It prints secrets, so leave it off |
 | `log [quiet\|<level> [tag]]` | console verbosity. Boots `quiet`: warnings and errors from every component, this firmware's own tags at info. `log info` restores everything, `log info OPENTHREAD` one tag |
 
-`status` also reports uptime and heap headroom, and `thread` prints the version string of the ESP32-H2 RCP firmware.
+`status` also reports uptime, heap headroom, ESP-IDF version and the application ELF SHA-256 for matching crash symbols. `thread` prints the version string of the ESP32-H2 RCP firmware.
+
+If either NVS partition cannot initialize, boot preserves its contents instead of automatically erasing provisioning. Back up flash before an explicit recovery or factory reset.
 
 ## Building
 
@@ -176,3 +178,8 @@ python -m esptool --chip esp32s3 -p COM5 -b 460800 `
 The merged image necessarily spans NVS and resets provisioning.
 
 `tools/layout_check.py` models the 320x240 screen geometry and reports overlapping widgets before you flash; it exits non-zero if anything collides.
+
+`python tools/run_host_tests.py --cc gcc` tests the production CoAP/REST parsers,
+Wi-Fi failure paths and settings logic on a host. Use `--cc path/to/zig.exe` on
+Windows if Zig is your host compiler. These tests and the layout check also run
+in CI; they do not replace device commissioning, reconnect or camera tests.
