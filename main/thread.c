@@ -17,6 +17,7 @@
 #include "esp_openthread.h"
 #include "esp_openthread_border_router.h"
 #include "esp_openthread_lock.h"
+#include "esp_openthread_meshcop_mdns.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "mdns.h"
@@ -28,6 +29,7 @@
 #include "openthread/instance.h"
 #include "openthread/link.h"
 #include "openthread/mesh_diag.h"
+#include "openthread/platform/radio.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
 #include "settings.h"
@@ -39,6 +41,88 @@ static bool s_br_started;
 static bool s_br_starting;
 static portMUX_TYPE s_br_start_lock = portMUX_INITIALIZER_UNLOCKED;
 static char s_border_router_name[SETTINGS_DEVICE_NAME_BUFFER_SIZE] = SETTINGS_DEFAULT_DEVICE_NAME;
+
+/* ePSKc advertising state; the callback itself lives in the sharing section. */
+static bool s_share_cb_set;
+static bool s_meshcop_e_published;
+static void share_state_cb(void *ctx);
+
+/*
+ * ---------------- MeshCoP TXT record correction ----------------
+ *
+ * ESP-IDF's prebuilt border-router library publishes _meshcop._udp itself and
+ * assembles the TXT record by hand. In v5.5.4 three entries come out wrong:
+ * "sb" reports the Thread role as detached whatever the real role, "at" is the
+ * Active Timestamp shifted by two bytes, and "omr" is this device's own local
+ * OMR prefix rather than the network's favoured one. OpenThread already encodes
+ * the whole record correctly, so whenever it reports a change this re-applies
+ * OpenThread's entries over the library's, through the same mDNS responder and
+ * the same item-set call the library uses. The ephemeral-key service
+ * (_meshcop-e) carries the same record, as ot-br-posix publishes it. Runs on
+ * the OpenThread task with the stack lock held.
+ */
+static void meshcop_txt_apply_locked(otInstance *instance, const char *service_type)
+{
+    if (!otBorderAgentIsActive(instance)) {
+        return;   /* nothing is published while detached */
+    }
+    if (!mdns_service_exists(service_type, "_udp", NULL)) {
+        /* The first callback fires before the library has added the service;
+         * the responder would log an error for the missing record, and the
+         * next state change applies it anyway. */
+        ESP_LOGD(TAG, "%s not published yet", service_type);
+        return;
+    }
+    otBorderAgentMeshCoPServiceTxtData txt;
+    if (otBorderAgentGetMeshCoPServiceTxtData(instance, &txt) != OT_ERROR_NONE) {
+        ESP_LOGW(TAG, "could not read the MeshCoP TXT data");
+        return;
+    }
+
+    unsigned applied = 0;
+    for (uint16_t at = 0; at < txt.mLength;) {
+        const uint8_t entry_len = txt.mData[at];
+        const uint8_t *entry = &txt.mData[at + 1];
+        at += 1u + entry_len;
+        if (at > txt.mLength) {
+            break;   /* truncated entry */
+        }
+        const uint8_t *eq = memchr(entry, '=', entry_len);
+        if (eq == NULL || eq == entry) {
+            continue;
+        }
+        char key[16];
+        const size_t key_len = (size_t) (eq - entry);
+        if (key_len >= sizeof(key)) {
+            continue;
+        }
+        memcpy(key, entry, key_len);
+        key[key_len] = '\0';
+        const uint8_t *value = eq + 1;
+        const size_t value_len = entry_len - key_len - 1;
+        esp_err_t err = mdns_service_txt_item_set_with_explicit_value_len(
+            service_type, "_udp", key, (const char *) value, (uint8_t) value_len);
+        if (err != ESP_OK) {
+            /* ESP_ERR_NOT_FOUND means the library has not added the service
+             * yet; the next state change applies the record then. */
+            ESP_LOGD(TAG, "%s TXT %s not applied: %s", service_type, key, esp_err_to_name(err));
+            return;
+        }
+        applied++;
+    }
+    /* The library hard-codes mn=BorderRouter. */
+    mdns_service_txt_item_set(service_type, "_udp", "mn", THREAD_MESHCOP_MODEL_NAME);
+    ESP_LOGI(TAG, "%s TXT record refreshed (%u entries)", service_type, applied);
+}
+
+static void meshcop_service_changed_cb(void *context)
+{
+    (void) context;
+    meshcop_txt_apply_locked(esp_openthread_get_instance(), "_meshcop");
+    if (s_meshcop_e_published) {
+        meshcop_txt_apply_locked(esp_openthread_get_instance(), "_meshcop-e");
+    }
+}
 
 /* Mesh Diagnostics calls back on OpenThread's own task with the OT API lock
  * already held. Keep that callback tiny: copy aggregate values behind a
@@ -272,6 +356,17 @@ static void run_border_router_start_claimed(esp_netif_t *backbone)
         finish_border_router_start(false);
         return;
     }
+    /* OpenThread invokes this once immediately and then on every change to
+     * the record; the notifier runs it after IDF's own publish, so the
+     * corrected entries always land on top. */
+    otBorderAgentSetMeshCoPServiceChangedCallback(esp_openthread_get_instance(),
+                                                  meshcop_service_changed_cb, NULL);
+    /* border_router_init installed the library's own ephemeral-key callback,
+     * which publishes a bare _meshcop-e record with no TXT data and would
+     * silently replace ours. OpenThread keeps one callback, so claim it now,
+     * after the library, and it stays ours. */
+    otBorderAgentEphemeralKeySetCallback(esp_openthread_get_instance(), share_state_cb, NULL);
+    s_share_cb_set = true;
 
     /*
      * Re-attach with whatever is already stored. This is what brings the device
@@ -344,6 +439,50 @@ esp_err_t thread_start_border_router(esp_netif_t *backbone)
     }
     s_br_boot_status = "br task spawned";
     return ESP_OK;
+}
+
+bool thread_rcp_version(char *out, size_t cap)
+{
+    if (!s_ready || out == NULL || cap == 0) {
+        return false;
+    }
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    const char *version = otPlatRadioGetVersionString(esp_openthread_get_instance());
+    snprintf(out, cap, "%s", version != NULL ? version : "");
+    esp_openthread_lock_release();
+    return out[0] != '\0';
+}
+
+esp_err_t thread_set_border_router_name(const char *name)
+{
+    if (name == NULL || name[0] == '\0' || strlen(name) > SETTINGS_DEVICE_NAME_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    snprintf(s_border_router_name, sizeof(s_border_router_name), "%s", name);
+    if (!s_ready || !s_br_started) {
+        return ESP_OK;   /* the border-router start applies it */
+    }
+
+    esp_openthread_lock_acquire(portMAX_DELAY);
+    otInstance *ins = esp_openthread_get_instance();
+    /* Withdraw the old instance first: the responder treats a renamed service
+     * as a new one, and two records for one border agent confuse clients. */
+    esp_openthread_remove_meshcop_mdns();
+    esp_err_t err = esp_openthread_set_meshcop_instance_name(s_border_router_name);
+    otDeviceRole role = otThreadGetDeviceRole(ins);
+    bool attached = role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER ||
+                    role == OT_DEVICE_ROLE_LEADER;
+    if (err == ESP_OK && attached) {
+        err = esp_openthread_publish_meshcop_mdns(s_border_router_name);
+        if (err == ESP_OK) {
+            meshcop_txt_apply_locked(ins, "_meshcop");
+        }
+    }
+    esp_openthread_lock_release();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "could not re-publish MeshCoP as \"%s\": %s", name, esp_err_to_name(err));
+    }
+    return err;
 }
 
 esp_err_t thread_forget(void)
@@ -656,13 +795,11 @@ bool thread_activity_get(thread_activity_t *activity)
 
 /* ---------------- sharing (ePSKc border-agent side) ---------------- */
 
-static bool s_share_cb_set;
-static bool s_meshcop_e_published;
-
 /*
- * IDF wires the _meshcop-e publish/remove events but nothing in it ever posts
- * them; advertising the ephemeral-key listener is the application's job.
- * Runs on the OpenThread task with the stack lock held.
+ * Advertise the ephemeral-key listener the way ot-br-posix does: the same
+ * instance name and the same TXT record as _meshcop._udp, on the port
+ * OpenThread opened for the key. Runs on the OpenThread task with the stack
+ * lock held.
  */
 static void share_state_cb(void *ctx)
 {
@@ -677,12 +814,16 @@ static void share_state_cb(void *ctx)
             { "rv", "1" },
             { "tv", "1.4.0" },
             { "vn", "OpenThread" },
-            { "mn", "BorderRouter" },
+            { "mn", THREAD_MESHCOP_MODEL_NAME },
             { "nn", nn ? nn : "" },
         };
-        esp_err_t err = mdns_service_add(NULL, "_meshcop-e", "_udp", port, txt,
+        esp_err_t err = mdns_service_add(esp_openthread_get_meshcop_instance_name(),
+                                         "_meshcop-e", "_udp", port, txt,
                                          sizeof(txt) / sizeof(txt[0]));
         s_meshcop_e_published = (err == ESP_OK);
+        if (err == ESP_OK) {
+            meshcop_txt_apply_locked(ins, "_meshcop-e");
+        }
         ESP_LOGI(TAG, "ephemeral key listening on udp/%u (%s)", port,
                  err == ESP_OK ? "advertised" : "advertise FAILED");
     } else if ((st == OT_BORDER_AGENT_STATE_STOPPED || st == OT_BORDER_AGENT_STATE_DISABLED)

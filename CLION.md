@@ -70,6 +70,17 @@ Build the `app` target, or from a terminal:
 idf.py -p COM5 flash monitor
 ```
 
+`build-native.ps1` wraps the same thing with ccache switched on and an
+app-only flash by default, so an edit-compile-flash cycle is a few seconds and
+never touches the saved Wi-Fi, Thread or Matter data:
+
+```
+.\build-native.ps1 -Port COM5
+```
+
+Note that editing `sdkconfig.defaults` does not update an existing `sdkconfig`;
+either change both or run `.\build-native.ps1 -Clean`.
+
 Serial is 115200. Opening the port resets the board, so the first thing you see
 is a boot log.
 

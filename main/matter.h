@@ -5,10 +5,19 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "esp_log.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * Map an ESP log level onto CHIP's own category filter. CHIP's ESP32 logger
+ * prints the "I (t) chip[XX]:" prefix with a bare printf before handing the
+ * message to esp_log, so the per-tag ESP filter alone leaves empty prefix
+ * lines; this gates the category at the source. Safe before matter_init().
+ */
+void matter_set_log_verbosity(esp_log_level_t level);
 
 /* Includes room for the terminating NUL. */
 #define MATTER_QR_CODE_BUFFER_SIZE       129
@@ -57,6 +66,13 @@ esp_err_t matter_open_commissioning_window(uint16_t timeout_seconds);
  * responsible for any non-Matter settings it also wants to erase.
  */
 esp_err_t matter_factory_reset(void);
+
+/**
+ * Apply a new border-router name live: the TBR Management BorderRouterName
+ * attribute and the root node's NodeLabel. ESP_ERR_INVALID_STATE before the
+ * stack has started; matter_init() reads the saved name itself.
+ */
+esp_err_t matter_set_border_router_name(const char *name);
 
 /**
  * Return the device's QR payload and manual setup code.

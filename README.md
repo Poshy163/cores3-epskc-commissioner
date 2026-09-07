@@ -38,6 +38,16 @@ Two ways to get the device online:
 
   Quote both arguments. The console splits on whitespace, so an unquoted SSID or password containing a space arrives truncated.
 
+### Staying online
+
+A border router is only useful while its backbone is up, so the device keeps trying to reconnect for as long as it holds credentials. Attempts are immediate for the first three, then back off 1, 2, 5, 15 and 30 seconds to a ceiling of one attempt a minute, which it will sustain indefinitely. A ten-second watchdog re-arms the ladder if an attempt is ever lost. Nothing about an outage is fatal: an access point that reboots, changes channel or is switched off for a week is picked up again when it returns.
+
+A new password is tested in RAM and only written to flash once it has actually connected, so a reset or a power cut while a wrong one is being tried can no longer destroy the credentials that were working. A failed attempt leaves the previous network in flash untouched.
+
+`status` reports the stored SSID separately from the live connection, so "the credentials were lost" and "the credentials are fine but we are not connected" are distinguishable at a glance. `link` shows the same detail plus the disconnect count and the reason code the access point last sent.
+
+`link drop [n]` forces `n` rapid disconnects to simulate an outage, and `link supervisor off` restores the old give-up-after-five-attempts behaviour. Both are diagnostics, neither is persisted, and the supervisor is on again at every boot.
+
 ## Joining someone else's network
 
 1. Ask your border router for an ephemeral key. In Home Assistant that's the Thread panel once ePSKc support lands; today you can run `ot-ctl ba ephemeralkey start <9 digits> 300000` inside the OTBR add-on container.
@@ -80,7 +90,9 @@ Plain HTTP with no authentication, exactly like ot-br-posix: anyone who can reac
 
 ## Matter and Home Assistant topology
 
-The Matter node has a standard Root Node plus a Thread Border Router endpoint with Thread Network Diagnostics and Thread Border Router Management (including PAN Change). Matter and MeshCoP use the same saved device name, so the controller-facing TBR name matches the border-router service visible on the LAN.
+The Matter node has a standard Root Node plus a Thread Border Router endpoint with Thread Network Diagnostics and Thread Border Router Management (including PAN Change). It identifies itself as vendor **M5Stack**, product **CoreS3 Thread BR**, with the firmware's git revision as its software version, and advertises device type `0x0091` while commissionable. Matter and MeshCoP use the same saved device name: it is the Matter NodeLabel (what Home Assistant names the device), the TBR Management `BorderRouterName`, and the `_meshcop._udp` instance on the LAN. Changing it under **Settings > Name** or with `name` republishes all three without a reboot.
+
+The `_meshcop._udp` record itself is corrected by the firmware. ESP-IDF's prebuilt border-router library publishes it with the Thread role stuck at "detached", the Active Timestamp shifted by two bytes and the device's own OMR prefix instead of the network's favoured one; the firmware re-applies OpenThread's own encoding of the record whenever it changes, so the entry matches what ot-br-posix and the Apple and Google routers on the same network advertise. While a share code is active, `_meshcop-e._udp` is published under the same instance name with the same record.
 
 This development build uses the Connectivity Standards Alliance test vendor/product range and Espressif's example device-attestation credentials. It is interoperable Matter firmware, but it is not a CSA-certified commercial product. Home Assistant Matter Server 9.0 and later therefore needs its **Test-Net DCL** option enabled before commissioning it.
 
@@ -100,11 +112,15 @@ Wi-Fi, screen brightness and sleep timeout, a live power page, Thread options (r
 
 The power page reports battery percentage, voltages, PMIC and ESP32 temperatures, charge state, and a discharge rate estimated from the gauge. There is no live wattage: the AXP2101 has no current-sense channel.
 
+Wi-Fi power management follows the power source. On USB the radio never dozes, which keeps backbone round trips in the low milliseconds rather than the 100 to 300 ms that modem sleep adds to every packet routed through a border router. On battery it returns to modem sleep automatically.
+
 ## Console commands
 
 | Command | Does |
 |---|---|
-| `wifi <ssid> <pass>` | connect and persist |
+| `wifi <ssid> <pass>` | connect, and save to flash only once the connection succeeds |
+| `link [drop [n]\|retry\|supervisor on\|off]` | Wi-Fi link state, disconnect count and last reason code; `drop` simulates an outage |
+| `reboot` | restart the device |
 | `status` | Wi-Fi, IP and firmware version |
 | `join <ip> <port> <code>` | run the ePSKc exchange from the console |
 | `newnet` | form a new Thread network |
@@ -116,14 +132,23 @@ The power page reports battery percentage, voltages, PMIC and ESP32 temperatures
 | `power` | voltages, temperatures, discharge rate |
 | `settings` | show persisted settings |
 | `batt` | battery %, voltage, charge state |
-| `name <name>` | set the shared Matter/MeshCoP border-router name |
+| `name <name>` | set the shared Matter/MeshCoP border-router name; republished immediately |
 | `matter [status\|code\|open [seconds]]` | inspect or open Matter commissioning |
 | `camtest` | grab frames, print stats and ASCII art |
 | `reveal 1` | unmask the network key in output. It prints secrets, so leave it off |
+| `log [quiet\|<level> [tag]]` | console verbosity. Boots `quiet`: warnings and errors from every component, this firmware's own tags at info. `log info` restores everything, `log info OPENTHREAD` one tag |
+
+`status` also reports uptime and heap headroom, and `thread` prints the version string of the ESP32-H2 RCP firmware.
 
 ## Building
 
-See [CLION.md](CLION.md) for a local ESP-IDF setup. `build.ps1` uses the same ESP-IDF v5.5.4 release as CI and builds in Docker. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
+See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` uses that local install, reuses `build/` and ccache, so a rebuild after a source edit takes seconds. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
+
+```powershell
+.\build-native.ps1 -Port COM5
+```
+
+`build.ps1` uses the same ESP-IDF v5.5.4 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
 
 ```powershell
 .\build.ps1 -Port COM5

@@ -122,6 +122,17 @@ CONFIG_ENABLE_ROUTE_HOOK=n
 CONFIG_ENABLE_CHIP_SHELL=n
 CONFIG_ENABLE_OTA_REQUESTOR=n
 CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=2
+# Advertise the Thread Border Router device type (0x0091 = 145) in the
+# commissionable-node record, so a commissioner can label the device before
+# it pairs. Vendor, product and hardware strings come from the provider in
+# matter.cpp; the VID/PID stay in the CSA test range.
+CONFIG_ENABLE_COMMISSIONABLE_DEVICE_TYPE=y
+CONFIG_DEVICE_TYPE=145
+# Compile CHIP's runtime category filter in. The ESP32 port prints the
+# "I (t) chip[XX]:" prefix with a bare printf before the message reaches
+# esp_log, so the per-tag ESP log level alone cannot silence it; the console's
+# `log` command drives this filter instead.
+CONFIG_CHIP_LOG_FILTERING=y
 CONFIG_ESP_MATTER_NVS_PART_NAME="matter_nvs"
 CONFIG_CHIP_FACTORY_NAMESPACE_PARTITION_LABEL="matter_nvs"
 CONFIG_CHIP_CONFIG_NAMESPACE_PARTITION_LABEL="matter_nvs"

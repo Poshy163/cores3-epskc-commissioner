@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 #include "esp_heap_caps.h"
 #include "lvgl.h"
+#include "matter.h"
 #include "meshcop.h"
 #include "nvs.h"
 #include "otbr_rest.h"
@@ -65,7 +66,7 @@ static const char *TAG = "ui";
 typedef enum {
     JOB_SCAN, JOB_JOIN, JOB_QR, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE, JOB_CAMTEST,
     JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_SHARE_STOP, JOB_FORGET,
-    JOB_FACTORY_RESET, JOB_CALL
+    JOB_FACTORY_RESET, JOB_CALL, JOB_RENAME
 } job_t;
 
 /*
@@ -102,6 +103,9 @@ typedef struct {
             ui_worker_fn fn;
             void *arg;
         } call;
+        struct {
+            char name[SETTINGS_DEVICE_NAME_BUFFER_SIZE];
+        } rename;
     } data;
 } ui_job_msg_t;
 
@@ -288,6 +292,7 @@ static void batt_timer_cb(lv_timer_t *t)
     esp_err_t perr = power_read(&ps);
     if (perr == ESP_OK) {
         s_on_external_power = ps.vbus;
+        app_wifi_set_power_profile(ps.vbus);
     }
     if (perr != ESP_OK || !ps.present || ps.percent < 0) {
         lv_obj_add_flag(batt_body, LV_OBJ_FLAG_HIDDEN);
@@ -1545,6 +1550,8 @@ static void worker(void *arg)
             bsp_display_unlock();
         } else if (job == JOB_FACTORY_RESET) {
             app_factory_reset();   /* reboots; does not normally return */
+        } else if (job == JOB_RENAME) {
+            app_apply_device_name(msg.data.rename.name);
         } else if (job == JOB_JOIN) {
             size_t dlen = 0;
             const ba_entry_t *target = &msg.data.join.target;
@@ -1818,7 +1825,13 @@ static void on_name_kb(lv_event_t *e)
         ESP_LOGE(TAG, "could not save device name");
         return;
     }
-    /* Both Matter and MeshCoP publish this value during boot. */
+    /* Publish it live on the worker. Not a UI job: it must neither wait for
+     * nor block a scan or join in flight. Boot applies it again anyway. */
+    ui_job_msg_t msg = { .type = JOB_RENAME };
+    snprintf(msg.data.rename.name, sizeof(msg.data.rename.name), "%s", name);
+    if (s_jobs == NULL || xQueueSend(s_jobs, &msg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "name saved; it is published after the next reboot");
+    }
     show_panel(panel_settings);
 }
 
@@ -1872,6 +1885,11 @@ static void refresh_about_info(void)
     if (otbr_rest_running()) {
         appendf(buf, sizeof(buf), &n, "           trusted LAN only (no authentication)\n");
     }
+    appendf(buf, sizeof(buf), &n, "Matter    %s", matter_status_string(matter_get_status()));
+    if (matter_get_status() == MATTER_RUNTIME_ERROR) {
+        appendf(buf, sizeof(buf), &n, " (%s)", esp_err_to_name(matter_get_last_error()));
+    }
+    appendf(buf, sizeof(buf), &n, "\n");
     appendf(buf, sizeof(buf), &n,
             "\nFirmware   %s\n"
             "ESP-IDF    %s\n"

@@ -15,7 +15,9 @@
 #include "settings.h"
 
 #include <app/server/Server.h>
+#include <lib/support/logging/TextOnlyLogging.h>
 #include <platform/CHIPDeviceLayer.h>
+#include <platform/DeviceInstanceInfoProvider.h>
 #include <platform/ESP32/OpenthreadLauncher.h>
 #include <platform/KvsPersistentStorageDelegate.h>
 #include <platform/OpenThread/GenericThreadBorderRouterDelegate.h>
@@ -42,6 +44,127 @@ constexpr int kRcpBaudRate = 460800;
 
 constexpr uint16_t kMinCommissioningWindowSeconds = 3 * 60;
 constexpr uint16_t kMaxCommissioningWindowSeconds = 15 * 60;
+
+/* What a controller shows for this node. The VID/PID stay in the CSA test
+ * range and come from the SDK's provider; only the human-readable strings
+ * are ours. */
+constexpr char kVendorName[] = "M5Stack";
+constexpr char kProductName[] = "CoreS3 Thread BR";
+constexpr char kHardwareVersionString[] = "CoreS3 Thread BR K149";
+
+CHIP_ERROR copy_string(char *buf, size_t size, const char *text)
+{
+    const size_t length = std::strlen(text);
+    VerifyOrReturnError(buf != nullptr && size > length, CHIP_ERROR_BUFFER_TOO_SMALL);
+    std::memcpy(buf, text, length + 1);
+    return CHIP_NO_ERROR;
+}
+
+/*
+ * esp_matter serves VendorName, ProductName and HardwareVersionString through
+ * the DeviceInstanceInfoProvider rather than from attribute storage, so the
+ * only way to replace the SDK's TEST_VENDOR placeholders without a factory
+ * partition is to wrap the provider the stack installs during start().
+ * Everything else is forwarded unchanged.
+ */
+class InstanceInfoProvider : public chip::DeviceLayer::DeviceInstanceInfoProvider
+{
+public:
+    void SetFallback(chip::DeviceLayer::DeviceInstanceInfoProvider *fallback)
+    {
+        if (fallback != this) {
+            m_fallback = fallback;
+        }
+    }
+
+    CHIP_ERROR GetVendorName(char *buf, size_t size) override { return copy_string(buf, size, kVendorName); }
+    CHIP_ERROR GetProductName(char *buf, size_t size) override { return copy_string(buf, size, kProductName); }
+    CHIP_ERROR GetHardwareVersionString(char *buf, size_t size) override
+    {
+        return copy_string(buf, size, kHardwareVersionString);
+    }
+
+    CHIP_ERROR GetVendorId(uint16_t &vendorId) override
+    {
+        return m_fallback ? m_fallback->GetVendorId(vendorId) : CHIP_ERROR_INCORRECT_STATE;
+    }
+    CHIP_ERROR GetProductId(uint16_t &productId) override
+    {
+        return m_fallback ? m_fallback->GetProductId(productId) : CHIP_ERROR_INCORRECT_STATE;
+    }
+    CHIP_ERROR GetPartNumber(char *buf, size_t size) override
+    {
+        return m_fallback ? m_fallback->GetPartNumber(buf, size) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetProductURL(char *buf, size_t size) override
+    {
+        return m_fallback ? m_fallback->GetProductURL(buf, size) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetProductLabel(char *buf, size_t size) override
+    {
+        return m_fallback ? m_fallback->GetProductLabel(buf, size) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetSerialNumber(char *buf, size_t size) override
+    {
+        return m_fallback ? m_fallback->GetSerialNumber(buf, size) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetManufacturingDate(uint16_t &year, uint8_t &month, uint8_t &day) override
+    {
+        return m_fallback ? m_fallback->GetManufacturingDate(year, month, day) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetHardwareVersion(uint16_t &version) override
+    {
+        return m_fallback ? m_fallback->GetHardwareVersion(version) : CHIP_ERROR_INCORRECT_STATE;
+    }
+    CHIP_ERROR GetRotatingDeviceIdUniqueId(chip::MutableByteSpan &uniqueId) override
+    {
+        return m_fallback ? m_fallback->GetRotatingDeviceIdUniqueId(uniqueId) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetProductFinish(chip::app::Clusters::BasicInformation::ProductFinishEnum *finish) override
+    {
+        return m_fallback ? m_fallback->GetProductFinish(finish) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetProductPrimaryColor(chip::app::Clusters::BasicInformation::ColorEnum *color) override
+    {
+        return m_fallback ? m_fallback->GetProductPrimaryColor(color) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+    CHIP_ERROR GetJointFabricMode(uint8_t &mode) override
+    {
+        return m_fallback ? m_fallback->GetJointFabricMode(mode) : CHIP_ERROR_NOT_IMPLEMENTED;
+    }
+
+private:
+    chip::DeviceLayer::DeviceInstanceInfoProvider *m_fallback = nullptr;
+};
+
+InstanceInfoProvider s_instance_info;
+
+/*
+ * NodeLabel is a writable, persisted attribute, so the config default handed
+ * to esp_matter only lands on a blank matter_nvs. Write the saved device name
+ * through esp_matter, which takes the stack lock, routes the managed
+ * attribute to the code-driven Basic Information cluster, skips the report
+ * when the value is unchanged, and persists it. Controllers name the device
+ * after this attribute.
+ */
+esp_err_t apply_node_label(const char *name)
+{
+    const size_t length = std::strlen(name);
+    if (length == 0 || length > SETTINGS_DEVICE_NAME_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_matter_attr_val_t value = esp_matter_char_str(const_cast<char *>(name),
+                                                      static_cast<uint16_t>(length));
+    esp_err_t error = esp_matter::attribute::update(
+        0, chip::app::Clusters::BasicInformation::Id,
+        chip::app::Clusters::BasicInformation::Attributes::NodeLabel::Id, &value);
+    if (error != ESP_OK) {
+        ESP_LOGW(kTag, "NodeLabel not updated: %s", esp_err_to_name(error));
+        return error;
+    }
+    ESP_LOGI(kTag, "NodeLabel is \"%s\"", name);
+    return ESP_OK;
+}
 
 std::atomic<matter_runtime_status_t> s_status{MATTER_RUNTIME_STOPPED};
 std::atomic<esp_err_t> s_last_error{ESP_OK};
@@ -301,11 +424,27 @@ extern "C" esp_err_t matter_init(void)
         return fail_init(error, "ESP-Matter start failed");
     }
 
-    chip_error = chip::DeviceLayer::ConnectivityMgr().SetWiFiStationMode(
-        chip::DeviceLayer::ConnectivityManager::kWiFiStationMode_ApplicationControlled);
+    /*
+     * Declaring application control is what stops CHIP's connectivity manager
+     * from driving the station underneath the application. It mutates CHIP
+     * state from this task rather than the CHIP event loop, so it needs the
+     * stack lock; without it the write can race the loop and be lost, leaving
+     * ownership of the radio undefined between two supervisors.
+     */
+    {
+        esp_matter::lock::ScopedChipStackLock chip_lock(portMAX_DELAY);
+        chip_error = chip::DeviceLayer::ConnectivityMgr().SetWiFiStationMode(
+            chip::DeviceLayer::ConnectivityManager::kWiFiStationMode_ApplicationControlled);
+    }
     if (chip_error != CHIP_NO_ERROR) {
         return fail_init(chip_error_to_esp(chip_error), "could not retain application-controlled Wi-Fi");
     }
+    ESP_LOGI(kTag, "Wi-Fi station is application-controlled; CHIP will not drive it");
+
+    /* start() installed the SDK's provider; wrap it so the controller sees the
+     * hardware's names instead of TEST_VENDOR / TEST_PRODUCT. */
+    s_instance_info.SetFallback(chip::DeviceLayer::GetDeviceInstanceInfoProvider());
+    chip::DeviceLayer::SetDeviceInstanceInfoProvider(&s_instance_info);
 
     s_started.store(true, std::memory_order_release);
     s_commissioning_window_open.store(
@@ -314,10 +453,35 @@ extern "C" esp_err_t matter_init(void)
     refresh_fabric_state();
     s_last_error.store(ESP_OK, std::memory_order_relaxed);
 
+    if (apply_node_label(border_router_name) != ESP_OK) {
+        ESP_LOGW(kTag, "NodeLabel keeps its stored value");
+    }
+
     ESP_LOGI(kTag, "Matter TBR endpoint %u started (%s)",
              static_cast<unsigned>(s_tbr_endpoint_id.load(std::memory_order_relaxed)),
              s_commissioned.load(std::memory_order_relaxed) ? "commissioned" : "commissionable");
     return ESP_OK;
+}
+
+extern "C" void matter_set_log_verbosity(esp_log_level_t level)
+{
+    uint8_t category;
+    switch (level) {
+    case ESP_LOG_NONE:
+        category = chip::Logging::kLogCategory_None;
+        break;
+    case ESP_LOG_ERROR:
+    case ESP_LOG_WARN:
+        category = chip::Logging::kLogCategory_Error;
+        break;
+    case ESP_LOG_INFO:
+        category = chip::Logging::kLogCategory_Progress;
+        break;
+    default:
+        category = chip::Logging::kLogCategory_Detail;
+        break;
+    }
+    chip::Logging::SetLogFilter(category);
 }
 
 extern "C" matter_runtime_status_t matter_get_status(void)
@@ -413,6 +577,19 @@ extern "C" esp_err_t matter_factory_reset(void)
                  esp_err_to_name(cleanup_error));
     }
     return ESP_OK;
+}
+
+extern "C" esp_err_t matter_set_border_router_name(const char *name)
+{
+    if (name == nullptr || name[0] == '\0' || std::strlen(name) > SETTINGS_DEVICE_NAME_MAX_LEN) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_started.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* Copies the name and schedules the attribute report on the CHIP loop. */
+    s_tbr_delegate.SetThreadBorderRouterName(chip::CharSpan(name, std::strlen(name)));
+    return apply_node_label(name);
 }
 
 extern "C" esp_err_t matter_get_onboarding_codes(char *qr_code, size_t qr_code_size,

@@ -13,8 +13,20 @@
  * The H2 still runs the RCP firmware from the stock border-router image; only
  * the S3 application was replaced, so the radio side is untouched.
  */
+/* Model string advertised in the MeshCoP records ("mn"). */
+#define THREAD_MESHCOP_MODEL_NAME "M5Stack CoreS3 Thread BR"
+
 /* Adopt the Matter-owned OpenThread stack. Matter must be started first. */
 esp_err_t thread_init(void);
+
+/* Version string reported by the ESP32-H2 RCP firmware. False if unavailable. */
+bool thread_rcp_version(char *out, size_t cap);
+
+/*
+ * Re-publish _meshcop._udp under a new instance name without a reboot. Safe
+ * before the border router is up: the name is kept and applied at start.
+ */
+esp_err_t thread_set_border_router_name(const char *name);
 
 /* True once the host stack and RCP are available. */
 bool thread_available(void);
