@@ -622,7 +622,7 @@ def panels() -> dict[str, list[Box]]:
         "Battery  100%   4.16 V   constant current\n"
         "USB      present   4.68 V\nSystem   4.37 V\n"
         "Temp     PMIC 40 C   ESP32 37 C\n\n"
-        "Discharge  measuring (10 min on battery)\n\n"
+        "Discharge  waiting for steady\ngauge data (10+ min, 2% drop)\n\n"
         "The AXP2101 has no current sensor,\nso there is no live mW figure.",
         14, power_content.x + 4, power_content.y + 4, W - 28,
         parent=power_content.name, clip=power_content.name,

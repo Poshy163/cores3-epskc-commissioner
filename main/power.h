@@ -41,10 +41,12 @@ esp_err_t power_read(power_status_t *out);
 bool power_esp_temp(float *celsius);
 
 /*
- * Discharge-rate tracking. Feed one sample roughly every minute; pass
+ * Discharge-rate tracking. Feed every telemetry poll (at least once/minute);
+ * storage is rate-limited to once per minute. Pass
  * on_battery=false (USB present) to reset the history, since charging makes
  * the numbers meaningless. power_discharge_rate() reports false until there
- * is at least ten minutes of battery-only history and a measurable drop.
+ * is at least ten minutes of continuous gauge-only battery history and a
+ * two-point drop. Gaps, invalid samples and upward gauge corrections reset it.
  */
 void power_note_sample(int percent, bool on_battery);
 bool power_discharge_rate(float *pct_per_hour, int *minutes_left);

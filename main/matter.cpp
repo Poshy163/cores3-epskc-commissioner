@@ -1,4 +1,5 @@
 #include "matter.h"
+#include "matter_battery.h"
 
 #include <algorithm>
 #include <atomic>
@@ -395,6 +396,11 @@ extern "C" esp_err_t matter_init(void)
     }
     s_tbr_endpoint_id.store(esp_matter::endpoint::get_id(endpoint), std::memory_order_release);
 
+    error = matter_battery_create(node);
+    if (error != ESP_OK) {
+        return fail_init(error, "could not create Matter battery endpoint");
+    }
+
     esp_matter::cluster_t *management_cluster = esp_matter::cluster::get(
         endpoint, chip::app::Clusters::ThreadBorderRouterManagement::Id);
     if (management_cluster == nullptr) {
@@ -452,6 +458,11 @@ extern "C" esp_err_t matter_init(void)
 
     if (apply_node_label(border_router_name) != ESP_OK) {
         ESP_LOGW(kTag, "NodeLabel keeps its stored value");
+    }
+
+    error = matter_battery_start(s_tbr_endpoint_id.load(std::memory_order_relaxed));
+    if (error != ESP_OK) {
+        return fail_init(error, "could not start Matter battery reporting");
     }
 
     ESP_LOGI(kTag, "Matter TBR endpoint %u started (%s)",

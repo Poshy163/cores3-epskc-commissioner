@@ -25,6 +25,7 @@
 #include "driver/temperature_sensor.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 
 static const char *TAG = "power";
 
@@ -46,6 +47,7 @@ static const char *TAG = "power";
 #define I2C_TIMEOUT_MS 200
 
 static i2c_master_dev_handle_t s_axp;
+static bool s_adc_ready;
 
 static esp_err_t reg_read(uint8_t reg, uint8_t *val)
 {
@@ -61,17 +63,18 @@ static esp_err_t reg_write(uint8_t reg, uint8_t val)
 /* Two-register ADC result: `hbits` significant bits in the high byte. */
 static int read_adc(uint8_t reg_h, int hbits)
 {
-    uint8_t h = 0, l = 0;
-    if (reg_read(reg_h, &h) != ESP_OK || reg_read(reg_h + 1, &l) != ESP_OK) {
+    uint8_t data[2];
+    if (i2c_master_transmit_receive(s_axp, &reg_h, 1, data, sizeof(data),
+                                  I2C_TIMEOUT_MS) != ESP_OK) {
         return -1;
     }
-    return ((h & ((1 << hbits) - 1)) << 8) | l;
+    return ((data[0] & ((1 << hbits) - 1)) << 8) | data[1];
 }
 
 /* Battery telemetry is a nice-to-have: never let it take the app down. */
 static esp_err_t ensure_init(void)
 {
-    if (s_axp) {
+    if (s_axp && s_adc_ready) {
         return ESP_OK;
     }
     esp_err_t err = bsp_i2c_init();
@@ -83,19 +86,29 @@ static esp_err_t ensure_init(void)
         .device_address = AXP2101_ADDR,
         .scl_speed_hz = 400000,
     };
-    err = i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &s_axp);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "AXP2101 not reachable: %s", esp_err_to_name(err));
-        return err;
+    if (!s_axp) {
+        err = i2c_master_bus_add_device(bsp_i2c_get_handle(), &cfg, &s_axp);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "AXP2101 not reachable: %s", esp_err_to_name(err));
+            return err;
+        }
     }
 
     /* The gauge runs regardless, but the voltage and temperature results only
      * populate with their ADC channels switched on. */
     uint8_t adc = 0;
     const uint8_t want = ADC_EN_VBAT | ADC_EN_VBUS | ADC_EN_VSYS | ADC_EN_TDIE;
-    if (reg_read(AXP2101_REG_ADC_EN, &adc) == ESP_OK && (adc & want) != want) {
-        reg_write(AXP2101_REG_ADC_EN, adc | want);
+    err = reg_read(AXP2101_REG_ADC_EN, &adc);
+    if (err != ESP_OK) {
+        return err;
     }
+    if ((adc & want) != want) {
+        err = reg_write(AXP2101_REG_ADC_EN, adc | want);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+    s_adc_ready = true;
     return ESP_OK;
 }
 
@@ -114,7 +127,8 @@ static const char *charge_detail_str(uint8_t st2)
 
 /*
  * Open-circuit curve for a single Li-ion cell. Coarse by design: it only has
- * to stand in while the gauge re-converges, and it is read under light load.
+ * to stand in while the gauge re-converges. Load affects this estimate;
+ * never apply an open-circuit curve to a cell being charged.
  */
 static int percent_from_mv(int mv)
 {
@@ -153,6 +167,8 @@ esp_err_t power_read(power_status_t *out)
     out->full = false;
     out->vbus = false;
     out->charge_detail = "unknown";
+    out->raw_st1 = 0;
+    out->raw_st2 = 0;
 
     esp_err_t err = ensure_init();
     if (err != ESP_OK) {
@@ -173,9 +189,10 @@ esp_err_t power_read(power_status_t *out)
 
     out->present = st1 & (1 << 3);
     out->vbus = st1 & (1 << 5);
-    out->charging = ((st2 >> 5) & 0x03) == 0x01;
-    out->full = (st2 & 0x07) == 0x04;
-    out->charge_detail = charge_detail_str(st2);
+    out->charging = out->present && out->vbus && ((st2 >> 5) & 0x03) == 0x01;
+    out->full = out->present && out->vbus && !out->charging && (st2 & 0x07) == 0x04;
+    out->charge_detail = !out->present ? "not connected" :
+                         !out->vbus ? "discharging" : charge_detail_str(st2);
     out->raw_st1 = st1;
     out->raw_st2 = st2;
 
@@ -193,9 +210,9 @@ esp_err_t power_read(power_status_t *out)
     if (out->present) {
         uint8_t soc = 0;
         bool gauge_ok = reg_read(AXP2101_REG_SOC, &soc) == ESP_OK && soc <= 100;
-        if (gauge_ok && soc > 0) {
+        if (gauge_ok && (soc > 0 || (out->batt_mv >= 2500 && out->batt_mv < 3800))) {
             out->percent = soc;
-        } else if (out->batt_mv > 0) {
+        } else if (!out->vbus && out->batt_mv >= 2500 && out->batt_mv <= 4350) {
             /*
              * Switching the Base DIN battery out and back in restarts the
              * AXP2101's gauge, which then reports 0 % for several minutes
@@ -242,6 +259,7 @@ bool power_esp_temp(float *celsius)
  * minutes the rate would be dominated by quantisation and is withheld.
  */
 #define HIST_N 12
+static portMUX_TYPE s_hist_lock = portMUX_INITIALIZER_UNLOCKED;
 static struct {
     int64_t t_us;
     int pct;
@@ -251,30 +269,52 @@ static int s_hist_head;   /* next write slot */
 
 void power_note_sample(int percent, bool on_battery)
 {
-    if (!on_battery || percent < 0) {
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_hist_lock);
+    if (!on_battery || percent < 0 || percent > 100) {
         s_hist_n = 0;
         s_hist_head = 0;
+        portEXIT_CRITICAL(&s_hist_lock);
         return;
     }
-    s_hist[s_hist_head].t_us = esp_timer_get_time();
+    if (s_hist_n) {
+        int newest = (s_hist_head + HIST_N - 1) % HIST_N;
+        int64_t elapsed = now - s_hist[newest].t_us;
+        /* A gap or gauge correction invalidates a continuous discharge run. */
+        if (elapsed > 90000000 || percent > s_hist[newest].pct || elapsed < 0) {
+            s_hist_n = 0;
+            s_hist_head = 0;
+        } else if (elapsed < 60000000) {
+            portEXIT_CRITICAL(&s_hist_lock);
+            return;
+        }
+    }
+    s_hist[s_hist_head].t_us = now;
     s_hist[s_hist_head].pct = percent;
     s_hist_head = (s_hist_head + 1) % HIST_N;
     if (s_hist_n < HIST_N) {
         s_hist_n++;
     }
+    portEXIT_CRITICAL(&s_hist_lock);
 }
 
 bool power_discharge_rate(float *pct_per_hour, int *minutes_left)
 {
+    portENTER_CRITICAL(&s_hist_lock);
     if (s_hist_n < 2) {
+        portEXIT_CRITICAL(&s_hist_lock);
         return false;
     }
     int newest = (s_hist_head + HIST_N - 1) % HIST_N;
     int oldest = (s_hist_n == HIST_N) ? s_hist_head : 0;
 
-    double dt_h = (s_hist[newest].t_us - s_hist[oldest].t_us) / 3.6e9;
+    int64_t elapsed = s_hist[newest].t_us - s_hist[oldest].t_us;
     int drop = s_hist[oldest].pct - s_hist[newest].pct;
-    if (dt_h < (10.0 / 60.0) || drop < 1) {
+    int remaining = s_hist[newest].pct;
+    int64_t age = esp_timer_get_time() - s_hist[newest].t_us;
+    portEXIT_CRITICAL(&s_hist_lock);
+    double dt_h = elapsed / 3.6e9;
+    if (dt_h < (10.0 / 60.0) || drop < 2 || age > 90000000) {
         return false;
     }
     float rate = (float) (drop / dt_h);
@@ -282,7 +322,7 @@ bool power_discharge_rate(float *pct_per_hour, int *minutes_left)
         *pct_per_hour = rate;
     }
     if (minutes_left) {
-        *minutes_left = (int) (s_hist[newest].pct / rate * 60.0f);
+        *minutes_left = (int) (remaining / rate * 60.0f);
     }
     return true;
 }

@@ -20,6 +20,7 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "esp_pm.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -31,6 +32,7 @@
 #include "meshcop.h"
 #include "otbr_rest.h"
 #include "power.h"
+#include "power_log.h"
 #include "qrscan.h"
 #include "settings.h"
 #include "thread.h"
@@ -1390,22 +1392,34 @@ static int cmd_power(int argc, char **argv)
         printf("PMIC unreachable\n");
         return 1;
     }
-    printf("battery  : %d%%%s  %d mV  %s%s\n",
-           ps.percent, ps.percent_estimated ? " est" : "", ps.batt_mv,
+    if (ps.percent >= 0) {
+        printf("battery  : %d%%%s", ps.percent, ps.percent_estimated ? " est" : "");
+    } else {
+        printf("battery  : unknown");
+    }
+    printf("  %d mV  %s%s\n", ps.batt_mv,
            ps.present ? "" : "(not detected) ", ps.charge_detail);
     printf("vbus     : %s  %d mV\n", ps.vbus ? "present" : "absent", ps.vbus_mv);
     printf("vsys     : %d mV\n", ps.vsys_mv);
     printf("pmic temp: %d C\n", ps.pmic_temp_c);
+    esp_pm_config_t pm;
+    if (esp_pm_get_configuration(&pm) == ESP_OK) {
+        printf("cpu      : %d-%d MHz, light sleep %s\n", pm.min_freq_mhz,
+               pm.max_freq_mhz, pm.light_sleep_enable ? "on" : "off");
+    }
     float t;
     if (power_esp_temp(&t)) {
         printf("esp temp : %.1f C\n", t);
     }
     float rate;
     int mins;
-    if (power_discharge_rate(&rate, &mins)) {
+    if (ps.vbus) {
+        printf("discharge: external power\n");
+    } else if (ps.present && !ps.percent_estimated && ps.percent >= 0 &&
+               power_discharge_rate(&rate, &mins)) {
         printf("discharge: %.1f %%/h  ~%dh%02dm left\n", rate, mins / 60, mins % 60);
     } else {
-        printf("discharge: measuring (needs 10 min on battery)\n");
+        printf("discharge: waiting for steady gauge data (10+ min, 2%% drop)\n");
     }
     return 0;
 }
@@ -1505,9 +1519,14 @@ static int cmd_batt(int argc, char **argv)
         printf("no battery detected (vbus: %s, vbat %d mV)\n",
                ps.vbus ? "present" : "absent", ps.batt_mv);
     } else {
-        printf("battery : %d%%  (%d mV)\n", ps.percent, ps.batt_mv);
+        if (ps.percent >= 0) {
+            printf("battery : %d%%%s  (%d mV)\n", ps.percent,
+                   ps.percent_estimated ? " est" : "", ps.batt_mv);
+        } else {
+            printf("battery : unknown  (%d mV)\n", ps.batt_mv);
+        }
         printf("state   : %s  vbus: %s\n",
-               ps.charging ? "charging" : ps.full ? "full" : "discharging",
+               ps.charge_detail,
                ps.vbus ? "present" : "absent");
     }
     printf("raw     : st1=0x%02x st2=0x%02x\n", ps.raw_st1, ps.raw_st2);
@@ -1545,6 +1564,16 @@ void app_main(void)
 {
     apply_quiet_log_profile();
 
+    /* Keep APB at 80 MHz for the H2 UART, camera and USB console. The CPUs
+     * can idle at 80 MHz and return to the configured maximum for work.
+     * Automatic sleep would require coordinating wakeup with the H2 RCP. */
+    const esp_pm_config_t pm = {
+        .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    ESP_ERROR_CHECK(esp_pm_configure(&pm));
+
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed (%s); saved provisioning preserved. "
@@ -1552,6 +1581,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
     settings_load();
+    if (power_log_init() != ESP_OK) {
+        ESP_LOGW(TAG, "battery history unavailable: no PSRAM buffer");
+    }
 
     /* Display first, so boot progress is visible on the LCD rather than
      * leaving the screen dark until something happens. */

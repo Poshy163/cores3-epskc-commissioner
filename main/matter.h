@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
+#include "power.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +39,9 @@ typedef enum {
  * them, while OpenThread is initialized and tasked by ESP-Matter itself.
  */
 esp_err_t matter_init(void);
+
+/* Nonblocking handoff of the existing PMIC sample; safe before Matter start. */
+void matter_note_power(const power_status_t *sample, esp_err_t error);
 
 matter_runtime_status_t matter_get_status(void);
 const char *matter_status_string(matter_runtime_status_t status);

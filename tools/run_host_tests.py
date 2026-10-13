@@ -15,13 +15,14 @@ def main():
     parser.add_argument('--cc', default='cc', help='host C compiler or Zig executable')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    for script in ['test_wifi.py', 'test_ui_power_settings.py']:
+    for script in ['test_wifi.py', 'test_ui_power_settings.py', 'test_power_log.py',
+                   'test_matter_battery_worker.py', 'test_ui_wake.py']:
         subprocess.run([sys.executable, str(root / 'tools' / script), '--cc', args.cc], check=True)
     compiler = [args.cc]
     if Path(args.cc).stem == 'zig':
         compiler.append('cc')
     with tempfile.TemporaryDirectory(prefix='epskc-codec-tests-') as tmp:
-        for name in ['test_otbr_rest_wire', 'test_meshcop_codec']:
+        for name in ['test_otbr_rest_wire', 'test_meshcop_codec', 'test_matter_battery']:
             binary = Path(tmp) / (name + '.exe')
             subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
                            str(root / 'tools' / (name + '.c')), '-o', str(binary)], check=True)

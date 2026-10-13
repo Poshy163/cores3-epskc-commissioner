@@ -32,12 +32,12 @@ def test_actual_power(cc: list[str]) -> None:
 #include <string.h>
 #include "power.h"
 ''' + constants + '''
-static int failed_reg = -1, soc = 100, adc = 4118, reads;
+static int failed_reg = -1, soc = 100, adc = 4118, reads, st1 = 0x28, st2 = 4;
 static esp_err_t ensure_init(void) { return ESP_OK; }
 static esp_err_t reg_read(uint8_t reg, uint8_t *out) {
     reads++;
     if (reg == failed_reg) return ESP_FAIL;
-    *out = reg == AXP2101_REG_STATUS1 ? 0x28 : reg == AXP2101_REG_STATUS2 ? 4 : soc;
+    *out = reg == AXP2101_REG_STATUS1 ? st1 : reg == AXP2101_REG_STATUS2 ? st2 : soc;
     return ESP_OK;
 }
 static int read_adc(uint8_t reg, int bits) { (void)reg; (void)bits; return adc; }
@@ -54,8 +54,22 @@ int main(void) {
     assert(power_read(&out) == ESP_OK && out.full && out.present && out.vbus);
     assert(out.percent == 100 && !out.percent_estimated);
     soc = 0;
+    assert(power_read(&out) == ESP_OK && out.percent == -1 && !out.percent_estimated);
+    st2 = 0x22; // charging voltage must never become an open-circuit SOC
+    assert(power_read(&out) == ESP_OK && out.percent == -1 && out.charging);
+    st1 = 8; st2 = 4; // stale charge-done phase after unplugging
     assert(power_read(&out) == ESP_OK && out.percent_estimated);
     assert(out.percent > 0 && out.percent <= 100);
+    assert(!out.full && !out.charging && strcmp(out.charge_detail, "discharging") == 0);
+    adc = 3400;
+    assert(power_read(&out) == ESP_OK && out.percent == 0 && !out.percent_estimated);
+    soc = 255; adc = 0;
+    assert(power_read(&out) == ESP_OK && out.percent == -1);
+    adc = 5000;
+    assert(power_read(&out) == ESP_OK && out.percent == -1);
+    st1 = 0x20; soc = 100;
+    assert(power_read(&out) == ESP_OK && out.percent == -1 && !out.full);
+    st1 = 8; soc = 0;
     adc = -1;
     assert(power_read(&out) == ESP_OK && out.percent == -1);
     assert(out.pmic_temp_c == INT_MIN);
@@ -68,6 +82,123 @@ int main(void) {
                         str(test), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
     print('PASS actual PMIC read errors, unknown telemetry and gauge fallback')
+
+
+def test_discharge_history(cc: list[str]) -> None:
+    source = (ROOT / 'main/power.c').read_text()
+    source = source[source.index('#define HIST_N'):]
+    with tempfile.TemporaryDirectory(prefix='discharge-test-') as temp:
+        test = pathlib.Path(temp) / 'test.c'
+        test.write_text('''#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#define portMUX_TYPE int
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(p) ((void)(p))
+#define portEXIT_CRITICAL(p) ((void)(p))
+static int64_t now;
+static int64_t esp_timer_get_time(void) { return now; }
+''' + source + '''
+static void run(int start, int drop) {
+    power_note_sample(-1, false);
+    for (int i = 0; i <= 10; ++i) {
+        now += 60000000;
+        power_note_sample(start - (i * drop / 10), true);
+    }
+}
+int main(void) {
+    float rate; int mins;
+    run(80, 1);
+    assert(!power_discharge_rate(&rate, &mins));
+    run(80, 2);
+    assert(power_discharge_rate(&rate, &mins));
+    assert(rate > 11.99f && rate < 12.01f && mins == 390);
+    power_note_sample(78, false); // USB seen between minute samples
+    assert(!power_discharge_rate(&rate, &mins));
+    run(80, 2); power_note_sample(-1, true);
+    assert(!power_discharge_rate(&rate, &mins));
+    run(80, 2); now += 90000001;
+    assert(!power_discharge_rate(&rate, &mins));
+    power_note_sample(77, true);
+    assert(!power_discharge_rate(&rate, &mins));
+    run(80, 2); power_note_sample(79, true); // gauge correction
+    assert(!power_discharge_rate(&rate, &mins));
+    power_note_sample(-1, false);
+    for (int i = 0; i < 80; ++i) {
+        now += 1000000; power_note_sample(70, true);
+    }
+    assert(s_hist_n == 2); // frequent polls do not shorten the window
+    run(80, 2);
+    for (int i = 0; i < 20; ++i) {
+        now += 60000000; power_note_sample(77 - i, true);
+    }
+    assert(power_discharge_rate(&rate, &mins));
+    assert(rate > 59.99f && rate < 60.01f && mins == 58);
+    return 0;
+}
+''')
+        exe = pathlib.Path(temp) / 'test.exe'
+        subprocess.run([*cc, '-std=c11', '-Wall', '-Wextra', '-Werror', str(test), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+    print('PASS actual discharge history continuity, quantisation, stale data and wraparound')
+
+
+def test_power_io(cc: list[str]) -> None:
+    source = (ROOT / 'main/power.c').read_text()
+    source = source[source.index('static const char *TAG'):source.index('static const char *charge_detail_str')]
+    with tempfile.TemporaryDirectory(prefix='power-io-test-') as temp:
+        test = pathlib.Path(temp) / 'test.c'
+        test.write_text('''#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#define ESP_OK 0
+#define ESP_FAIL -1
+#define I2C_ADDR_BIT_LEN_7 7
+#define ESP_LOGW(tag, ...) ((void)(tag))
+typedef int esp_err_t;
+typedef void *i2c_master_dev_handle_t;
+typedef struct { int dev_addr_length, device_address, scl_speed_hz; } i2c_device_config_t;
+static uint8_t registers[256];
+static int adds, fail_read, fail_write, read_length;
+static esp_err_t bsp_i2c_init(void) { return ESP_OK; }
+static void *bsp_i2c_get_handle(void) { return (void *)1; }
+static esp_err_t i2c_master_bus_add_device(void *bus, const i2c_device_config_t *cfg, void **out) {
+    (void)bus; (void)cfg; ++adds; *out = (void *)2; return ESP_OK;
+}
+static esp_err_t i2c_master_transmit_receive(void *dev, const uint8_t *reg, size_t tx,
+                                           uint8_t *out, size_t rx, int timeout) {
+    (void)dev; (void)timeout; assert(tx == 1); read_length = (int)rx;
+    if (fail_read) return ESP_FAIL;
+    for (size_t i = 0; i < rx; ++i) out[i] = registers[*reg + i];
+    return ESP_OK;
+}
+static esp_err_t i2c_master_transmit(void *dev, const uint8_t *data, size_t len, int timeout) {
+    (void)dev; (void)timeout; assert(len == 2);
+    if (fail_write) return ESP_FAIL;
+    registers[data[0]] = data[1]; return ESP_OK;
+}
+''' + source + '''
+int main(void) {
+    registers[0x30] = 0x82; // preserve unrelated ADC bits
+    fail_read = 1;
+    assert(ensure_init() == ESP_FAIL && adds == 1 && !s_adc_ready);
+    fail_read = 0; fail_write = 1;
+    assert(ensure_init() == ESP_FAIL && adds == 1 && !s_adc_ready);
+    fail_write = 0;
+    assert(ensure_init() == ESP_OK && adds == 1 && s_adc_ready);
+    assert(registers[0x30] == 0x9f);
+    registers[0x34] = 0xf0; registers[0x35] = 0x15;
+    assert(read_adc(0x34, 5) == 4117 && read_length == 2);
+    fail_read = 1;
+    assert(read_adc(0x34, 5) == -1);
+    return 0;
+}
+''')
+        exe = pathlib.Path(temp) / 'test.exe'
+        subprocess.run([*cc, '-std=c11', '-Wall', '-Wextra', '-Werror', str(test), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+    print('PASS actual ADC burst reads and failed setup retry without duplicate device')
 
 
 def test_actual_settings(cc: list[str]) -> None:
@@ -128,6 +259,8 @@ def main() -> None:
     command = [cc, "cc"] if pathlib.Path(cc).name.lower().startswith("zig") else [cc]
     test_actual_settings(command)
     test_actual_power(command)
+    test_discharge_history(command)
+    test_power_io(command)
 
 
 if __name__ == "__main__":

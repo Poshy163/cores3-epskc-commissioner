@@ -3,6 +3,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -10,6 +11,8 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "power_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -436,6 +439,72 @@ static esp_err_t h_node(httpd_req_t *r)
     return send_json(r, json);
 }
 
+/* Read-only, paged battery history. No PMIC reads or flash writes occur in
+ * HTTPD; it only copies the UI's samples from the PSRAM ring. */
+static esp_err_t h_power_history(httpd_req_t *r)
+{
+    uint32_t after = 0, limit = 120;
+    char query[80], value[24];
+    if (httpd_req_get_url_query_len(r)) {
+        if (httpd_req_get_url_query_str(r, query, sizeof(query)) != ESP_OK) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "query too long");
+        }
+        esp_err_t err = httpd_query_key_value(query, "after", value, sizeof(value));
+        if ((err != ESP_OK && err != ESP_ERR_NOT_FOUND) ||
+            (err == ESP_OK && !power_log_parse_uint(value, UINT32_MAX, &after))) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "invalid after");
+        }
+        err = httpd_query_key_value(query, "limit", value, sizeof(value));
+        if ((err != ESP_OK && err != ESP_ERR_NOT_FOUND) ||
+            (err == ESP_OK && (!power_log_parse_uint(value, 120, &limit) || limit == 0))) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "limit must be 1..120");
+        }
+    }
+    power_log_info_t info;
+    if (!power_log_info(&info)) {
+        httpd_resp_set_status(r, "503 Service Unavailable");
+        return send_json(r, "{\"error\":\"battery history unavailable\"}");
+    }
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"schema\":1,\"boot_id\":\"%016"PRIx64"\",\"device_uptime_ms\":%"PRId64","
+        "\"capacity\":%u,\"oldest_seq\":%"PRIu32",\"latest_seq\":%"PRIu32",\"samples\":[",
+        info.boot_id, esp_timer_get_time() / 1000, POWER_LOG_CAPACITY,
+        info.oldest_seq, info.latest_seq);
+    esp_err_t err = httpd_resp_send_chunk(r, buf, n);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint32_t start = after >= info.latest_seq ? 0 : after + 1;
+    if (start && start < info.oldest_seq) {
+        start = info.oldest_seq;
+    }
+    unsigned sent = 0;
+    for (uint32_t seq = start; seq && seq <= info.latest_seq && sent < limit; ++seq) {
+        power_log_sample_t row;
+        if (!power_log_get(seq, &row)) {
+            continue; /* overwritten while a slow client was reading */
+        }
+        size_t len = power_log_json(&row, buf, sizeof(buf));
+        if (!len) {
+            return ESP_FAIL;
+        }
+        if (sent && httpd_resp_send_chunk(r, ",", 1) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        if (httpd_resp_send_chunk(r, buf, len) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        ++sent;
+    }
+    if (httpd_resp_send_chunk(r, "]}", 2) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(r, NULL, 0);
+}
+
 esp_err_t otbr_rest_start(void)
 {
     if (s_server) {
@@ -444,7 +513,7 @@ esp_err_t otbr_rest_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = OTBR_REST_PORT;
     cfg.ctrl_port = 32768 + OTBR_REST_PORT;   /* keep clear of other servers */
-    cfg.max_uri_handlers = 18;
+    cfg.max_uri_handlers = 20;
     cfg.max_open_sockets = 3;
     /* Keep HTTPD's default internal-RAM stack. Active-dataset reads reach the
      * OpenThread NVS backend, and ESP-IDF cannot disable the flash cache while
@@ -462,6 +531,7 @@ esp_err_t otbr_rest_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/power/history",        .method = HTTP_GET,    .handler = h_power_history },
         { .uri = "/node",                 .method = HTTP_GET,    .handler = h_node },
         { .uri = "/node",                 .method = HTTP_DELETE, .handler = h_node_delete },
         { .uri = "/node/ba-id",           .method = HTTP_GET,  .handler = h_ba_id },

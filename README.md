@@ -106,11 +106,76 @@ matter open 900
 
 Use the manual code or QR payload from `matter code` in Home Assistant's Matter add-device flow. An uncommissioned device advertises on the LAN and over BLE; after it has a fabric, `matter open` follows the Matter requirement to open subsequent commissioning on the operational network only. Once commissioned, Matter Server can interview endpoint `0x0091` and include the border router and its diagnostics in the Matter network topology.
 
+### Matter battery entities
+
+The node also exposes a Power Source endpoint with Battery and Rechargeable
+features. Home Assistant discovers **Battery**, **Battery voltage**, and
+**Battery charge state** under the existing Matter device. This operates
+independently of the PC recorder; the OTBR REST integration alone does not
+provide these entities. Home Assistant's [Matter sensor mappings](https://github.com/home-assistant/core/blob/2026.9.2/homeassistant/components/matter/sensor.py)
+support these standard attributes.
+
+Battery percentage uses the same gauge samples as the display and is encoded
+in Matter's half-percent units (100% = 200). Missing, invalid, voltage-estimated,
+or stale (60 seconds without a fresh sample) percentages become unknown.
+Cell voltage has independent validity and is sent at most once a minute;
+validity transitions are immediate. Percentage and charge-state changes are
+published from the existing 10-second samples, including with the screen off.
+The charger state distinguishes charging, full charge and not charging.
+The required non-nullable charge-level flag uses warning below 15% and critical
+at 5% or below, retaining its last known value when the gauge is unknown.
+Live attributes are not persisted to flash.
+
+For an already-paired device, refresh its Matter interview if the new endpoint
+is not discovered after the firmware update. Preserve the existing pairing;
+removing the device or factory-resetting it is not required by this change.
+
 ## Settings
 
 Wi-Fi, screen brightness and sleep timeout, a live power page, Thread options (router preference, fixed channel for new networks, share-code lifetime, REST toggles), device name, an About page with firmware hash and uptime, plus Reboot and Factory reset.
 
 The power page reports battery percentage, voltages, PMIC and ESP32 temperatures, charge state, and a discharge rate estimated from the gauge. There is no live wattage: the AXP2101 has no current-sense channel.
+
+The CPUs scale between 80 MHz when idle and the configured maximum (normally
+160 MHz) during work, keeping the peripheral bus at 80 MHz. Automatic light
+sleep is disabled so the H2 radio, USB console and border routing stay available.
+On battery, the screen dims to at most 20% after 30 seconds without a touch,
+then turns off at the saved sleep timeout. Touching restores the saved brightness;
+camera and sharing screens stay bright. Live labels stop refreshing while the
+screen is off. These changes do not overwrite saved screen preferences.
+
+Battery percentages marked `~` in the header or `est` on the power page are
+coarse voltage estimates, affected by load and cell condition. This fallback is
+withheld on USB because charging voltage is unsuitable for the discharge curve.
+A valid zero gauge reading near empty stays zero. Unknown telemetry is not
+reported as a negative percentage. Time remaining needs at least ten minutes
+and a two-point gauge drop; charging, missing data, long sampling gaps and upward
+gauge corrections invalidate the history. It is an extrapolation of recent use,
+not a calibrated runtime guarantee.
+
+For longer discharge tests, `GET /power/history?after=0&limit=120` on the REST
+port returns paged battery telemetry. `boot_id` identifies a boot, `seq` orders
+its samples, and `oldest_seq`/`latest_seq` expose retention bounds. Up to 8,640
+samples are buffered in PSRAM (24 hours at the normal 10-second interval).
+Reconnecting USB does not clear this log. Reboot or complete power loss does;
+the PC recorder provides durable storage. Logging follows the UI's power timer,
+including while the screen is asleep; a stalled UI or missing samples are
+visible through sample age and timestamps.
+
+Run `tools/battery_record.py --url http://<device-ip>:8081 --output <path>.csv
+--keep-awake` using Python on Windows. It collects over Wi-Fi every 30 seconds,
+flushes each sample to disk, resumes from existing CSV without duplicates, and
+records reboots/missing samples in a companion `.events.jsonl`. A `.status.json`
+shows the most recent reading, sample age, error, saved-row counts and process
+ID. It runs for 24 hours by default (`--hours` changes this); `--keep-awake`
+prevents automatic system sleep while it runs, without changing power-plan
+settings. Manual sleep/shutdown and network loss can still interrupt collection.
+
+CSV timestamps are UTC estimates anchored to PC receive time; `uptime_ms`
+is the device's monotonic sample time for discharge calculations. `valid=false`
+marks a failed PMIC read; unknown numbers are blank in CSV/null in JSON. Screen
+percentage is the requested backlight setting, not a measured light level.
+The recorder never fetches Thread credentials or changes device settings.
 
 Wi-Fi power management follows the power source. On USB the radio never dozes, which keeps backbone round trips in the low milliseconds rather than the 100 to 300 ms that modem sleep adds to every packet routed through a border router. On battery it returns to modem sleep automatically.
 

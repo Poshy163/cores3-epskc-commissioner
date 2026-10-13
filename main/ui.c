@@ -27,6 +27,7 @@
 #include "nvs.h"
 #include "otbr_rest.h"
 #include "power.h"
+#include "power_log.h"
 #include "qrscan.h"
 #include "settings.h"
 #include "thread.h"
@@ -133,8 +134,8 @@ static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *pane
 static lv_obj_t *lbl_power_info, *lbl_about_info, *name_ta;
 static lv_obj_t *s_sleep_shield;   /* full-screen tap catcher while asleep */
 static bool s_asleep;
-static int s_sample_tick;          /* batt timer ticks since last gauge sample */
-static bool s_on_external_power;   /* latest VBUS reading, for keep-awake */
+static bool s_dimmed;
+static bool s_on_external_power = true; /* fail safe until the PMIC is read */
 static char s_ip_str[16] = "-";
 
 /* Signals the console task that the worker has finished the camera selftest. */
@@ -294,26 +295,31 @@ static void batt_timer_cb(lv_timer_t *t)
     (void) t;
     power_status_t ps;
     esp_err_t perr = power_read(&ps);
+    unsigned screen = s_asleep ? 0 : settings_get()->brightness;
+    if (s_dimmed && screen > 20) {
+        screen = 20;
+    }
+    power_log_note(&ps, perr, screen);
+    matter_note_power(&ps, perr);
     if (perr == ESP_OK) {
         s_on_external_power = ps.vbus;
         app_wifi_set_power_profile(ps.vbus);
     }
+    /* Call every poll: a brief USB connection or failed read must invalidate
+     * the run immediately. The sampler itself limits storage to once/minute. */
+    power_note_sample(perr == ESP_OK ? ps.percent : -1,
+                      perr == ESP_OK && ps.present && !ps.vbus && !ps.percent_estimated);
+    if (s_asleep) {
+        return;
+    }
     if (perr != ESP_OK || !ps.present || ps.percent < 0) {
+        lv_label_set_text(lbl_batt, "--");
         lv_obj_add_flag(batt_body, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(batt_nub, LV_OBJ_FLAG_HIDDEN);
         return;
     }
     lv_obj_clear_flag(batt_body, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(batt_nub, LV_OBJ_FLAG_HIDDEN);
-
-    /* One gauge sample a minute for the discharge estimate (timer is 10 s). */
-    if (++s_sample_tick >= 6) {
-        s_sample_tick = 0;
-        /* A voltage estimate swings with load, so it would make the
-         * discharge rate meaningless. Treat it like external power and
-         * hold the history until the gauge is authoritative again. */
-        power_note_sample(ps.percent, !ps.vbus && !ps.percent_estimated);
-    }
 
     /* Bolt whenever external power is present, not only while the charger is
      * actively topping up: a full battery on USB reported "no bolt", which
@@ -323,7 +329,7 @@ static void batt_timer_cb(lv_timer_t *t)
                    : ps.percent < 40 ? COL_ACCENT
                                      : COL_DIM;
     lv_label_set_text_fmt(lbl_batt, "%s%d%%",
-                          ps.vbus ? LV_SYMBOL_CHARGE : "", ps.percent);
+                          ps.vbus ? LV_SYMBOL_CHARGE : ps.percent_estimated ? "~" : "", ps.percent);
     lv_obj_set_style_border_color(batt_body, lv_color_hex(col), LV_PART_MAIN);
     lv_obj_set_style_bg_color(batt_nub, lv_color_hex(col), LV_PART_MAIN);
     lv_obj_set_style_bg_color(batt_fill, lv_color_hex(col), LV_PART_MAIN);
@@ -337,7 +343,9 @@ static void role_timer_cb(lv_timer_t *t)
 {
     (void) t;
     s_lvgl_task = xTaskGetCurrentTaskHandle();
-    refresh_network_label();
+    if (!s_asleep) {
+        refresh_network_label();
+    }
 
     /* Stopping a share is security-sensitive. If the worker queue happened
      * to be full when Close was tapped, keep retrying until the stop request
@@ -353,6 +361,9 @@ static void role_timer_cb(lv_timer_t *t)
     }
 
     thread_apply_router_preference();
+    if (s_asleep) {
+        return;
+    }
 
     /* Live pages refresh while visible. */
     if (panel_power && !lv_obj_has_flag(panel_power, LV_OBJ_FLAG_HIDDEN)) {
@@ -376,6 +387,14 @@ static void role_timer_cb(lv_timer_t *t)
     bool camera_open = (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) ||
                        (panel_camera && !lv_obj_has_flag(panel_camera, LV_OBJ_FLAG_HIDDEN));
     bool held_awake = settings_get()->keep_awake_powered && s_on_external_power;
+    bool dim = !s_on_external_power && !sharing && !showing_secret && !camera_open &&
+               !s_ui_job_busy && lv_display_get_inactive_time(NULL) > 30000;
+    if (dim != s_dimmed) {
+        int brightness = settings_get()->brightness;
+        if (bsp_display_brightness_set(dim && brightness > 20 ? 20 : brightness) == ESP_OK) {
+            s_dimmed = dim;
+        }
+    }
     if (timeout && !s_asleep && !sharing && !showing_secret && !camera_open &&
         !s_ui_job_busy && !held_awake &&
         lv_display_get_inactive_time(NULL) > timeout) {
@@ -1759,6 +1778,14 @@ static void on_wake(lv_event_t *e)
         return;
     }
     s_asleep = false;
+    s_dimmed = false;
+    /* Sampling continues during sleep, but label updates are suspended. Read
+     * and render fresh battery state before exposing the old LCD contents. */
+    batt_timer_cb(NULL);
+    if (panel_power && !lv_obj_has_flag(panel_power, LV_OBJ_FLAG_HIDDEN)) {
+        refresh_power_info();
+    }
+    lv_refr_now(NULL);
     bsp_display_brightness_set(settings_get()->brightness);
     /* Deleting the object from inside its own event is unsafe; defer it. */
     lv_obj_delete_async(s_sleep_shield);
@@ -1773,6 +1800,7 @@ static void on_brightness(lv_event_t *e)
     int v = lv_slider_get_value(sl);
     settings_get()->brightness = (uint8_t) v;
     bsp_display_brightness_set(v);
+    s_dimmed = false;
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
         settings_save();
     }
@@ -1826,31 +1854,49 @@ static void refresh_power_info(void)
         return;
     }
     if (ps.present) {
-        appendf(buf, sizeof(buf), &n, "Battery  %d%%%s   %d.%02d V   %s\n",
-                ps.percent, ps.percent_estimated ? " est" : "",
-                ps.batt_mv / 1000, (ps.batt_mv % 1000) / 10, ps.charge_detail);
+        if (ps.percent >= 0) {
+            appendf(buf, sizeof(buf), &n, "Battery  %d%%%s", ps.percent,
+                    ps.percent_estimated ? " est" : "");
+        } else {
+            appendf(buf, sizeof(buf), &n, "Battery  unknown");
+        }
+        if (ps.batt_mv >= 0) {
+            appendf(buf, sizeof(buf), &n, "   %d.%02d V", ps.batt_mv / 1000,
+                    (ps.batt_mv % 1000) / 10);
+        }
+        appendf(buf, sizeof(buf), &n, "   %s\n", ps.charge_detail);
     } else {
         appendf(buf, sizeof(buf), &n, "Battery  not connected (switch on Base DIN)\n");
     }
-    appendf(buf, sizeof(buf), &n, "USB      %s   %d.%02d V\n",
-            ps.vbus ? "present" : "absent", ps.vbus_mv / 1000, (ps.vbus_mv % 1000) / 10);
-    appendf(buf, sizeof(buf), &n, "System   %d.%02d V\n",
-            ps.vsys_mv / 1000, (ps.vsys_mv % 1000) / 10);
+    appendf(buf, sizeof(buf), &n, "USB      %s", ps.vbus ? "present" : "absent");
+    if (ps.vbus_mv >= 0) {
+        appendf(buf, sizeof(buf), &n, "   %d.%02d V", ps.vbus_mv / 1000, (ps.vbus_mv % 1000) / 10);
+    }
+    if (ps.vsys_mv >= 0) {
+        appendf(buf, sizeof(buf), &n, "\nSystem   %d.%02d V\n", ps.vsys_mv / 1000, (ps.vsys_mv % 1000) / 10);
+    } else {
+        appendf(buf, sizeof(buf), &n, "\nSystem   unknown\n");
+    }
+    if (ps.pmic_temp_c != INT32_MIN) {
+        appendf(buf, sizeof(buf), &n, "Temp     PMIC %d C", ps.pmic_temp_c);
+    } else {
+        appendf(buf, sizeof(buf), &n, "Temp     PMIC unknown");
+    }
     float t;
     if (power_esp_temp(&t)) {
-        appendf(buf, sizeof(buf), &n, "Temp     PMIC %d C   ESP32 %.0f C\n", ps.pmic_temp_c, t);
-    } else {
-        appendf(buf, sizeof(buf), &n, "Temp     PMIC %d C\n", ps.pmic_temp_c);
+        appendf(buf, sizeof(buf), &n, "   ESP32 %.0f C", t);
     }
+    appendf(buf, sizeof(buf), &n, "\n");
     float rate;
     int mins;
     if (ps.vbus) {
         appendf(buf, sizeof(buf), &n, "\nOn external power; discharge\nrate measured on battery only.");
-    } else if (power_discharge_rate(&rate, &mins)) {
+    } else if (ps.present && ps.percent >= 0 && !ps.percent_estimated &&
+               power_discharge_rate(&rate, &mins)) {
         appendf(buf, sizeof(buf), &n, "\nDischarge  %.1f %%/h   about %dh %02dm left",
                 rate, mins / 60, mins % 60);
     } else {
-        appendf(buf, sizeof(buf), &n, "\nDischarge  measuring (10 min on battery)");
+        appendf(buf, sizeof(buf), &n, "\nDischarge  waiting for steady\ngauge data (10+ min, 2%% drop)");
     }
     appendf(buf, sizeof(buf), &n, "\n\nThe AXP2101 has no current sensor,\nso there is no live mW figure.");
     lv_label_set_text(lbl_power_info, buf);
