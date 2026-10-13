@@ -1,8 +1,11 @@
 #include "matter.h"
+#include "log_ring.h"
 #include "matter_battery.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <cstring>
 
 #include "driver/gpio.h"
@@ -342,6 +345,45 @@ void open_commissioning_window_work(intptr_t argument)
     }
 }
 
+/*
+ * CHIP's ESP32 logger prints its "I (t) chip[XX]: " prefix and the newline
+ * with bare printf and only the message through esp_log, so the log ring would
+ * get headless fragments. This keeps the console output identical and gives
+ * the ring the whole line whenever the message itself would be shown.
+ */
+void log_chip_line(const char *module, uint8_t category, const char *msg, va_list args)
+{
+    char letter = 'I';
+    const char *color = LOG_COLOR_I;
+    esp_log_level_t level = ESP_LOG_INFO;
+    if (category == chip::Logging::kLogCategory_Error) {
+        letter = 'E';
+        color = LOG_COLOR_E;
+        level = ESP_LOG_ERROR;
+    } else if (category == chip::Logging::kLogCategory_Detail) {
+        letter = 'D';
+        color = LOG_COLOR_D;
+        level = ESP_LOG_DEBUG;
+    }
+    char tag[11];
+    snprintf(tag, sizeof(tag), "chip[%s]", module);
+    const uint32_t now = esp_log_timestamp();
+    printf("%s%c (%" PRIu32 ") %s: ", color, letter, now, tag);
+    if (esp_log_level_get(tag) >= level) {
+        char line[LOG_RING_TEXT];
+        const int prefix = snprintf(line, sizeof(line), "%c (%" PRIu32 ") %s: ", letter, now, tag);
+        if (prefix > 0 && static_cast<size_t>(prefix) < sizeof(line)) {
+            va_list copy;
+            va_copy(copy, args);
+            vsnprintf(line + prefix, sizeof(line) - prefix, msg, copy);
+            va_end(copy);
+            log_ring_line(line, strlen(line));
+        }
+        vprintf(msg, args);
+    }
+    printf(LOG_RESET_COLOR "\n");
+}
+
 } // namespace
 
 extern "C" esp_err_t matter_init(void)
@@ -351,6 +393,8 @@ extern "C" esp_err_t matter_init(void)
                                           std::memory_order_acq_rel)) {
         return s_started.load(std::memory_order_acquire) ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
+
+    chip::Logging::SetLogRedirectCallback(log_chip_line);
 
     esp_err_t error = validate_storage_configuration();
     if (error != ESP_OK) {

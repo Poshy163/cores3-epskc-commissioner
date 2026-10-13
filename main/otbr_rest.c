@@ -11,7 +11,9 @@
 
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "log_ring.h"
 #include "power_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -22,11 +24,11 @@
 
 static const char *TAG = "otbr_rest";
 static httpd_handle_t s_server;
-static bool s_epskc_routes_registered;
 
 typedef enum {
     REST_CONTROL_RUNNING,
     REST_CONTROL_EPSKC,
+    REST_CONTROL_LOGS,
 } rest_control_type_t;
 
 typedef struct {
@@ -38,8 +40,15 @@ static QueueHandle_t s_control_queue;
 static TaskHandle_t s_control_task;
 static bool s_control_start_failed;
 
-/* Defined below; called from otbr_rest_start(). */
-void otbr_rest_set_epskc(bool on);
+/* A group of routes that exists only while its feature is switched on. */
+typedef struct {
+    const char *name;
+    const httpd_uri_t *uris;
+    size_t count;
+    bool registered;   /* set on the server task; reset once it has stopped */
+} route_set_t;
+
+static route_set_t s_epskc_routes, s_log_routes;
 
 /* ot-br-posix returns bare JSON strings for the scalar endpoints, quotes and
  * all, so HA's client parses them as JSON rather than plain text. */
@@ -505,6 +514,146 @@ static esp_err_t h_power_history(httpd_req_t *r)
     return httpd_resp_send_chunk(r, NULL, 0);
 }
 
+/* Parse key=a|b. Absent keeps *is_second; anything else is rejected. */
+static bool query_choice(const char *query, const char *key, const char *first,
+                         const char *second, bool *is_second)
+{
+    char value[16];
+    esp_err_t err = httpd_query_key_value(query, key, value, sizeof(value));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK || (strcmp(value, first) != 0 && strcmp(value, second) != 0)) {
+        return false;
+    }
+    *is_second = strcmp(value, second) == 0;
+    return true;
+}
+
+typedef struct {
+    char batch[1536];
+    size_t used;
+    log_ring_line_t line;
+    char json[448];
+} logs_scratch_t;
+
+/* Coalesce small writes; one chunk per line would mean one TCP send each. */
+static esp_err_t logs_send(httpd_req_t *r, logs_scratch_t *s, const char *data, size_t len)
+{
+    if (s->used + len > sizeof(s->batch)) {
+        if (s->used && httpd_resp_send_chunk(r, s->batch, s->used) != ESP_OK) {
+            return ESP_FAIL;
+        }
+        s->used = 0;
+        if (len > sizeof(s->batch)) {
+            return httpd_resp_send_chunk(r, data, len);
+        }
+    }
+    memcpy(s->batch + s->used, data, len);
+    s->used += len;
+    return ESP_OK;
+}
+
+/*
+ * Recent log lines from the PSRAM ring: this boot, or with boot=previous the
+ * boot that ended in the last panic, watchdog or software reset. Paged by
+ * sequence number like /power/history, as JSON or format=text. Short paged
+ * requests rather than a held-open stream, so Home Assistant's REST calls on
+ * this single-task server are never starved. No flash access.
+ */
+static esp_err_t h_logs(httpd_req_t *r)
+{
+    uint32_t after = 0, limit = 200;
+    bool previous = false, text = false;
+    char query[96], value[24];
+    if (httpd_req_get_url_query_len(r)) {
+        if (httpd_req_get_url_query_str(r, query, sizeof(query)) != ESP_OK) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "query too long");
+        }
+        esp_err_t err = httpd_query_key_value(query, "after", value, sizeof(value));
+        if ((err != ESP_OK && err != ESP_ERR_NOT_FOUND) ||
+            (err == ESP_OK && !power_log_parse_uint(value, UINT32_MAX, &after))) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "invalid after");
+        }
+        err = httpd_query_key_value(query, "limit", value, sizeof(value));
+        if ((err != ESP_OK && err != ESP_ERR_NOT_FOUND) ||
+            (err == ESP_OK && (!power_log_parse_uint(value, 200, &limit) || limit == 0))) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "limit must be 1..200");
+        }
+        if (!query_choice(query, "boot", "current", "previous", &previous)) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "boot must be current or previous");
+        }
+        if (!query_choice(query, "format", "json", "text", &text)) {
+            return httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "format must be json or text");
+        }
+    }
+    const log_ring_boot_t boot = previous ? LOG_RING_PREVIOUS : LOG_RING_CURRENT;
+    log_ring_info_t info;
+    if (!log_ring_info(boot, &info)) {
+        httpd_resp_set_status(r, HTTPD_404);
+        return send_json(r, previous
+            ? "{\"error\":\"no previous boot log: last start was a power-on or new firmware\"}"
+            : "{\"error\":\"log capture unavailable\"}");
+    }
+    /* Keep the ~2 KB of buffers off the 4 KB internal-RAM server stack. */
+    logs_scratch_t *s = heap_caps_malloc(sizeof(*s), MALLOC_CAP_SPIRAM);
+    if (s == NULL) {
+        httpd_resp_set_status(r, "503 Service Unavailable");
+        return send_json(r, "{\"error\":\"out of memory\"}");
+    }
+    s->used = 0;
+    httpd_resp_set_type(r, text ? "text/plain; charset=utf-8" : "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+
+    char head[400];
+    int n = text
+        ? snprintf(head, sizeof(head), "# %s boot %" PRIu32 ", lines %" PRIu32 "..%" PRIu32
+                   ", this boot started by: %s\n", previous ? "previous" : "current",
+                   info.boot_count, info.oldest_seq, info.latest_seq, ui_reset_reason_str())
+        : snprintf(head, sizeof(head),
+                   "{\"schema\":1,\"boot\":\"%s\",\"boot_id\":\"%016" PRIx64 "\",\"boot_count\":%" PRIu32
+                   ",\"reset_reason\":\"%s\",\"device_uptime_ms\":%" PRId64 ",\"capacity\":%u"
+                   ",\"oldest_seq\":%" PRIu32 ",\"latest_seq\":%" PRIu32 ",\"last_uptime_ms\":%" PRIu32
+                   ",\"lines\":[", previous ? "previous" : "current", info.boot_id, info.boot_count,
+                   ui_reset_reason_str(), esp_timer_get_time() / 1000, LOG_RING_LINES,
+                   info.oldest_seq, info.latest_seq, info.last_uptime_ms);
+    esp_err_t err = n > 0 && (size_t) n < sizeof(head) ? logs_send(r, s, head, (size_t) n) : ESP_FAIL;
+
+    uint32_t start = after >= info.latest_seq ? 0 : after + 1;
+    if (start && start < info.oldest_seq) {
+        start = info.oldest_seq;
+    }
+    unsigned sent = 0;
+    for (uint32_t seq = start; err == ESP_OK && seq && seq <= info.latest_seq && sent < limit; ++seq) {
+        if (!log_ring_get(boot, seq, &s->line)) {
+            continue;   /* overwritten while a slow client paged, or torn by a crash */
+        }
+        if (text) {
+            size_t len = strlen(s->line.text);
+            s->line.text[len] = '\n';
+            err = logs_send(r, s, s->line.text, len + 1);
+        } else {
+            size_t len = log_ring_json(&s->line, s->json, sizeof(s->json));
+            err = len == 0 ? ESP_FAIL : sent ? logs_send(r, s, ",", 1) : ESP_OK;
+            if (err == ESP_OK) {
+                err = logs_send(r, s, s->json, len);
+            }
+        }
+        ++sent;
+    }
+    if (err == ESP_OK && !text) {
+        err = logs_send(r, s, "]}", 2);
+    }
+    if (err == ESP_OK && s->used) {
+        err = httpd_resp_send_chunk(r, s->batch, s->used);
+    }
+    heap_caps_free(s);
+    if (err != ESP_OK) {
+        return ESP_FAIL;
+    }
+    return httpd_resp_send_chunk(r, NULL, 0);
+}
+
 esp_err_t otbr_rest_start(void)
 {
     if (s_server) {
@@ -513,7 +662,7 @@ esp_err_t otbr_rest_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = OTBR_REST_PORT;
     cfg.ctrl_port = 32768 + OTBR_REST_PORT;   /* keep clear of other servers */
-    cfg.max_uri_handlers = 20;
+    cfg.max_uri_handlers = 22;
     cfg.max_open_sockets = 3;
     /* Keep HTTPD's default internal-RAM stack. Active-dataset reads reach the
      * OpenThread NVS backend, and ESP-IDF cannot disable the flash cache while
@@ -560,11 +709,12 @@ esp_err_t otbr_rest_start(void)
     if (route_err != ESP_OK) {
         httpd_stop(s_server);
         s_server = NULL;
-        s_epskc_routes_registered = false;
+        s_epskc_routes.registered = s_log_routes.registered = false;
         ESP_LOGE(TAG, "REST API stopped after incomplete route registration");
         return route_err;
     }
     otbr_rest_set_epskc(settings_get()->rest_epskc);
+    otbr_rest_set_logs(settings_get()->rest_logs);
 
     ESP_LOGI(TAG, "REST API on port %d", OTBR_REST_PORT);
     return ESP_OK;
@@ -583,55 +733,86 @@ static const httpd_uri_t epskc_uris[] = {
     { .uri = "/node/ba-epskc/key",   .method = HTTP_DELETE, .handler = h_epskc_key },
 };
 
+static route_set_t s_epskc_routes = {
+    "ba-epskc", epskc_uris, sizeof(epskc_uris) / sizeof(epskc_uris[0]), false,
+};
+
+static const httpd_uri_t log_uris[] = {
+    { .uri = "/logs", .method = HTTP_GET, .handler = h_logs },
+};
+
+static route_set_t s_log_routes = {
+    "/logs", log_uris, sizeof(log_uris) / sizeof(log_uris[0]), false,
+};
+
 /* URI registration mutates the HTTP server's handler array and is not
- * thread-safe. This callback always runs on the server task, after any current
- * handler has returned, because it is submitted with httpd_queue_work(). */
-static void apply_epskc_routes(void *arg)
+ * thread-safe. These callbacks always run on the server task, after any
+ * current handler has returned, because they are submitted with
+ * httpd_queue_work(). */
+static void apply_routes(route_set_t *set, bool on)
 {
-    bool on = (uintptr_t) arg != 0;
     httpd_handle_t server = s_server;
-    if (server == NULL || on == s_epskc_routes_registered) {
+    if (server == NULL || on == set->registered) {
         return;
     }
 
     bool ok = true;
-    for (size_t i = 0; i < sizeof(epskc_uris) / sizeof(epskc_uris[0]); i++) {
+    for (size_t i = 0; i < set->count; i++) {
         if (on) {
-            esp_err_t err = httpd_register_uri_handler(server, &epskc_uris[i]);
+            esp_err_t err = httpd_register_uri_handler(server, &set->uris[i]);
             if (err != ESP_OK && err != ESP_ERR_HTTPD_HANDLER_EXISTS) {
                 ESP_LOGE(TAG, "could not register %s: %s",
-                         epskc_uris[i].uri, esp_err_to_name(err));
+                         set->uris[i].uri, esp_err_to_name(err));
                 ok = false;
             }
         } else {
-            httpd_unregister_uri_handler(server, epskc_uris[i].uri, epskc_uris[i].method);
+            httpd_unregister_uri_handler(server, set->uris[i].uri, set->uris[i].method);
         }
     }
 
     if (on && !ok) {
         /* Do not expose a partial feature surface. */
-        for (size_t i = 0; i < sizeof(epskc_uris) / sizeof(epskc_uris[0]); i++) {
-            httpd_unregister_uri_handler(server, epskc_uris[i].uri, epskc_uris[i].method);
+        for (size_t i = 0; i < set->count; i++) {
+            httpd_unregister_uri_handler(server, set->uris[i].uri, set->uris[i].method);
         }
-        s_epskc_routes_registered = false;
-        ESP_LOGE(TAG, "ba-epskc route update failed closed");
+        set->registered = false;
+        ESP_LOGE(TAG, "%s route update failed closed", set->name);
         return;
     }
 
-    s_epskc_routes_registered = on;
-    ESP_LOGI(TAG, "ba-epskc endpoints %s", on ? "registered" : "removed");
+    set->registered = on;
+    ESP_LOGI(TAG, "%s endpoints %s", set->name, on ? "registered" : "removed");
 }
 
-void otbr_rest_set_epskc(bool on)
+static void apply_epskc_routes(void *arg)
+{
+    apply_routes(&s_epskc_routes, (uintptr_t) arg != 0);
+}
+
+static void apply_log_routes(void *arg)
+{
+    apply_routes(&s_log_routes, (uintptr_t) arg != 0);
+}
+
+static void queue_routes(httpd_work_fn_t apply, const char *name, bool on)
 {
     if (s_server == NULL) {
         return;   /* picked up when the server next starts */
     }
-    esp_err_t err = httpd_queue_work(s_server, apply_epskc_routes,
-                                     (void *) (uintptr_t) (on ? 1 : 0));
+    esp_err_t err = httpd_queue_work(s_server, apply, (void *) (uintptr_t) (on ? 1 : 0));
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "could not queue ba-epskc route update: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "could not queue %s route update: %s", name, esp_err_to_name(err));
     }
+}
+
+void otbr_rest_set_epskc(bool on)
+{
+    queue_routes(apply_epskc_routes, s_epskc_routes.name, on);
+}
+
+void otbr_rest_set_logs(bool on)
+{
+    queue_routes(apply_log_routes, s_log_routes.name, on);
 }
 
 void otbr_rest_stop(void)
@@ -639,7 +820,7 @@ void otbr_rest_stop(void)
     if (s_server) {
         httpd_stop(s_server);
         s_server = NULL;
-        s_epskc_routes_registered = false;
+        s_epskc_routes.registered = s_log_routes.registered = false;
         ESP_LOGI(TAG, "REST API stopped");
     }
 }
@@ -668,6 +849,8 @@ static void rest_control_task(void *arg)
         } else if (msg.type == REST_CONTROL_EPSKC) {
             thread_epskc_set_feature_enabled(msg.on);
             otbr_rest_set_epskc(msg.on);
+        } else if (msg.type == REST_CONTROL_LOGS) {
+            otbr_rest_set_logs(msg.on);
         }
     }
 }
@@ -732,4 +915,9 @@ bool otbr_rest_request_running(bool on)
 bool otbr_rest_request_epskc(bool on)
 {
     return request_control(REST_CONTROL_EPSKC, on);
+}
+
+bool otbr_rest_request_logs(bool on)
+{
+    return request_control(REST_CONTROL_LOGS, on);
 }

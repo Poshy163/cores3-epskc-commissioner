@@ -28,6 +28,7 @@
 #include "nvs_flash.h"
 
 #include "discover.h"
+#include "log_ring.h"
 #include "matter.h"
 #include "meshcop.h"
 #include "otbr_rest.h"
@@ -1368,6 +1369,21 @@ static int cmd_rest(int argc, char **argv)
         printf("ba-epskc endpoint change requested: %s\n", on ? "on" : "off");
         return 0;
     }
+    if (argc >= 3 && strcmp(argv[1], "logs") == 0) {
+        if (strcmp(argv[2], "on") != 0 && strcmp(argv[2], "off") != 0) {
+            printf("usage: rest logs <on|off>\n");
+            return 1;
+        }
+        bool on = strcmp(argv[2], "on") == 0;
+        if (!otbr_rest_request_logs(on)) {
+            printf("could not queue /logs change\n");
+            return 1;
+        }
+        settings_get()->rest_logs = on;
+        settings_save();
+        printf("/logs endpoint change requested: %s\n", on ? "on" : "off");
+        return 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "start") == 0) {
         if (!otbr_rest_request_running(true)) {
             printf("could not queue REST start\n");
@@ -1381,6 +1397,56 @@ static int cmd_rest(int argc, char **argv)
     printf("REST API : %s\n", otbr_rest_running() ? "running" : "stopped");
     printf("URL      : http://%s:%d\n", s_ip, OTBR_REST_PORT);
     printf("ba-epskc : %s\n", settings_get()->rest_epskc ? "registered" : "removed");
+    printf("logs     : %s\n", settings_get()->rest_logs ? "registered" : "removed");
+    return 0;
+}
+
+/* The same ring GET /logs serves, printed over USB: useful when Wi-Fi is the
+ * thing that broke. printf output does not feed back into the ring. */
+static int cmd_logs(int argc, char **argv)
+{
+    const bool previous = argc >= 2 && strcmp(argv[1], "prev") == 0;
+    if ((argc >= 2 && !previous && strcmp(argv[1], "cur") != 0) || argc > 3) {
+        printf("usage: logs [cur|prev [lines]]\n");
+        return 1;
+    }
+    uint32_t count = 20;
+    if (argc == 3 && (!power_log_parse_uint(argv[2], LOG_RING_LINES, &count) || count == 0)) {
+        printf("lines must be 1..%u\n", LOG_RING_LINES);
+        return 1;
+    }
+    log_ring_info_t info;
+    if (argc == 1) {
+        printf("started by: %s\n", ui_reset_reason_str());
+        if (log_ring_info(LOG_RING_CURRENT, &info)) {
+            printf("current   : boot %" PRIu32 ", lines %" PRIu32 "..%" PRIu32 "\n",
+                   info.boot_count, info.oldest_seq, info.latest_seq);
+        }
+        if (log_ring_info(LOG_RING_PREVIOUS, &info)) {
+            printf("previous  : boot %" PRIu32 ", lines %" PRIu32 "..%" PRIu32 ", last at %" PRIu32 " ms\n",
+                   info.boot_count, info.oldest_seq, info.latest_seq, info.last_uptime_ms);
+        } else {
+            printf("previous  : none (power-on or new firmware)\n");
+        }
+        printf("REST      : %s\n", settings_get()->rest_logs
+               ? "GET http://<ip>:8081/logs[?boot=previous][&format=text]" : "off (rest logs on)");
+        return 0;
+    }
+    const log_ring_boot_t boot = previous ? LOG_RING_PREVIOUS : LOG_RING_CURRENT;
+    if (!log_ring_info(boot, &info) || info.latest_seq == 0) {
+        printf("%s\n", previous ? "no previous boot log (power-on or new firmware)" : "no lines yet");
+        return 1;
+    }
+    static log_ring_line_t line;   /* the console runs one command at a time */
+    uint32_t first = info.latest_seq >= count ? info.latest_seq - count + 1 : 1;
+    if (first < info.oldest_seq) {
+        first = info.oldest_seq;
+    }
+    for (uint32_t seq = first; seq <= info.latest_seq; ++seq) {
+        if (log_ring_get(boot, seq, &line)) {
+            printf("%s\n", line.text);
+        }
+    }
     return 0;
 }
 
@@ -1440,6 +1506,7 @@ static int cmd_settings(int argc, char **argv)
     printf("share minutes: %u\n", c->share_minutes);
     printf("rest api     : %s\n", c->rest_api ? "on" : "off");
     printf("rest epskc   : %s\n", c->rest_epskc ? "on" : "off");
+    printf("rest logs    : %s\n", c->rest_logs ? "on" : "off");
     return 0;
 }
 
@@ -1537,7 +1604,8 @@ static void register_commands(void)
 {
     const esp_console_cmd_t cmds[] = {
         { .command = "newnet", .help = "form a new Thread network with fresh credentials", .func = cmd_newnet },
-        { .command = "rest", .help = "rest [start|stop|epskc on|off] - OTBR REST API", .func = cmd_rest },
+        { .command = "rest", .help = "rest [start|stop|epskc on|off|logs on|off] - OTBR REST API", .func = cmd_rest },
+        { .command = "logs", .help = "logs [cur|prev [lines]] - recent log lines, this or the previous boot", .func = cmd_logs },
         { .command = "power", .help = "voltages, temperatures, discharge rate", .func = cmd_power },
         { .command = "settings", .help = "show persisted settings", .func = cmd_settings },
         { .command = "share", .help = "share [stop|state] - ePSKc code so a commissioner can pull our credentials", .func = cmd_share },
@@ -1562,6 +1630,9 @@ static void register_commands(void)
 
 void app_main(void)
 {
+    /* First, so every later line reaches GET /logs, and so the previous
+     * boot's lines are recovered before anything can overwrite them. */
+    log_ring_init();
     apply_quiet_log_profile();
 
     /* Keep APB at 80 MHz for the H2 UART, camera and USB console. The CPUs

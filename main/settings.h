@@ -23,6 +23,7 @@ typedef struct {
     bool    keep_awake_powered;  /* never sleep while USB power is present */
     bool    rest_api;            /* serve the OTBR REST API on port 8081 */
     bool    rest_epskc;          /* also serve the ba-epskc endpoints (PR #267) */
+    bool    rest_logs;           /* also serve /logs, this and the previous boot */
 } settings_t;
 
 /* Sleep-timeout choices, in ms; 0 means never. Matches the on-screen roller. */

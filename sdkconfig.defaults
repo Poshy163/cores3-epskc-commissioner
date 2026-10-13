@@ -33,6 +33,10 @@ CONFIG_ESP_WIFI_RX_BA_WIN=8
 # and border-router work with no contiguous space to allocate.
 CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Lets the /logs ring sit in PSRAM that start-up leaves alone, so a panic or
+# watchdog reset keeps the previous boot's lines. Without it the ring's
+# EXT_RAM_NOINIT_ATTR would fall back to internal RAM; log_ring.c refuses that.
+CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
 
 # Matter commissioning uses NimBLE.  Keep the controller, Matter allocations,
 # TLS allocations and large static tables in PSRAM because the camera and H2

@@ -16,7 +16,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     for script in ['test_wifi.py', 'test_ui_power_settings.py', 'test_power_log.py',
-                   'test_matter_battery_worker.py', 'test_ui_wake.py']:
+                   'test_matter_battery_worker.py', 'test_ui_wake.py', 'test_log_ring.py']:
         subprocess.run([sys.executable, str(root / 'tools' / script), '--cc', args.cc], check=True)
     compiler = [args.cc]
     if Path(args.cc).stem == 'zig':

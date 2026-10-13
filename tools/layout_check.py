@@ -633,6 +633,7 @@ def panels() -> dict[str, list[Box]]:
         ("Prefer router role", 40, "switch"),
         ("REST API (LAN, no auth)", 40, "switch"),
         ("ePSKc over REST", 40, "switch"),
+        ("Logs over REST", 40, "switch"),
         ("New network channel", 62, "roller"),
         ("Share code lifetime", 62, "roller"),
     ])

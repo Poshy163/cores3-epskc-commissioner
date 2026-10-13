@@ -28,6 +28,7 @@ esp_err_t otbr_rest_control_start(void);
  * owned. Requests are serialized by a dedicated REST control task. */
 bool otbr_rest_request_running(bool on);
 bool otbr_rest_request_epskc(bool on);
+bool otbr_rest_request_logs(bool on);
 
 /*
  * Add or remove the ba-epskc routes at runtime. Removing them is not
@@ -36,5 +37,10 @@ bool otbr_rest_request_epskc(bool on);
  * a client uses to decide the router has no ePSKc support.
  */
 void otbr_rest_set_epskc(bool on);
+
+/* Add or remove GET /logs (recent and previous-boot log lines). Capture into
+ * the ring continues either way; this only controls network exposure. */
+void otbr_rest_set_logs(bool on);
+
 void otbr_rest_stop(void);
 bool otbr_rest_running(void);

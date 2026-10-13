@@ -19,6 +19,7 @@ static settings_t s_cfg = {
     .keep_awake_powered = true,
     .rest_api = true,
     .rest_epskc = true,
+    .rest_logs = true,
 };
 
 /* Ignore invalid persisted booleans and retain the existing setting. */
@@ -116,6 +117,7 @@ void settings_load(void)
     settings_load_bool(h, "keepawake", &s_cfg.keep_awake_powered);
     settings_load_bool(h, "restapi", &s_cfg.rest_api);
     settings_load_bool(h, "restepskc", &s_cfg.rest_epskc);
+    settings_load_bool(h, "restlogs", &s_cfg.rest_logs);
     nvs_close(h);
 }
 
@@ -134,6 +136,7 @@ void settings_save(void)
     if (err == ESP_OK) { err = nvs_set_u8(h, "keepawake", s_cfg.keep_awake_powered ? 1 : 0); }
     if (err == ESP_OK) { err = nvs_set_u8(h, "restapi", s_cfg.rest_api ? 1 : 0); }
     if (err == ESP_OK) { err = nvs_set_u8(h, "restepskc", s_cfg.rest_epskc ? 1 : 0); }
+    if (err == ESP_OK) { err = nvs_set_u8(h, "restlogs", s_cfg.rest_logs ? 1 : 0); }
     if (err == ESP_OK) { err = nvs_commit(h); }
     nvs_close(h);
     if (err != ESP_OK) {

@@ -63,3 +63,6 @@ void ui_forget_network(void);
  * 0 if no LVGL callback has run yet.
  */
 size_t ui_lvgl_stack_free(void);
+
+/* Why this boot started (how the previous one ended): About page and /logs. */
+const char *ui_reset_reason_str(void);

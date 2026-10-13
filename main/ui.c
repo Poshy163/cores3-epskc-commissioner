@@ -1951,6 +1951,22 @@ static void on_rest_epskc(lv_event_t *e)
     settings_save();
 }
 
+static void on_rest_logs(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (!otbr_rest_request_logs(on)) {
+        if (on) {
+            lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        } else {
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        }
+        return;
+    }
+    settings_get()->rest_logs = on;
+    settings_save();
+}
+
 static void on_channel_choice(lv_event_t *e)
 {
     uint32_t idx = lv_roller_get_selected(lv_event_get_target(e));
@@ -2007,7 +2023,7 @@ static void on_name_kb(lv_event_t *e)
 
 /* -- about -- */
 
-static const char *reset_reason_str(void)
+const char *ui_reset_reason_str(void)
 {
     switch (esp_reset_reason()) {
     case ESP_RST_POWERON:   return "power on";
@@ -2071,7 +2087,7 @@ static void refresh_about_info(void)
             FW_VERSION, esp_get_idf_version(),
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             (long long) (up / 3600), (long long) ((up / 60) % 60),
-            (long long) (up % 60), reset_reason_str(),
+            (long long) (up % 60), ui_reset_reason_str(),
             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
             (unsigned) (heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024),
             (unsigned) (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
@@ -2351,6 +2367,9 @@ static void build_tset(void)
 
     lv_obj_t *r_eps = mk_row(page, "ePSKc over REST", 40);
     mk_switch(r_eps, settings_get()->rest_epskc, on_rest_epskc);
+
+    lv_obj_t *r_logs = mk_row(page, "Logs over REST", 40);
+    mk_switch(r_logs, settings_get()->rest_logs, on_rest_logs);
 
     lv_obj_t *r2 = mk_row(page, "New network channel", 62);
     lv_obj_t *ch = mk_roller(r2,

@@ -83,10 +83,33 @@ The device serves the OTBR REST API on port 8081, so you can add it in Home Assi
 | `/node/dataset/pending` | GET |
 | `/node/ba-epskc/state` | GET, PUT |
 | `/node/ba-epskc/key` | GET, POST, DELETE |
+| `/logs` | GET (see [Logs over Wi-Fi](#logs-over-wi-fi)) |
+| `/power/history` | GET (see [Settings](#settings)) |
 
 The `ba-epskc` endpoints follow [python-otbr-api #267](https://github.com/home-assistant-libs/python-otbr-api/pull/267). They can be switched off at **Settings > Thread > ePSKc over REST**, which *unregisters* them rather than returning an error, so the API becomes indistinguishable from a build without ePSKc support. That makes it easy to test both branches of a client.
 
 Plain HTTP with no authentication, exactly like ot-br-posix: anyone who can reach port 8081 can read the Active Operational Dataset, which contains the network key. Keep it on a trusted network.
+
+### Logs over Wi-Fi
+
+Every line the firmware logs, including Matter and OpenThread, is also kept in PSRAM: the last 1,024 lines of this boot and the last 1,024 of the previous one. `GET /logs` serves them, so seeing what the device has been doing no longer needs a USB cable.
+
+| Query | Meaning |
+|---|---|
+| `boot=previous` | the boot that ended in the last panic, watchdog or software reset |
+| `after=<seq>&limit=<1..200>` | page by sequence number, like `/power/history` |
+| `format=text` | plain lines instead of JSON, for `curl` |
+
+```
+curl "http://<device-ip>:8081/logs?boot=previous&format=text"
+python tools/logtail.py --url http://<device-ip>:8081 --follow --output cores3.log
+```
+
+`logtail.py` polls every 2 seconds and prints new lines; `--previous` dumps the previous boot instead. If the device reboots while it is following, it fetches the lines the old boot wrote after the last poll from the retained copy, then reports how the new boot started, so a crash does not hide its own last words. Lines overwritten before they were read are reported, not skipped silently.
+
+The previous boot survives because the ring sits in PSRAM that start-up leaves alone, and each line is pushed out of the data cache as it is written (the ESP32-S3 does not flush that cache on a reset). A power cut or a brownout loses it, and so can flashing different firmware, which may move the ring. `reset_reason` (in the text form, the header line) says how the previous boot ended: `panic`, `task watchdog`, `software`, `power on` and so on. The panic handler prints its backtrace directly rather than through logging, so the backtrace itself is not captured; decode one from a USB capture with the ELF SHA-256 that `status` reports.
+
+What is captured follows the console verbosity set with `log`: the default quiet profile keeps warnings and errors from every component and this firmware's own info lines. Lines are cut at 179 bytes. Capture costs one extra copy per line and 384 KB of the 8 MB PSRAM; it uses no internal RAM and never writes flash. **Settings > Thread > Logs over REST** (or `rest logs off`) unregisters the endpoint while capture carries on, so a crash log is still there if you switch it back on. The firmware does not log the network key, PSKc, Wi-Fi password or Matter pairing codes: `reveal` and `matter code` print to the USB console only, outside the captured log.
 
 ## Matter and Home Assistant topology
 
@@ -193,7 +216,8 @@ Wi-Fi power management follows the power source. On USB the radio never dozes, w
 | `thread` | attachment, parent/direct children, local routers and traffic counters |
 | `thread scan` | run a best-effort mesh topology scan and show devices seen |
 | `forget` | erase Thread credentials |
-| `rest [start\|stop\|epskc on\|off]` | OTBR REST API |
+| `rest [start\|stop\|epskc on\|off\|logs on\|off]` | OTBR REST API, and its switchable endpoints |
+| `logs [cur\|prev [lines]]` | where `/logs` stands, or the last lines of this or the previous boot, over USB |
 | `power` | voltages, temperatures, discharge rate |
 | `settings` | show persisted settings |
 | `batt` | battery %, voltage, charge state |
