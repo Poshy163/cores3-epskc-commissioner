@@ -65,6 +65,9 @@ CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 
 CONFIG_LWIP_IPV6=y
+# DHCP option 12. The IDF default "espressif" is shared by every ESP device on
+# the LAN and led UniFi to fingerprint this one as a Mysa thermostat.
+CONFIG_LWIP_LOCAL_HOSTNAME="cores3-thread-br"
 
 # OpenThread host stack driving the on-board ESP32-H2 over spinel/UART, so the
 # device can actually attach to the network whose credentials it retrieved.
@@ -77,6 +80,11 @@ CONFIG_OPENTHREAD_ENABLED=y
 # a radio co-processor. A host driving an RCP is a full Thread device anyway.
 CONFIG_OPENTHREAD_FTD=y
 CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
+# Wi-Fi + BLE switch on the S3's software coexistence, which defaults this off
+# for a native 802.15.4 radio sharing the 2.4 GHz front end. Here the radio is
+# the H2 RCP with its own front end, and the hardware-validated build has it on;
+# without this line a fresh (CI) configuration silently differs.
+CONFIG_OPENTHREAD_RX_ON_WHEN_IDLE=y
 # 1024 buffers is a 128 KB pool -- far more than a joining end device needs,
 # and this board has no internal RAM to spare for it.
 CONFIG_OPENTHREAD_NUM_MESSAGE_BUFFERS=128
