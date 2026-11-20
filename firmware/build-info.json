@@ -1,36 +1,37 @@
 {
   "schema": 1,
-  "version": "ccf163d*",
-  "sdk": "6.0.2",
+  "version": "8eb5a9e",
+  "sdk": "6.1.1",
   "matter": "1.6.1",
-  "build_purpose": "remote management",
+  "build_purpose": "ESP-IDF 6.1.1 update; Border Agent ID kept across dataset changes",
   "hardware_tested": true,
   "deployed": true,
+  "note": "Hashes describe the locally built images flashed and verified on the bench device. CI rebuilds of the same commit differ in embedded build paths and timestamps.",
   "deployment": {
-    "verified_on": "2026-10-27",
-    "method": "app-only USB flash",
-    "full_recovery_backup_verified": true,
+    "verified_on": "2026-11-20",
+    "method": "app-only USB flash, chip held in the ROM loader from the first NVS read to the final reset",
     "nvs_unchanged_across_flash": true,
     "matter_nvs_unchanged_across_flash": true,
+    "running_version": "8eb5a9e",
     "running_elf_matches_artifact": true,
     "thread_dataset_preserved": true,
     "home_assistant_fabric_preserved": true,
     "home_assistant_available": true,
-    "remote_management_enabled": true,
-    "authentication_rejection_checks_passed": true,
-    "token_rotation_and_reboot_persistence_passed": true,
-    "remote_reboot_verified": true,
-    "remote_reboot_recovery_seconds": 7.364,
-    "diagnostic_export_verified": true,
-    "wifi_reconnect_telemetry_verified": true,
+    "home_assistant_reports_software_version": "8eb5a9e",
+    "border_agent_id_kept_after_epskc_self_fetch_and_reboot": true,
+    "epskc_self_fetch_seconds": 10.0,
+    "epskc_cipher_suite": "TLS-ECJPAKE-WITH-AES-128-CCM-8",
     "camera_capture_passed": true,
-    "captured_panic_watchdog_lines": 0
+    "rcp_firmware": "openthread-esp32/50c71d69b84-a12ff0d0f; esp32h2; 2026-04-10 09:57:39 UTC",
+    "captured_panic_watchdog_lines": 0,
+    "internal_heap_free_bytes_after_boot": 51739,
+    "internal_heap_largest_block_bytes_after_boot": 31744
   },
   "esptool": "5.6.0",
   "artifacts": {
     "bootloader.bin": {
-      "bytes": 22528,
-      "sha256": "62192e527a90da839f69676700de9451ad00ac9d209f990fa4747d2b287cede1",
+      "bytes": 22128,
+      "sha256": "9980809bcef157b94f66ee266b56ced39ed4236848169cbf9295ab45444d10f8",
       "offset": "0x0"
     },
     "partition-table.bin": {
@@ -39,27 +40,28 @@
       "offset": "0x8000"
     },
     "epskc-commissioner-app.bin": {
-      "bytes": 2890528,
-      "sha256": "696ac7cb2a048c0b69470dae1cf3892a87dba8154bc86661d859ebe1f5fc60c0",
+      "bytes": 2929120,
+      "sha256": "9c363deb4b5c02e97c964cc102e282f25f30581c462a1f144aa0003399b60342",
       "offset": "0x10000"
     },
     "cores3-epskc-commissioner.bin": {
-      "bytes": 2956064,
-      "sha256": "62bfcc43f0e003e55b8909a83e2ba69a1901766f85271dc1f3725efd20a47470",
+      "bytes": 2994656,
+      "sha256": "652ef72b9c7cba53a10b3bae83a669e4bdfee5af65b7118d4173f3c7a1ca7bb8",
       "offset": "0x0",
       "usage": "fresh-install only; do not use for an upgrade that preserves provisioning"
     }
   },
   "elf": {
     "path": "build/idf6/epskc_commissioner.elf",
-    "bytes": 128721632,
-    "sha256": "91d41efb7a73b98848d3698b0da2a832c1470cbec59d1352c33b5c0536a7103f"
+    "bytes": 128594908,
+    "sha256": "a77077b0172c923ac1c23ec6e5bb46cdb2ef5ba1a995d793d29c6ba5a11eb1ea"
   },
   "validation": {
     "native_build_passed": true,
     "host_suite_passed": true,
     "host_suite_entrypoints": 16,
     "layout_check_passed": true,
+    "local_config_equals_fresh_ci_config": true,
     "partition_table_unchanged": true,
     "merged_ranges_match": true
   }
