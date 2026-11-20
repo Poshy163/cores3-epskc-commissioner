@@ -25,7 +25,8 @@ def main():
     if Path(args.cc).stem == 'zig':
         compiler.append('cc')
     with tempfile.TemporaryDirectory(prefix='epskc-codec-tests-') as tmp:
-        for name in ['test_otbr_rest_wire', 'test_meshcop_codec', 'test_matter_battery']:
+        for name in ['test_otbr_rest_wire', 'test_meshcop_codec', 'test_matter_battery',
+                     'test_rcp_update_policy']:
             binary = Path(tmp) / (name + '.exe')
             subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
                            str(root / 'tools' / (name + '.c')), '-o', str(binary)], check=True)

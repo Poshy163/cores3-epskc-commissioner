@@ -70,15 +70,27 @@ records its own `CMAKE_HOME_DIRECTORY` and CLion cannot reuse it.
 
 ## 4. Build and flash
 
-Build the `app` target, or from a terminal:
+The app packs the ESP32-H2 radio firmware into its `rcp_fw` partition, so build
+`rcp/` once before the first app build, and again after changing it. Use
+absolute paths; `SDKCONFIG` is otherwise resolved under `rcp/`:
+
+```powershell
+idf.py -C rcp -B "$PWD/build/rcp" -D "SDKCONFIG=$PWD/build/rcp/sdkconfig" build
+```
+
+`build-native.ps1` does this every time, pinning the radio firmware's version
+timestamp to `rcp/`'s last commit (`SOURCE_DATE_EPOCH`); a manual build without
+that variable gets a new version, and the device reflashes its H2 once.
+
+Then build the `app` target, or from a terminal:
 
 ```
-idf.py -B build/idf6 -p COM5 app-flash monitor
+idf.py -B build/idf6 -p COM5 app-flash rcp_fw-flash monitor
 ```
 
 `build-native.ps1` wraps the same thing with ccache switched on and an
-app-only flash by default, so an edit-compile-flash cycle is a few seconds and
-never touches the saved Wi-Fi, Thread or Matter data:
+app and radio-image flash by default, so an edit-compile-flash cycle is a few
+seconds and never touches the saved Wi-Fi, Thread or Matter data:
 
 ```
 .\build-native.ps1 -Port COM5

@@ -21,9 +21,15 @@ The GitHub Actions workflow rebuilds both choices on every source push. There ca
 
 ## Hardware
 
-One M5Stack CoreS3 Thread BR (SKU K149). The ESP32-S3 runs this firmware. The on-board ESP32-H2 keeps its stock RCP firmware and never gets touched.
+One M5Stack CoreS3 Thread BR (SKU K149). The ESP32-S3 runs this firmware, and the on-board ESP32-H2 runs this project's radio co-processor firmware (see below).
 
 Flashing replaces M5Stack's stock border-router firmware. To go back, use M5Burner's factory restore.
+
+## ESP32-H2 radio firmware
+
+The H2 runs OpenThread's radio co-processor (RCP) firmware built from `rcp/`: ESP-IDF 6.1.1's `ot_rcp` example plus `rcp/main/ack_length_fix.c`. That file removes the cause of the `Handle radio frame failed: Parse` / `RCP failure detected` resets the stock firmware produced every few hours. ESP-IDF clears the reserved PHR bit of received data frames but not of acknowledgements, so an ACK arriving with that bit set reached the S3 claiming more than 127 bytes, failed to parse, and made the S3 reset the radio. The fix wraps the driver's ACK hand-off with `-Wl,--wrap` and clears the bit there; no ESP-IDF source is modified.
+
+The S3 image carries the H2 build in the `rcp_fw` partition. At boot, before OpenThread opens the UART, `main/rcp_update.c` flashes the H2 when the bundled version is new to it, which takes about 12 seconds, then restarts the S3 so the radio comes up from a normal boot. It holds the H2's BOOT strap (GPIO18) and pulses RESET (GPIO7), as Espressif's M5Stack border router example does, so the H2's ROM bootloader is always reachable and an interrupted flash is retried on the next boot. After three attempts without a boot that shows the H2 running the bundled version, it stops; `rcp update` in the console requests another. The version string pins its timestamp to `rcp/`'s last commit, so rebuilding unchanged sources never reflashes the radio.
 
 ## Wi-Fi
 
@@ -315,6 +321,7 @@ Wi-Fi power management follows the power source. On USB the radio never dozes, w
 | `name <name>` | set the shared Matter/MeshCoP border-router name; republished immediately |
 | `matter [status\|code\|open [seconds]]` | inspect or open Matter commissioning |
 | `camtest` | grab frames, print stats and ASCII art |
+| `rcp [update]` | ESP32-H2 radio firmware: running, bundled and last-flashed versions; `update` reflashes it on restart |
 | `reveal 1` | unmask the network key in output. It prints secrets, so leave it off |
 | `log [quiet\|<level> [tag]]` | console verbosity. Boots `quiet`: warnings and errors from every component, this firmware's own tags at info. `log info` restores everything, `log info OPENTHREAD` one tag |
 
@@ -324,11 +331,13 @@ If either NVS partition cannot initialize, boot preserves its contents instead o
 
 ## Building
 
-See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.1.1 SDK and reuses `build/idf6/` and ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
+See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.1.1 SDK, builds the H2 radio firmware in `build/rcp/`, then the app in `build/idf6/`, with ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes the app and the radio firmware image (`rcp_fw`), which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
 
 ```powershell
 .\build-native.ps1 -Port COM5
 ```
+
+The first flash of a build that has the `rcp_fw` partition must use `-Full` once, because the partition table gains that entry. It is appended after `matter_nvs`, so every earlier offset, and therefore NVS, stays where it was.
 
 For the first ESP-IDF 5.5 to 6.0 upgrade, retain a verified full-flash backup
 and use `-Full` to update the bootloader, the unchanged partition table and app
@@ -339,7 +348,7 @@ can use the default app-only flash:
 .\build-native.ps1 -Port COM5 -Full
 ```
 
-`build.ps1` uses the same ESP-IDF v6.1.1 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Its `epskc-work-idf61` volume keeps the build cache separate from the earlier SDK. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
+`build.ps1` uses the same ESP-IDF v6.1.1 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Its `epskc-work-idf61` volume keeps the build cache separate from the earlier SDK. Supplying `-Port` flashes the bootloader, partition table, app and radio firmware image as separate ranges, so it does not overwrite NVS:
 
 ```powershell
 .\build.ps1 -Port COM5
@@ -360,26 +369,28 @@ Project CMake supplies the Scenes helpers required by ESP-Matter 1.6.1's legacy
 command dispatcher when unused lighting/Scenes clusters are disabled. The
 workaround is limited to that SDK version and does not create a Scenes endpoint.
 
-CI publishes four files under `firmware/`:
+CI builds `rcp/` before the app and publishes five files under `firmware/`:
 
 | File | Offset | Purpose |
 |---|---:|---|
 | `bootloader.bin` | `0x0` | Sparse/manual flashing |
 | `partition-table.bin` | `0x8000` | Sparse/manual flashing |
 | `epskc-commissioner-app.bin` | `0x10000` | Launchpad **Update (keeps settings)** and sparse/manual flashing |
+| `rcp-fw.bin` | `0x720000` | ESP32-H2 radio firmware image (`rcp_fw`) for sparse/manual flashing |
 | `cores3-epskc-commissioner.bin` | `0x0` | Complete merged image for **Factory install** and compatibility |
 
-To preserve settings when flashing the published components manually, write the first three files at their listed offsets and do not run `erase-flash`:
+To preserve settings when flashing the published components manually, write the first four files at their listed offsets and do not run `erase-flash`:
 
 ```powershell
 python -m esptool --chip esp32s3 -p COM5 -b 460800 `
   --before default_reset --after hard_reset write_flash `
   0x0 .\firmware\bootloader.bin `
   0x8000 .\firmware\partition-table.bin `
-  0x10000 .\firmware\epskc-commissioner-app.bin
+  0x10000 .\firmware\epskc-commissioner-app.bin `
+  0x720000 .\firmware\rcp-fw.bin
 ```
 
-The merged image necessarily spans NVS and resets provisioning.
+The merged image necessarily spans NVS and resets provisioning. Launchpad's app-only **Update** does not write `rcp_fw`, so it leaves the H2's radio firmware as it was; the factory image and the PC flashes above carry it.
 
 `tools/layout_check.py` models the 320x240 screen geometry and reports overlapping widgets before you flash; it exits non-zero if anything collides.
 

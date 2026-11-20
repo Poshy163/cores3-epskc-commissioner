@@ -23,6 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          # The radio firmware's version string carries the time of the last
+          # commit touching rcp/, which needs history beyond the tip.
+          fetch-depth: 0
 
       - name: Test production parsers and failure paths on host
         run: python3 -B tools/run_host_tests.py --cc gcc
@@ -35,12 +39,20 @@ jobs:
         with:
           esp_idf_version: v6.1.1
           target: esp32s3
+          # The ESP32-H2 radio firmware (rcp/) builds first: the S3 image packs
+          # it into the rcp_fw partition. SOURCE_DATE_EPOCH pins its version to
+          # rcp/'s last commit so CI and local builds of the same sources match
+          # and the device does not reflash its radio for a rebuild.
           command: |
-            idf.py -B build build
+            set -e
+            RCP_EPOCH=$(git log -1 --format=%ct -- rcp)
+            SOURCE_DATE_EPOCH=${RCP_EPOCH:-$(git log -1 --format=%ct)} IDF_TARGET=esp32h2 idf.py -C rcp -B "$PWD/build-rcp" -D SDKCONFIG="$PWD/build-rcp/sdkconfig" build
+            idf.py -B build -DRCP_BUILD_DIR="$PWD/build-rcp" build
             mkdir -p firmware
             cp build/bootloader/bootloader.bin firmware/bootloader.bin
             cp build/partition_table/partition-table.bin firmware/partition-table.bin
             cp build/epskc_commissioner.bin firmware/epskc-commissioner-app.bin
+            cp build/rcp_fw.bin firmware/rcp-fw.bin
             cd build
             python -m esptool --chip esp32s3 merge_bin -o ../firmware/cores3-epskc-commissioner.bin @flash_args
 
@@ -52,6 +64,7 @@ jobs:
             firmware/bootloader.bin \
             firmware/partition-table.bin \
             firmware/epskc-commissioner-app.bin \
+            firmware/rcp-fw.bin \
             firmware/cores3-epskc-commissioner.bin
           git diff --cached --quiet && exit 0
 

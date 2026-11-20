@@ -32,6 +32,7 @@
 #include "openthread/platform/radio.h"
 #include "openthread/thread.h"
 #include "openthread/thread_ftd.h"
+#include "rcp_update.h"
 #include "settings.h"
 
 static const char *TAG = "thread";
@@ -48,6 +49,27 @@ static bool s_meshcop_e_published;
 static void share_state_cb(void *ctx);
 
 /*
+ * mDNS calls must not be made while holding OpenThread's task-switching lock.
+ * The responder's task holds its service lock while it waits for lwIP's core
+ * lock, and lwIP's thread holds the core lock while it waits for the
+ * task-switching lock to transmit on the Thread interface (an MLD report or a
+ * routed packet). An mDNS call made with the lock held closes that cycle, and
+ * the OpenThread, mDNS, lwIP, esp_timer and UI tasks stop for good. ESP-IDF's
+ * own MeshCoP publisher drops the lock around its mDNS calls; these helpers
+ * do the same. The caller keeps the API lock, so only lwIP's thread can enter
+ * OpenThread meanwhile. Make no OpenThread call between the two.
+ */
+static void mdns_section_begin(void)
+{
+    esp_openthread_task_switching_lock_release();
+}
+
+static void mdns_section_end(void)
+{
+    esp_openthread_task_switching_lock_acquire(portMAX_DELAY);
+}
+
+/*
  * ---------------- MeshCoP TXT record correction ----------------
  *
  * ESP-IDF's prebuilt border-router library publishes _meshcop._udp itself and
@@ -58,14 +80,15 @@ static void share_state_cb(void *ctx);
  * the whole record correctly, so whenever it reports a change this re-applies
  * OpenThread's entries over the library's, through the same mDNS responder and
  * the same item-set call the library uses. The ephemeral-key service
- * (_meshcop-e) carries the same record, as ot-br-posix publishes it. Runs on
- * the OpenThread task with the stack lock held.
+ * (_meshcop-e) carries the same record, as ot-br-posix publishes it.
+ *
+ * meshcop_txt_apply() makes mDNS calls only, so it runs inside an mDNS
+ * section; meshcop_txt_apply_locked() reads OpenThread's record first and is
+ * called with the stack lock held.
  */
-static void meshcop_txt_apply_locked(otInstance *instance, const char *service_type)
+static void meshcop_txt_apply(const char *service_type,
+                              const otBorderAgentMeshCoPServiceTxtData *txt)
 {
-    if (!otBorderAgentIsActive(instance)) {
-        return;   /* nothing is published while detached */
-    }
     if (!mdns_service_exists(service_type, "_udp", NULL)) {
         /* The first callback fires before the library has added the service;
          * the responder would log an error for the missing record, and the
@@ -73,18 +96,13 @@ static void meshcop_txt_apply_locked(otInstance *instance, const char *service_t
         ESP_LOGD(TAG, "%s not published yet", service_type);
         return;
     }
-    otBorderAgentMeshCoPServiceTxtData txt;
-    if (otBorderAgentGetMeshCoPServiceTxtData(instance, &txt) != OT_ERROR_NONE) {
-        ESP_LOGW(TAG, "could not read the MeshCoP TXT data");
-        return;
-    }
 
     unsigned applied = 0;
-    for (uint16_t at = 0; at < txt.mLength;) {
-        const uint8_t entry_len = txt.mData[at];
-        const uint8_t *entry = &txt.mData[at + 1];
+    for (uint16_t at = 0; at < txt->mLength;) {
+        const uint8_t entry_len = txt->mData[at];
+        const uint8_t *entry = &txt->mData[at + 1];
         at += 1u + entry_len;
-        if (at > txt.mLength) {
+        if (at > txt->mLength) {
             break;   /* truncated entry */
         }
         const uint8_t *eq = memchr(entry, '=', entry_len);
@@ -115,12 +133,32 @@ static void meshcop_txt_apply_locked(otInstance *instance, const char *service_t
     ESP_LOGI(TAG, "%s TXT record refreshed (%u entries)", service_type, applied);
 }
 
+static void meshcop_txt_apply_locked(otInstance *instance, const char *service_type)
+{
+    if (!otBorderAgentIsActive(instance)) {
+        return;   /* nothing is published while detached */
+    }
+    otBorderAgentMeshCoPServiceTxtData txt;
+    if (otBorderAgentGetMeshCoPServiceTxtData(instance, &txt) != OT_ERROR_NONE) {
+        ESP_LOGW(TAG, "could not read the MeshCoP TXT data");
+        return;
+    }
+    mdns_section_begin();
+    meshcop_txt_apply(service_type, &txt);
+    mdns_section_end();
+}
+
+/* Runs on the OpenThread task with the stack lock held. */
 static void meshcop_service_changed_cb(void *context)
 {
     (void) context;
     otInstance *instance = esp_openthread_get_instance();
     if (otBorderAgentIsActive(instance)) {
-        if (!mdns_service_exists("_meshcop", "_udp", NULL)) {
+        mdns_section_begin();
+        const bool published = mdns_service_exists("_meshcop", "_udp", NULL);
+        mdns_section_end();
+        if (!published) {
+            /* Called with the lock held: the library manages it itself. */
             esp_err_t err = esp_openthread_publish_meshcop_mdns(s_border_router_name);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "MeshCoP publication retry failed: %s", esp_err_to_name(err));
@@ -129,14 +167,17 @@ static void meshcop_service_changed_cb(void *context)
         }
         /* An early role notification can precede the Border Agent socket.
          * IDF refreshes TXT on subsequent changes but not the SRV port. */
-        esp_err_t err = mdns_service_port_set("_meshcop", "_udp", otBorderAgentGetUdpPort(instance));
+        const uint16_t port = otBorderAgentGetUdpPort(instance);
+        mdns_section_begin();
+        esp_err_t err = mdns_service_port_set("_meshcop", "_udp", port);
+        mdns_section_end();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "MeshCoP port refresh failed: %s", esp_err_to_name(err));
         }
     }
     meshcop_txt_apply_locked(instance, "_meshcop");
     if (s_meshcop_e_published) {
-        meshcop_txt_apply_locked(esp_openthread_get_instance(), "_meshcop-e");
+        meshcop_txt_apply_locked(instance, "_meshcop-e");
     }
 }
 
@@ -307,6 +348,12 @@ esp_err_t thread_init(void)
     }
     s_ready = true;
     ESP_LOGI(TAG, "adopted Matter OpenThread stack (H2 RCP over UART1)");
+
+    /* Prove the H2 runs the bundled radio firmware, or schedule a reflash. */
+    char rcp_version[RCP_UPDATE_VERSION_SIZE];
+    if (thread_rcp_version(rcp_version, sizeof(rcp_version))) {
+        rcp_update_check_running(rcp_version);
+    }
     return ESP_OK;
 }
 
@@ -487,7 +534,9 @@ esp_err_t thread_set_border_router_name(const char *name)
     /* Withdraw the old instance first: the responder treats a renamed service
      * as a new one, and two records for one border agent confuse clients. */
     if (s_meshcop_e_published) {
+        mdns_section_begin();
         mdns_service_remove("_meshcop-e", "_udp");
+        mdns_section_end();
         s_meshcop_e_published = false;
     }
     esp_openthread_remove_meshcop_mdns();
@@ -879,17 +928,22 @@ static void share_state_cb(void *ctx)
                   st == OT_BORDER_AGENT_STATE_ACCEPTED;
     if (active && !s_meshcop_e_published) {
         uint16_t port = otBorderAgentEphemeralKeyGetUdpPort(ins);
-        const char *nn = otThreadGetNetworkName(ins);
+        /* Copied: no OpenThread memory is read inside the mDNS section. */
+        char nn[OT_NETWORK_NAME_MAX_SIZE + 1];
+        const char *name = otThreadGetNetworkName(ins);
+        snprintf(nn, sizeof(nn), "%s", name ? name : "");
         mdns_txt_item_t txt[] = {
             { "rv", "1" },
             { "tv", "1.4.0" },
             { "vn", "OpenThread" },
             { "mn", THREAD_MESHCOP_MODEL_NAME },
-            { "nn", nn ? nn : "" },
+            { "nn", nn },
         };
+        mdns_section_begin();
         esp_err_t err = mdns_service_add(esp_openthread_get_meshcop_instance_name(),
                                          "_meshcop-e", "_udp", port, txt,
                                          sizeof(txt) / sizeof(txt[0]));
+        mdns_section_end();
         s_meshcop_e_published = (err == ESP_OK);
         if (err == ESP_OK) {
             meshcop_txt_apply_locked(ins, "_meshcop-e");
@@ -898,7 +952,9 @@ static void share_state_cb(void *ctx)
                  err == ESP_OK ? "advertised" : "advertise FAILED");
     } else if ((st == OT_BORDER_AGENT_STATE_STOPPED || st == OT_BORDER_AGENT_STATE_DISABLED)
                && s_meshcop_e_published) {
+        mdns_section_begin();
         mdns_service_remove("_meshcop-e", "_udp");
+        mdns_section_end();
         s_meshcop_e_published = false;
         ESP_LOGI(TAG, "ephemeral key closed, _meshcop-e withdrawn");
     }

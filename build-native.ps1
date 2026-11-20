@@ -4,10 +4,12 @@
 # CI-equivalent path.
 #
 # Usage:
-#   .\build-native.ps1                    build
-#   .\build-native.ps1 -Port COM5         build, then write only the app partition
-#                                         (keeps Wi-Fi, Thread and Matter data)
+#   .\build-native.ps1                    build the H2 radio firmware (rcp/) and the app
+#   .\build-native.ps1 -Port COM5         build, then write the app and the radio
+#                                         firmware image (rcp_fw); keeps Wi-Fi,
+#                                         Thread and Matter data
 #   .\build-native.ps1 -Port COM5 -Full   also write the bootloader and partition table
+#                                         (needed once when partitions.csv changes)
 #   .\build-native.ps1 -Port COM5 -Monitor  open the serial console after flashing
 #   .\build-native.ps1 -Clean             discard this build's output first
 #   .\build-native.ps1 -BuildDir build/test  use a separate build directory
@@ -58,6 +60,19 @@ try {
             & $python $idf -B $BuildDir fullclean
             if ($LASTEXITCODE -ne 0) { exit 1 }
         }
+        # The ESP32-H2 radio firmware first: the app packs it into rcp_fw. Its
+        # version string carries SOURCE_DATE_EPOCH, pinned to rcp/'s last
+        # commit, so rebuilding unchanged sources does not make the device
+        # reflash its radio. Only this build sees the variable.
+        $rcpBuildDir = (Join-Path $PSScriptRoot "build/rcp") -replace '\\', '/'
+        $rcpEpoch = (git log -1 --format=%ct -- rcp | Out-String).Trim()
+        if (-not $rcpEpoch) { $rcpEpoch = (git log -1 --format=%ct | Out-String).Trim() }
+        if ($rcpEpoch) { $env:SOURCE_DATE_EPOCH = $rcpEpoch }
+        & $python $idf -C rcp -B $rcpBuildDir -D "SDKCONFIG=$rcpBuildDir/sdkconfig" build
+        $rcpStatus = $LASTEXITCODE
+        Remove-Item Env:\SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
+        if ($rcpStatus -ne 0) { exit 1 }
+
         & $python $idf -B $BuildDir build
         if ($LASTEXITCODE -ne 0) { exit 1 }
 
@@ -65,7 +80,7 @@ try {
             if ($Full) {
                 & $python $idf -B $BuildDir -p $Port flash
             } else {
-                & $python $idf -B $BuildDir -p $Port app-flash
+                & $python $idf -B $BuildDir -p $Port app-flash rcp_fw-flash
             }
             if ($LASTEXITCODE -ne 0) { exit 1 }
             if ($Monitor) {

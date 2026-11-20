@@ -6,8 +6,11 @@
 set -euo pipefail
 DEFAULTS="${1:-sdkconfig.defaults}"
 
-rm -rf /work/main
-cp -r /host/main /work/
+# The repo is bind-mounted with the host user's ownership.
+git config --global --add safe.directory /host 2>/dev/null || true
+
+rm -rf /work/main /work/rcp
+cp -r /host/main /host/rcp /work/
 cp /host/CMakeLists.txt /host/partitions.csv /host/sdkconfig.defaults /host/dependencies.lock /work/
 v=$(git -C /host rev-parse --short=7 HEAD 2>/dev/null || echo unknown); git -C /host diff --quiet HEAD 2>/dev/null || v="${v}*"; echo "$v" > /work/version.txt
 if [ -f /host/sdkconfig.debug ]; then
@@ -36,11 +39,20 @@ if [ "$(cat .defaults 2>/dev/null || true)" != "$defaults_stamp" ]; then
     printf '%s\n' "$defaults_stamp" > .defaults
 fi
 
-idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
+# The ESP32-H2 radio firmware first: the S3 image packs it into rcp_fw. Its
+# version string carries this timestamp, pinned to rcp/'s last commit so a
+# rebuild of unchanged sources does not make the device reflash its radio.
+rcp_epoch=$(git -C /host log -1 --format=%ct -- rcp 2>/dev/null || true)
+[ -n "$rcp_epoch" ] || rcp_epoch=$(git -C /host log -1 --format=%ct 2>/dev/null || date +%s)
+SOURCE_DATE_EPOCH="$rcp_epoch" IDF_TARGET=esp32h2 \
+    idf.py -C /work/rcp -B /work/build-rcp -D SDKCONFIG=/work/build-rcp/sdkconfig build
+
+idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" -DRCP_BUILD_DIR=/work/build-rcp build
 
 mkdir -p /host/dist/bootloader /host/dist/partition_table
 cp build/flash_args /host/dist/
 cp build/bootloader/bootloader.bin /host/dist/bootloader/
 cp build/partition_table/partition-table.bin /host/dist/partition_table/
 cp build/epskc_commissioner.bin /host/dist/
+cp build/rcp_fw.bin /host/dist/
 echo "artifacts copied to host dist/"

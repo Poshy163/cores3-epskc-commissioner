@@ -11,3 +11,5 @@ dependencies:
     version: "1.6.1"
   lvgl/lvgl:
     version: "9.6.0~1"
+  espressif/esp_rcp_update:
+    version: "1.7.0"

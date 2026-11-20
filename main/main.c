@@ -36,6 +36,7 @@
 #include "power.h"
 #include "power_log.h"
 #include "qrscan.h"
+#include "rcp_update.h"
 #include "remote_admin.h"
 #include "settings.h"
 #include "thread.h"
@@ -303,7 +304,7 @@ static void wifi_watchdog_cb(void *arg)
  */
 static const char *const k_app_log_tags[] = {
     "epskc", "thread", "matter", "otbr_rest", "meshcop", "discover", "qrscan",
-    "ui", "power", "settings",
+    "ui", "power", "settings", "rcp",
 };
 static const char *s_log_profile = "quiet";
 
@@ -945,6 +946,36 @@ static int cmd_reboot(int argc, char **argv)
     (void) argc; (void) argv;
     printf("rebooting\n");
     app_reboot();
+    return 0;
+}
+
+static int cmd_rcp(int argc, char **argv)
+{
+    if (argc >= 2 && strcmp(argv[1], "update") == 0) {
+        esp_err_t err = rcp_update_request();
+        if (err != ESP_OK) {
+            printf("cannot schedule a radio firmware update: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        printf("radio firmware will be reflashed on restart; rebooting\n");
+        app_reboot();
+        return 0;
+    }
+    if (argc >= 2) {
+        printf("usage: rcp [update]\n");
+        return 1;
+    }
+    rcp_update_status_t status;
+    if (rcp_update_get_status(&status) != ESP_OK) {
+        printf("radio firmware status unavailable\n");
+        return 1;
+    }
+    char running[RCP_UPDATE_VERSION_SIZE];
+    printf("running : %s\n", thread_rcp_version(running, sizeof(running)) ? running : "(unknown)");
+    printf("bundled : %s\n", status.bundled[0] ? status.bundled : "(no rcp_fw image)");
+    printf("flashed : %s\n", status.flashed[0] ? status.flashed : "(never by this firmware)");
+    printf("attempts: %u since the last verified boot%s\n", (unsigned) status.attempts,
+           status.forced ? ", reflash requested" : "");
     return 0;
 }
 
@@ -1779,6 +1810,7 @@ static void register_commands(void)
         { .command = "log", .help = "log [quiet|<level> [tag]] - console log verbosity", .func = cmd_log },
         { .command = "link", .help = "link [drop|retry|supervisor on|off] - Wi-Fi link diagnostics", .func = cmd_link },
         { .command = "reboot", .help = "restart the device", .func = cmd_reboot },
+        { .command = "rcp", .help = "rcp [update] - H2 radio firmware: running, bundled, reflash", .func = cmd_rcp },
         { .command = "remote", .help = "remote [status|enable|disable|rotate|token] - local admin setup", .func = cmd_remote },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {

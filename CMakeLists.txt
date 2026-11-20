@@ -53,3 +53,38 @@ if(CONFIG_ESP_MATTER_ENABLE_DATA_MODEL AND
             "${matter_scenes_dir}/SceneTableImpl.cpp")
     endif()
 endif()
+
+# Pack the ESP32-H2 radio firmware (rcp/, built separately for esp32h2) into
+# the rcp_fw SPIFFS partition. main/rcp_update.c flashes it to the H2 when the
+# bundled version changes. esp_rcp_update's own packing (CONFIG_AUTO_UPDATE_RCP)
+# needs an absolute RCP path in sdkconfig and an update flow that restarts while
+# OpenThread is running, so this project uses only its image format and API.
+set(RCP_BUILD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/rcp" CACHE PATH
+    "Build directory of rcp/ whose image is packed into the rcp_fw partition")
+set(rcp_inputs
+    "${RCP_BUILD_DIR}/rcp_version"
+    "${RCP_BUILD_DIR}/flash_args"
+    "${RCP_BUILD_DIR}/bootloader/bootloader.bin"
+    "${RCP_BUILD_DIR}/partition_table/partition-table.bin"
+    "${RCP_BUILD_DIR}/esp_ot_rcp.bin")
+foreach(rcp_input IN LISTS rcp_inputs)
+    if(NOT EXISTS "${rcp_input}")
+        message(FATAL_ERROR
+            "Radio firmware not built: ${rcp_input} is missing. Build rcp/ first, "
+            "for example `idf.py -C rcp -B build/rcp -D SDKCONFIG=<abs>/build/rcp/sdkconfig build` "
+            "(build-native.ps1, build.sh and CI do this), or pass -DRCP_BUILD_DIR=<dir>.")
+    endif()
+endforeach()
+idf_component_get_property(rcp_update_dir espressif__esp_rcp_update COMPONENT_DIR)
+idf_build_get_property(python PYTHON)
+set(rcp_image_dir "${CMAKE_BINARY_DIR}/rcp_fw_image")
+add_custom_command(
+    OUTPUT "${rcp_image_dir}/ot_rcp_0/rcp_image"
+    COMMAND ${python} "${rcp_update_dir}/create_ota_image.py"
+            --rcp-build-dir "${RCP_BUILD_DIR}"
+            --target-file "${rcp_image_dir}/ot_rcp_0/rcp_image"
+    DEPENDS ${rcp_inputs}
+    COMMENT "Packing the ESP32-H2 radio firmware into rcp_fw"
+    VERBATIM)
+add_custom_target(rcp_image DEPENDS "${rcp_image_dir}/ot_rcp_0/rcp_image")
+spiffs_create_partition_image(rcp_fw "${rcp_image_dir}" FLASH_IN_PROJECT DEPENDS rcp_image)

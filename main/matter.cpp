@@ -1,6 +1,7 @@
 #include "matter.h"
 #include "log_ring.h"
 #include "matter_battery.h"
+#include "rcp_update.h"
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +42,10 @@ constexpr char kTag[] = "matter";
 constexpr char kMatterNvsPartition[] = "matter_nvs";
 constexpr char kOpenThreadNvsPartition[] = "nvs";
 constexpr gpio_num_t kRcpResetPin = GPIO_NUM_7;
+/* The H2's boot strap. Held low across a reset, it enters the ROM download
+ * mode the radio firmware updater uses; Espressif's M5Stack border router
+ * example uses the same pin (CONFIG_DEFAULT_PIN_TO_RCP_BOOT=18). */
+constexpr gpio_num_t kRcpBootPin = GPIO_NUM_18;
 constexpr gpio_num_t kRcpRxPin = GPIO_NUM_10;
 constexpr gpio_num_t kRcpTxPin = GPIO_NUM_17;
 constexpr uart_port_t kRcpUart = UART_NUM_1;
@@ -500,6 +505,20 @@ extern "C" esp_err_t matter_init(void)
     error = set_openthread_platform_config(&openthread_config);
     if (error != ESP_OK) {
         return fail_init(error, "could not configure Matter-owned OpenThread");
+    }
+    /* Bring the H2 onto the bundled radio firmware while its UART is still
+     * free: OpenThread opens the port in esp_matter::start(). Failures leave
+     * the current firmware running and are not fatal here. */
+    const rcp_update_pins_t rcp_pins = {
+        .uart = kRcpUart,
+        .rx_pin = kRcpRxPin,
+        .tx_pin = kRcpTxPin,
+        .reset_pin = kRcpResetPin,
+        .boot_pin = kRcpBootPin,
+    };
+    error = rcp_update_prepare(&rcp_pins);
+    if (error != ESP_OK) {
+        ESP_LOGW(kTag, "radio firmware check skipped: %s", esp_err_to_name(error));
     }
     error = reset_rcp();
     if (error != ESP_OK) {
