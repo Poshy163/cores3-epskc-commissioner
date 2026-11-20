@@ -114,6 +114,30 @@ static void reset(void) {
 }
 
 int main(void) {
+    /* Boot defaults and runtime joins share the same fixed-width conversion. */
+    char boot_ssid[33], boot_psk[65];
+    memset(boot_ssid, 'b', 32); boot_ssid[32] = 0;
+    memset(boot_psk, 'c', 64); boot_psk[64] = 0;
+    wifi_config_t boot_config;
+    memset(&boot_config, 0xff, sizeof(boot_config));
+    assert(wifi_config_from_credentials(boot_ssid, boot_psk, &boot_config) == ESP_OK);
+    assert(memcmp(boot_config.sta.ssid, boot_ssid, 32) == 0);
+    assert(memcmp(boot_config.sta.password, boot_psk, 64) == 0);
+    assert(wifi_config_from_credentials("open-network", "", &boot_config) == ESP_OK);
+    assert(strcmp((char *)boot_config.sta.ssid, "open-network") == 0);
+    for (size_t i = 0; i < sizeof(boot_config.sta.password); ++i) {
+        assert(boot_config.sta.password[i] == 0);
+    }
+    assert(wifi_config_from_credentials("", "password", &boot_config) == ESP_ERR_INVALID_ARG);
+    assert(wifi_config_from_credentials("network", "password", NULL) == ESP_ERR_INVALID_ARG);
+    wifi_config_t before_invalid = boot_config;
+    assert(wifi_config_from_credentials("123456789012345678901234567890123", "password",
+                                        &boot_config) == ESP_ERR_INVALID_ARG);
+    assert(wifi_config_from_credentials("network",
+        "12345678901234567890123456789012345678901234567890123456789012345",
+        &boot_config) == ESP_ERR_INVALID_ARG);
+    assert(memcmp(&boot_config, &before_invalid, sizeof(boot_config)) == 0);
+
     /* Force external API failures through the actual production branches. */
     reset(); fail_storage_ram = 1;
     assert(app_wifi_join("candidate", "candidate-pass", 20000) != ESP_OK);
@@ -191,6 +215,6 @@ int main(void) {
     }
     assert(!parse_udp_port(NULL, &port) && !parse_udp_port("1", NULL));
 #endif
-    puts("Wi-Fi production regression checks passed (18 scenarios + UDP port boundaries)");
+    puts("Wi-Fi production regression checks passed (boot credentials, 18 scenarios + UDP port boundaries)");
     return 0;
 }

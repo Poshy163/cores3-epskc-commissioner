@@ -2,10 +2,11 @@
  * Minimal OpenThread Border Router REST API, the subset Home Assistant's
  * `otbr` integration (python-otbr-api) actually calls.
  *
- * Point HA at http://<device-ip>:8081. Served plain HTTP with no
- * authentication, exactly like ot-br-posix: anyone who can reach the port can
- * read the Active Operational Dataset, which contains the network key. Keep it
- * on a trusted network.
+ * Point HA at http://<device-ip>:8081. Standard OTBR routes use plain HTTP
+ * without authentication, like ot-br-posix: anyone who can reach the port can
+ * read the Active Operational Dataset, including its network key. Keep it on a
+ * trusted network. The separate /device routes require opt-in remote management
+ * and its Bearer token; they do not add encryption to this HTTP transport.
  */
 #pragma once
 

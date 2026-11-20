@@ -151,7 +151,7 @@ int main(int argc, char **argv)
     int before = msync_calls;
     emit("W (%lu) %s: hello %d\n", 5ul, "tag", 7);
     assert(!strcmp(line(LOG_RING_CURRENT, 1), "W (5) tag: hello 7"));
-    assert(msync_calls == before + 1);
+    assert(msync_calls == before + 2); /* retained slot plus persisted counter header */
 
     /* OpenThread's three-call line, interleaved with another task. */
     emit("W(%lu) %s:", 23591ul, "OPENTHREAD");
@@ -270,6 +270,49 @@ int main(int argc, char **argv)
     reboot();
     memset(&s_ring, 0x5a, sizeof(s_ring));
     assert(log_ring_init() == ESP_OK && !log_ring_info(LOG_RING_PREVIOUS, &info));
+
+    /* Repeated MLE replay warnings keep exact persisted counts while only
+     * retaining one example per minute. Other errors are never coalesced. */
+    task(1);
+    test_time = 1000000;
+    emit("W(1) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated\n");
+    /* Exact SDK 6 line observed on the upgraded device. Both spellings
+     * share a counter and retention interval when they occur in one boot. */
+    emit("W(9887) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated\n");
+    for (int i = 0; i < 8; ++i) {
+        test_time += 1000000;
+        emit(i % 2 ? "W(%d) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated\n"
+                   : "W(%d) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated\n", i + 2);
+    }
+    assert(log_ring_info(LOG_RING_CURRENT, &info));
+    assert(info.latest_seq == 1 && info.duplicate_mle_count == 10);
+    const char *untouched[] = {
+        "W(2) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Security",
+        "W(2) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Security",
+        "W(9887) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Security",
+        "W(9887) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Security",
+        "W(2) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated peer=abcd",
+        "W(9887) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated peer=abcd",
+    };
+    const unsigned untouched_count = sizeof(untouched) / sizeof(untouched[0]);
+    for (unsigned i = 0; i < untouched_count; ++i) {
+        emit("%s\n", untouched[i]);
+        assert(log_ring_info(LOG_RING_CURRENT, &info));
+        assert(info.latest_seq == i + 2 && info.duplicate_mle_count == 10);
+        assert(!strcmp(line(LOG_RING_CURRENT, i + 2), untouched[i]));
+    }
+    test_time = 61000000;
+    emit("W(61) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated\n");
+    assert(log_ring_info(LOG_RING_CURRENT, &info));
+    assert(info.latest_seq == untouched_count + 2 && info.duplicate_mle_count == 11);
+    assert(!strcmp(line(LOG_RING_CURRENT, untouched_count + 2),
+        "W(61) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated [count 10, total 11]"));
+    reboot();
+    assert(log_ring_init() == ESP_OK);
+    assert(log_ring_info(LOG_RING_PREVIOUS, &info) && info.duplicate_mle_count == 11);
+    assert(log_ring_info(LOG_RING_CURRENT, &info) && info.duplicate_mle_count == 0);
+    emit("W(1) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated\n");
+    assert(log_ring_info(LOG_RING_CURRENT, &info) && info.latest_seq == 1);
 
     /* Hook used before init finished storing the previous console. */
     s_console = NULL;

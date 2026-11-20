@@ -755,14 +755,16 @@ bool thread_link_rssi(int8_t *rssi)
     return err == OT_ERROR_NONE && *rssi != 127;
 }
 
-bool thread_activity_get(thread_activity_t *activity)
+static bool activity_get(thread_activity_t *activity, TickType_t wait)
 {
     if (!s_ready || activity == NULL) {
         return false;
     }
 
     memset(activity, 0, sizeof(*activity));
-    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (!esp_openthread_lock_acquire(wait)) {
+        return false;
+    }
     otInstance *instance = esp_openthread_get_instance();
     otDeviceRole role = otThreadGetDeviceRole(instance);
     activity->attached = role == OT_DEVICE_ROLE_CHILD ||
@@ -817,6 +819,19 @@ bool thread_activity_get(thread_activity_t *activity)
     }
     esp_openthread_lock_release();
     return true;
+}
+
+bool thread_activity_get(thread_activity_t *activity)
+{
+    return activity_get(activity, portMAX_DELAY);
+}
+
+bool thread_activity_get_with_timeout(thread_activity_t *activity, uint32_t timeout_ms)
+{
+    /* Management reads have a hard upper bound even if a future caller passes
+     * a value that would overflow pdMS_TO_TICKS. */
+    const uint32_t bounded_ms = timeout_ms > 1000 ? 1000 : timeout_ms;
+    return activity_get(activity, pdMS_TO_TICKS(bounded_ms));
 }
 
 /* ---------------- sharing (ePSKc border-agent side) ---------------- */

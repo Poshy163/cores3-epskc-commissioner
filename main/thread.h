@@ -112,6 +112,8 @@ typedef struct {
 } thread_activity_t;
 
 bool thread_activity_get(thread_activity_t *activity);
+/* Bounded diagnostic read for HTTP polling; false when the stack lock is busy. */
+bool thread_activity_get_with_timeout(thread_activity_t *activity, uint32_t timeout_ms);
 
 /*
  * Network-wide Mesh Diagnostics are asynchronous and best-effort. "Seen"

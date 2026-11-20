@@ -10,6 +10,7 @@
  * Credentials are entered at runtime and never compiled in.
  */
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,6 +36,7 @@
 #include "power.h"
 #include "power_log.h"
 #include "qrscan.h"
+#include "remote_admin.h"
 #include "settings.h"
 #include "thread.h"
 #include "ui.h"
@@ -80,13 +82,68 @@ static bool s_wifi_hold;   /* true after an intentional leave: no auto-reconnect
  */
 static esp_timer_handle_t s_reconnect_timer;
 static volatile bool s_join_active;           /* app_wifi_join() owns the retries */
-static volatile bool s_supervisor_on = true;  /* `link supervisor off` for testing */
+static atomic_bool s_supervisor_on = true;  /* `link supervisor off` for testing */
 static volatile bool s_have_credentials;
-static volatile int s_backoff_step;
-static volatile uint32_t s_disconnect_count;
-static volatile uint8_t s_last_disc_reason;
-static volatile int64_t s_last_disc_us;
-static volatile int64_t s_last_conn_us;
+static atomic_int s_backoff_step;
+/* Event-owned metadata also read by telemetry and the console. Keep 64-bit
+ * timestamps and address arrays together; volatile cannot prevent torn reads
+ * on the 32-bit S3. Never call an SDK/driver API while holding this lock. */
+static portMUX_TYPE s_wifi_status_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t s_disconnect_count, s_wifi_status_generation;
+static uint16_t s_last_disc_reason;
+static int64_t s_last_disc_us, s_last_conn_us, s_associated_us;
+static bool s_wifi_associated, s_association_recorded, s_disconnect_recorded;
+
+/* Caller holds s_wifi_status_lock. Ages share the same monotonic sample time. */
+static void wifi_status_copy_locked(app_wifi_status_t *out, int64_t now_us)
+{
+    memset(out, 0, sizeof(*out));
+    out->connected = s_wifi_associated;
+    out->disconnect_count = s_disconnect_count;
+    out->last_disconnect_reason = s_last_disc_reason;
+    out->association_valid = s_wifi_associated && s_association_recorded &&
+                             now_us >= s_associated_us;
+    if (out->association_valid) {
+        out->associated_ms = (uint64_t) (now_us - s_associated_us) / 1000;
+    }
+    out->last_disconnect_valid = s_disconnect_recorded && now_us >= s_last_disc_us;
+    if (out->last_disconnect_valid) {
+        out->last_disconnect_age_ms = (uint64_t) (now_us - s_last_disc_us) / 1000;
+    }
+    memcpy(out->ipv4, s_ip, sizeof(s_ip));
+    memcpy(out->ipv6, s_ip6, sizeof(s_ip6));
+}
+
+void app_wifi_get_status(app_wifi_status_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_wifi_status_lock);
+    wifi_status_copy_locked(out, now_us);
+    const uint32_t generation = s_wifi_status_generation;
+    portEXIT_CRITICAL(&s_wifi_status_lock);
+
+    wifi_ap_record_t ap;
+    const bool signal_valid = out->connected && esp_wifi_sta_get_ap_info(&ap) == ESP_OK;
+    now_us = esp_timer_get_time();
+    portENTER_CRITICAL(&s_wifi_status_lock);
+    if (generation != s_wifi_status_generation) {
+        /* Do not pair an old AP reading with a newer disconnect/reconnect or
+         * address update. The next poll can obtain the new radio sample. */
+        wifi_status_copy_locked(out, now_us);
+    } else if (signal_valid && out->connected) {
+        out->signal_valid = true;
+        out->rssi = ap.rssi;
+        out->channel = ap.primary;
+    }
+    portEXIT_CRITICAL(&s_wifi_status_lock);
+
+    out->supervisor_on = atomic_load(&s_supervisor_on);
+    out->retry_step = atomic_load(&s_backoff_step);
+    out->reconnect_pending = s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer);
+}
 
 /*
  * Fast at first so a momentary blip never reaches the user, then backing off
@@ -102,10 +159,10 @@ static const char *wifi_reason_name(uint8_t reason)
     case WIFI_REASON_UNSPECIFIED:            return "unspecified";
     case WIFI_REASON_AUTH_EXPIRE:            return "auth expired";
     case WIFI_REASON_AUTH_LEAVE:             return "deauthenticated";
-    case WIFI_REASON_ASSOC_EXPIRE:           return "assoc expired";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY: return "disassociated due to inactivity";
     case WIFI_REASON_ASSOC_TOOMANY:          return "AP full";
-    case WIFI_REASON_NOT_AUTHED:             return "not authenticated";
-    case WIFI_REASON_NOT_ASSOCED:            return "not associated";
+    case WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA: return "not authenticated";
+    case WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA: return "not associated";
     case WIFI_REASON_ASSOC_LEAVE:            return "we left";
     case WIFI_REASON_ASSOC_NOT_AUTHED:       return "assoc without auth";
     case WIFI_REASON_MIC_FAILURE:            return "MIC failure";
@@ -349,6 +406,12 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_wifi_status_lock);
+        s_wifi_associated = s_association_recorded = true;
+        s_associated_us = now_us;
+        ++s_wifi_status_generation;
+        portEXIT_CRITICAL(&s_wifi_status_lock);
         /*
          * The border router sends Router Solicitations on the backbone to learn
          * the LAN's on-link prefixes, and that needs a link-local address on
@@ -363,14 +426,18 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *) data;
-        if (d != NULL) {
-            s_last_disc_reason = d->reason;
-        }
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_wifi_status_lock);
+        s_last_disc_reason = d != NULL ? d->reason : 0;
         s_disconnect_count++;
-        s_last_disc_us = esp_timer_get_time();
-        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_BACKBONE_READY_BIT);
+        s_last_disc_us = now_us;
+        s_disconnect_recorded = true;
+        s_wifi_associated = s_association_recorded = false;
         strcpy(s_ip, "-");
         strcpy(s_ip6, "-");
+        ++s_wifi_status_generation;
+        portEXIT_CRITICAL(&s_wifi_status_lock);
+        xEventGroupClearBits(s_wifi_events, WIFI_CONNECTED_BIT | WIFI_BACKBONE_READY_BIT);
         ui_set_wifi(NULL, NULL);
         if (s_wifi_hold) {
             /* deliberate leave: stay down */
@@ -395,9 +462,15 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         xEventGroupSetBits(s_wifi_events, WIFI_DISCONNECTED_BIT);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *) data;
-        snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&e->ip_info.ip));
+        char ip[sizeof(s_ip)] = { 0 };
+        snprintf(ip, sizeof(ip), IPSTR, IP2STR(&e->ip_info.ip));
+        const int64_t now_us = esp_timer_get_time();
+        portENTER_CRITICAL(&s_wifi_status_lock);
+        memcpy(s_ip, ip, sizeof(s_ip));
+        s_last_conn_us = now_us;
+        ++s_wifi_status_generation;
+        portEXIT_CRITICAL(&s_wifi_status_lock);
         s_retries = 0;
-        s_last_conn_us = esp_timer_get_time();
         s_have_credentials = true;
         cancel_reconnect();
         refresh_wifi_ui();
@@ -418,8 +491,13 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
         /* The Thread netif raises this too, so only record the backbone's. */
         ip_event_got_ip6_t *e = (ip_event_got_ip6_t *) data;
         if (e->esp_netif == s_sta_netif) {
-            snprintf(s_ip6, sizeof(s_ip6), IPV6STR, IPV62STR(e->ip6_info.ip));
-            ESP_LOGI(TAG, "backbone IPv6 %s", s_ip6);
+            char ip6[sizeof(s_ip6)] = { 0 };
+            snprintf(ip6, sizeof(ip6), IPV6STR, IPV62STR(e->ip6_info.ip));
+            portENTER_CRITICAL(&s_wifi_status_lock);
+            memcpy(s_ip6, ip6, sizeof(s_ip6));
+            ++s_wifi_status_generation;
+            portEXIT_CRITICAL(&s_wifi_status_lock);
+            ESP_LOGI(TAG, "backbone IPv6 %s", ip6);
             xEventGroupSetBits(s_wifi_events, WIFI_BACKBONE_READY_BIT);
             /* IPv4 is not a prerequisite for Thread border routing.  Start on
              * a usable backbone IPv6 address too; the operation is idempotent
@@ -451,11 +529,26 @@ static void wifi_disconnect_for_config_switch(void)
     }
 }
 
-esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
+static esp_err_t wifi_config_from_credentials(const char *ssid, const char *pass,
+                                               wifi_config_t *cfg)
 {
-    if (ssid == NULL || pass == NULL || ssid[0] == '\0' ||
+    if (cfg == NULL || ssid == NULL || pass == NULL || ssid[0] == '\0' ||
         strlen(ssid) > sizeof(((wifi_config_t *)0)->sta.ssid) ||
         strlen(pass) > sizeof(((wifi_config_t *)0)->sta.password)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(cfg, 0, sizeof(*cfg));
+    /* Full-width driver fields do not need a trailing NUL: a 32-byte SSID
+     * and a 64-digit hexadecimal PSK are both valid Wi-Fi credentials. */
+    memcpy(cfg->sta.ssid, ssid, strlen(ssid));
+    memcpy(cfg->sta.password, pass, strlen(pass));
+    return ESP_OK;
+}
+
+esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
+{
+    wifi_config_t cfg;
+    if (wifi_config_from_credentials(ssid, pass, &cfg) != ESP_OK) {
         return ESP_ERR_INVALID_ARG;
     }
     if (s_wifi_op_lock == NULL) {
@@ -497,12 +590,6 @@ esp_err_t app_wifi_join(const char *ssid, const char *pass, uint32_t timeout_ms)
         goto done;
     }
     const bool had_previous = previous.sta.ssid[0] != '\0';
-
-    wifi_config_t cfg = { 0 };
-    /* IDF accepts full-width 32-byte SSIDs and 64-byte hexadecimal PSKs.
-     * These fixed-width driver arrays need no trailing NUL when full. */
-    memcpy(cfg.sta.ssid, ssid, strlen(ssid));
-    memcpy(cfg.sta.password, pass, strlen(pass));
 
     /* Stop the old station attempt before replacing its config. IDF can reject
      * esp_wifi_set_config() with ESP_ERR_WIFI_STATE while STA is connecting.
@@ -694,7 +781,9 @@ static int cmd_wifi(int argc, char **argv)
     }
     printf("connecting to \"%s\"...\n", argv[1]);
     if (app_wifi_join(argv[1], argv[2], 20000) == ESP_OK) {
-        printf("connected, ip=%s (saved to NVS)\n", s_ip);
+        app_wifi_status_t wifi;
+        app_wifi_get_status(&wifi);
+        printf("connected, ip=%s (saved to NVS)\n", wifi.ipv4);
         return 0;
     }
     printf("failed to connect\n");
@@ -704,12 +793,17 @@ static int cmd_wifi(int argc, char **argv)
 static int cmd_status(int argc, char **argv)
 {
     (void) argc; (void) argv;
+    app_wifi_status_t wifi;
+    app_wifi_get_status(&wifi);
+    portENTER_CRITICAL(&s_wifi_status_lock);
+    const int64_t last_conn_us = s_last_conn_us;
+    portEXIT_CRITICAL(&s_wifi_status_lock);
     wifi_ap_record_t ap;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
         printf("wifi   : \"%s\" rssi %d", (char *) ap.ssid, ap.rssi);
-        if (s_last_conn_us != 0) {
+        if (last_conn_us != 0) {
             printf(", associated %llds",
-                   (long long) ((esp_timer_get_time() - s_last_conn_us) / 1000000));
+                   (long long) ((esp_timer_get_time() - last_conn_us) / 1000000));
         }
         printf("\n");
     } else {
@@ -725,23 +819,23 @@ static int cmd_status(int argc, char **argv)
     } else {
         printf("config : no driver credentials\n");
     }
-    printf("link   : %lu disconnect(s)", (unsigned long) s_disconnect_count);
-    if (s_disconnect_count != 0) {
-        printf(", last %u (%s) %llds ago", (unsigned) s_last_disc_reason,
-               wifi_reason_name(s_last_disc_reason),
-               (long long) ((esp_timer_get_time() - s_last_disc_us) / 1000000));
+    printf("link   : %lu disconnect(s)", (unsigned long) wifi.disconnect_count);
+    if (wifi.disconnect_count != 0) {
+        printf(", last %u (%s) %llds ago", (unsigned) wifi.last_disconnect_reason,
+               wifi_reason_name(wifi.last_disconnect_reason),
+               (long long) (wifi.last_disconnect_age_ms / 1000));
     }
     printf("\n");
-    printf("retry  : supervisor %s, step %d", s_supervisor_on ? "on" : "OFF",
-           s_backoff_step);
-    if (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer)) {
+    printf("retry  : supervisor %s, step %d", wifi.supervisor_on ? "on" : "OFF",
+           wifi.retry_step);
+    if (wifi.reconnect_pending) {
         printf(", attempt pending");
     } else if (!(xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT)) {
         printf(", idle");
     }
     printf("\n");
-    printf("ip     : %s\n", s_ip);
-    printf("ipv6   : %s\n", s_ip6);
+    printf("ip     : %s\n", wifi.ipv4);
+    printf("ipv6   : %s\n", wifi.ipv6);
     printf("matter : %s (endpoint %u, window %s)\n",
            matter_status_string(matter_get_status()),
            (unsigned) matter_get_thread_border_router_endpoint_id(),
@@ -826,21 +920,22 @@ static int cmd_link(int argc, char **argv)
         printf("usage: link [drop [n]|retry|supervisor <on|off>]\n");
         return 1;
     }
+    app_wifi_status_t wifi;
+    app_wifi_get_status(&wifi);
     printf("state     : %s\n",
            (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) ? "connected"
            : s_wifi_hold ? "held down (deliberate leave)" : "disconnected");
     printf("credential: %s\n", s_have_credentials ? "configured (driver)" : "none");
     printf("supervisor: %s, backoff step %d, next delay %lu ms\n",
-           s_supervisor_on ? "on" : "off", s_backoff_step,
+           wifi.supervisor_on ? "on" : "off", wifi.retry_step,
            (unsigned long) backoff_delay_ms());
     printf("pending   : %s\n",
-           (s_reconnect_timer != NULL && esp_timer_is_active(s_reconnect_timer))
-           ? "yes" : "no");
-    printf("disconnects: %lu\n", (unsigned long) s_disconnect_count);
-    if (s_disconnect_count != 0) {
-        printf("last reason: %u (%s), %llds ago\n", (unsigned) s_last_disc_reason,
-               wifi_reason_name(s_last_disc_reason),
-               (long long) ((esp_timer_get_time() - s_last_disc_us) / 1000000));
+           wifi.reconnect_pending ? "yes" : "no");
+    printf("disconnects: %lu\n", (unsigned long) wifi.disconnect_count);
+    if (wifi.disconnect_count != 0) {
+        printf("last reason: %u (%s), %llds ago\n", (unsigned) wifi.last_disconnect_reason,
+               wifi_reason_name(wifi.last_disconnect_reason),
+               (long long) (wifi.last_disconnect_age_ms / 1000));
     }
     return 0;
 }
@@ -1394,8 +1489,10 @@ static int cmd_rest(int argc, char **argv)
         printf("REST API start requested\n");
         return 0;
     }
+    app_wifi_status_t wifi;
+    app_wifi_get_status(&wifi);
     printf("REST API : %s\n", otbr_rest_running() ? "running" : "stopped");
-    printf("URL      : http://%s:%d\n", s_ip, OTBR_REST_PORT);
+    printf("URL      : http://%s:%d\n", wifi.ipv4, OTBR_REST_PORT);
     printf("ba-epskc : %s\n", settings_get()->rest_epskc ? "registered" : "removed");
     printf("logs     : %s\n", settings_get()->rest_logs ? "registered" : "removed");
     return 0;
@@ -1510,6 +1607,66 @@ static int cmd_settings(int argc, char **argv)
     return 0;
 }
 
+typedef struct {
+    bool enable;
+    bool rotate;
+    esp_err_t result;
+} remote_change_args_t;
+
+static void do_remote_change(void *arg)
+{
+    remote_change_args_t *change = arg;
+    change->result = change->rotate ? remote_admin_rotate_key()
+                                    : remote_admin_set_enabled(change->enable);
+}
+
+static int cmd_remote(int argc, char **argv)
+{
+    if (argc == 1 || (argc == 2 && strcmp(argv[1], "status") == 0)) {
+        printf("remote management: %s; token %s; REST %s\n",
+               remote_admin_enabled() ? "enabled" : "disabled",
+               remote_admin_key_configured() ? "configured" : "not configured",
+               otbr_rest_running() ? "running" : "stopped");
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "token") == 0) {
+        char token[REMOTE_ADMIN_TOKEN_BUFFER_SIZE];
+        if (!remote_admin_get_token(token, sizeof(token))) {
+            printf("remote token unavailable; enable remote management first\n");
+            return 1;
+        }
+        /* An explicit local console request only. Never put this in ESP logs,
+         * a diagnostic bundle, HTTP response or the normal status command. */
+        printf("remote token: %s\n", token);
+        memset(token, 0, sizeof(token));
+        return 0;
+    }
+    if (argc == 2 && (!strcmp(argv[1], "enable") || !strcmp(argv[1], "disable") ||
+                      !strcmp(argv[1], "rotate"))) {
+        remote_change_args_t change = {
+            .enable = !strcmp(argv[1], "enable"),
+            .rotate = !strcmp(argv[1], "rotate"),
+            .result = ESP_FAIL,
+        };
+        if (!run_off_console(do_remote_change, &change, 10000)) {
+            printf("operation worker unavailable; remote settings were not requested\n");
+            return 1;
+        }
+        if (change.result != ESP_OK) {
+            printf("remote settings failed: %s\n", esp_err_to_name(change.result));
+            return 1;
+        }
+        printf("remote management %s%s\n", remote_admin_enabled() ? "enabled" : "disabled",
+               change.rotate ? "; token rotated" : "");
+        if (remote_admin_enabled()) {
+            printf("use 'remote token' locally to retrieve the access token\n");
+        }
+        return 0;
+    }
+    printf("usage: remote [status|enable|disable|rotate|token]\n");
+    return 1;
+}
+
 static int cmd_share(int argc, char **argv)
 {
     if (argc >= 2 && strcmp(argv[1], "stop") == 0) {
@@ -1622,9 +1779,22 @@ static void register_commands(void)
         { .command = "log", .help = "log [quiet|<level> [tag]] - console log verbosity", .func = cmd_log },
         { .command = "link", .help = "link [drop|retry|supervisor on|off] - Wi-Fi link diagnostics", .func = cmd_link },
         { .command = "reboot", .help = "restart the device", .func = cmd_reboot },
+        { .command = "remote", .help = "remote [status|enable|disable|rotate|token] - local admin setup", .func = cmd_remote },
     };
     for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
         ESP_ERROR_CHECK(esp_console_cmd_register(&cmds[i]));
+    }
+}
+
+/* Camera acquisition belongs to the same worker as preview, QR and camtest.
+ * A late boot probe must wait for an early user operation to finish instead
+ * of stopping its stream or initializing the V4L2 globals concurrently. */
+static void do_camera_probe(void *arg)
+{
+    esp_err_t *result = arg;
+    *result = qrscan_start();
+    if (*result == ESP_OK) {
+        qrscan_stop();
     }
 }
 
@@ -1652,6 +1822,9 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(err);
     settings_load();
+    if (remote_admin_init() != ESP_OK) {
+        ESP_LOGW(TAG, "remote management unavailable; local setup/recovery required");
+    }
     if (power_log_init() != ESP_OK) {
         ESP_LOGW(TAG, "battery history unavailable: no PSRAM buffer");
     }
@@ -1733,16 +1906,17 @@ void app_main(void)
         wifi_config_t stored = { 0 };
         if (esp_wifi_get_config(WIFI_IF_STA, &stored) == ESP_OK &&
             stored.sta.ssid[0] == '\0') {
-            wifi_config_t cfg = { 0 };
-            strncpy((char *) cfg.sta.ssid, CONFIG_EPSKC_WIFI_SSID,
-                    sizeof(cfg.sta.ssid) - 1);
-            strncpy((char *) cfg.sta.password, CONFIG_EPSKC_WIFI_PASSWORD,
-                    sizeof(cfg.sta.password) - 1);
-            ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
-            esp_wifi_disconnect();
-            esp_wifi_connect();
-            ESP_LOGI(TAG, "using compile-time Wi-Fi credentials for \"%s\"",
-                     CONFIG_EPSKC_WIFI_SSID);
+            wifi_config_t cfg;
+            if (wifi_config_from_credentials(CONFIG_EPSKC_WIFI_SSID,
+                                             CONFIG_EPSKC_WIFI_PASSWORD, &cfg) == ESP_OK) {
+                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &cfg));
+                esp_wifi_disconnect();
+                esp_wifi_connect();
+                ESP_LOGI(TAG, "using compile-time Wi-Fi credentials for \"%s\"",
+                         CONFIG_EPSKC_WIFI_SSID);
+            } else {
+                ESP_LOGE(TAG, "compile-time Wi-Fi credentials exceed the driver limits; ignored");
+            }
         }
     }
 
@@ -1814,9 +1988,10 @@ void app_main(void)
      * the DVP controller, including its 7680-byte DMA staging block. The compact
      * Wi-Fi buffer profile keeps enough contiguous internal RAM available when
      * a later QR scan recreates the controller. */
-    if (qrscan_start() == ESP_OK) {
-        qrscan_stop();
-    } else {
+    esp_err_t camera_probe_result = ESP_FAIL;
+    if (!ui_run_on_worker(do_camera_probe, &camera_probe_result, 30000)) {
+        ESP_LOGW(TAG, "camera boot probe skipped: operation worker unavailable");
+    } else if (camera_probe_result != ESP_OK) {
         ESP_LOGW(TAG, "camera unavailable - QR scanning disabled");
     }
     /* Start the REST lifecycle task after the camera probe; its queue already

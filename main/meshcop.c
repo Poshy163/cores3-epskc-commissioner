@@ -1,9 +1,8 @@
 /*
  * Thread 1.4 ePSKc external commissioner, ESP-IDF port.
  *
- * Ported from the PC proof-of-concept. The mbedTLS calls are identical; the two
- * things that differ on IDF are that MBEDTLS_TIMING_C is unavailable (so the
- * DTLS retransmission timers are implemented here on esp_timer) and that
+ * DTLS retransmission timers use esp_timer because MBEDTLS_TIMING_C is not
+ * available on IDF. Socket I/O and retry loops share a bounded deadline, and
  * secrets are masked by default when printing.
  */
 #include "meshcop.h"
@@ -16,8 +15,17 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "lwip/netdb.h"
+#include "lwip/sockets.h"
+#include "mbedtls/version.h"
+#if MBEDTLS_VERSION_MAJOR >= 4
+#include "psa/crypto.h"
+#else
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
+#endif
 #include "mbedtls/net_sockets.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/ssl_ciphersuites.h"
@@ -26,6 +34,114 @@ static const char *TAG = "meshcop";
 
 #define URI_PETITION   "cp"
 #define URI_ACTIVE_GET "ag"
+
+/* An absent peer must not hold the application's single fetch worker forever.
+ * The reply limit includes empty ACKs and WANT_READ/WRITE retries. */
+#define FETCH_TIMEOUT_MS 30000
+#define REPLY_TIMEOUT_MS 5000
+
+typedef struct {
+    mbedtls_net_context net;
+    int64_t deadline_us;
+} meshcop_transport_t;
+
+static bool deadline_expired(int64_t deadline_us)
+{
+    return esp_timer_get_time() >= deadline_us;
+}
+
+static bool io_would_block(int ret)
+{
+    return ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE;
+}
+
+static int transport_send(void *ctx, const unsigned char *buf, size_t len)
+{
+    meshcop_transport_t *transport = ctx;
+    if (deadline_expired(transport->deadline_us)) {
+        return MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+    return mbedtls_net_send(&transport->net, buf, len);
+}
+
+static int transport_recv(void *ctx, unsigned char *buf, size_t len)
+{
+    meshcop_transport_t *transport = ctx;
+    if (deadline_expired(transport->deadline_us)) {
+        return MBEDTLS_ERR_SSL_TIMEOUT;
+    }
+    return mbedtls_net_recv(&transport->net, buf, len);
+}
+
+/* Discovery supplies numeric IP addresses. AI_NUMERICHOST also accepts scoped
+ * IPv6 literals and prevents a CLI typo from starting an unbounded DNS lookup.
+ * UDP connect does not wait for a peer; all subsequent I/O is nonblocking. */
+static int transport_connect(meshcop_transport_t *transport, const char *addr,
+                             const char *port)
+{
+    struct addrinfo hints = { 0 };
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+    hints.ai_flags = AI_NUMERICHOST;
+    struct addrinfo *addresses = NULL;
+    if (getaddrinfo(addr, port, &hints, &addresses) != 0) {
+        return MBEDTLS_ERR_NET_UNKNOWN_HOST;
+    }
+
+    int ret = MBEDTLS_ERR_NET_CONNECT_FAILED;
+    for (struct addrinfo *a = addresses; a != NULL; a = a->ai_next) {
+        if (deadline_expired(transport->deadline_us)) {
+            ret = MBEDTLS_ERR_SSL_TIMEOUT;
+            break;
+        }
+        transport->net.fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (transport->net.fd < 0) {
+            ret = MBEDTLS_ERR_NET_SOCKET_FAILED;
+            continue;
+        }
+        ret = mbedtls_net_set_nonblock(&transport->net);
+        if (ret == 0 && connect(transport->net.fd, a->ai_addr, a->ai_addrlen) == 0) {
+            break;
+        }
+        if (ret == 0) {
+            ret = MBEDTLS_ERR_NET_CONNECT_FAILED;
+        }
+        mbedtls_net_free(&transport->net);
+    }
+    freeaddrinfo(addresses);
+    return ret;
+}
+
+static int handshake_until(mbedtls_ssl_context *ssl, int64_t deadline_us)
+{
+    for (;;) {
+        if (deadline_expired(deadline_us)) {
+            return MBEDTLS_ERR_SSL_TIMEOUT;
+        }
+        int ret = mbedtls_ssl_handshake(ssl);
+        if (!io_would_block(ret)) {
+            return deadline_expired(deadline_us) ? MBEDTLS_ERR_SSL_TIMEOUT : ret;
+        }
+        vTaskDelay(1);
+    }
+}
+
+static int write_until(mbedtls_ssl_context *ssl, const uint8_t *buf, size_t len,
+                       int64_t deadline_us)
+{
+    for (;;) {
+        if (deadline_expired(deadline_us)) {
+            return MBEDTLS_ERR_SSL_TIMEOUT;
+        }
+        int ret = mbedtls_ssl_write(ssl, buf, len);
+        if (!io_would_block(ret)) {
+            return deadline_expired(deadline_us) ? MBEDTLS_ERR_SSL_TIMEOUT : ret;
+        }
+        /* Mbed TLS requires the same buffer and length after WANT_WRITE. */
+        vTaskDelay(1);
+    }
+}
 
 const char *meshcop_tlv_name(unsigned type)
 {
@@ -122,19 +238,34 @@ static size_t coap_post(uint8_t *buf, const char *uri,
  * naive read-once treats the next request's reply as belonging to this one.
  */
 /* Read until a message with an actual payload arrives, skipping empty ACKs. */
-static int read_real_response(mbedtls_ssl_context *ssl, uint8_t *buf, size_t cap)
+static int read_real_response(mbedtls_ssl_context *ssl, uint8_t *buf, size_t cap,
+                              int64_t fetch_deadline_us)
 {
-    for (int attempt = 0; attempt < 4; attempt++) {
+    int64_t deadline_us = esp_timer_get_time() + (int64_t) REPLY_TIMEOUT_MS * 1000;
+    if (deadline_us > fetch_deadline_us) {
+        deadline_us = fetch_deadline_us;
+    }
+    for (;;) {
+        if (deadline_expired(deadline_us)) {
+            return MBEDTLS_ERR_SSL_TIMEOUT;
+        }
         int ret = mbedtls_ssl_read(ssl, buf, cap);
+        if (io_would_block(ret)) {
+            vTaskDelay(1);
+            continue;
+        }
         if (ret <= 0) {
             return ret;
+        }
+        if (deadline_expired(deadline_us)) {
+            return MBEDTLS_ERR_SSL_TIMEOUT;
         }
         if (!meshcop_coap_is_empty_ack(buf, ret)) {
             return ret;
         }
         ESP_LOGD(TAG, "empty ACK, waiting for separate response");
+        vTaskDelay(1);
     }
-    return -1;
 }
 
 void meshcop_print_tlvs(const uint8_t *p, size_t len, bool reveal)
@@ -228,34 +359,51 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         snprintf(s_last_error, sizeof(s_last_error), "Invalid connection details");
         return ESP_ERR_INVALID_ARG;
     }
-    int ret;
+    int ret = 0;
     *dataset_len = 0;
     esp_err_t err = ESP_FAIL;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%u", port);
 
-    mbedtls_net_context fd;
+    meshcop_transport_t transport = {
+        .deadline_us = esp_timer_get_time() + (int64_t) FETCH_TIMEOUT_MS * 1000,
+    };
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context drbg;
+#endif
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     dtls_timer_t timer = { 0 };
 
-    mbedtls_net_init(&fd);
+    mbedtls_net_init(&transport.net);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&drbg);
+#endif
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
 
+#if MBEDTLS_VERSION_MAJOR >= 4
+    /* Mbed TLS 4 uses the shared PSA RNG; the application no longer provides a
+     * DRBG callback. Initialization is idempotent and failures must stop TLS. */
+    if ((ret = psa_crypto_init()) != PSA_SUCCESS) {
+        ESP_LOGE(TAG, "psa_crypto_init: %d", ret);
+        snprintf(s_last_error, sizeof(s_last_error), "Could not initialize secure connection");
+        goto done;
+    }
+#else
     const char *pers = "epskc";
     if ((ret = mbedtls_ctr_drbg_seed(&drbg, mbedtls_entropy_func, &entropy,
                                      (const unsigned char *) pers, strlen(pers))) != 0) {
         ESP_LOGE(TAG, "ctr_drbg_seed: -0x%04x", (unsigned) -ret);
+        snprintf(s_last_error, sizeof(s_last_error), "Could not initialize secure connection");
         goto done;
     }
+#endif
 
     ESP_LOGI(TAG, "connecting UDP %s:%s", addr, port_str);
-    if ((ret = mbedtls_net_connect(&fd, addr, port_str, MBEDTLS_NET_PROTO_UDP)) != 0) {
+    if ((ret = transport_connect(&transport, addr, port_str)) != 0) {
         ESP_LOGE(TAG, "net_connect: -0x%04x", (unsigned) -ret);
         set_err("Could not reach the router (-0x%04x)", ret);
         goto done;
@@ -271,7 +419,10 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
     static const int ciphers[] = { MBEDTLS_TLS_ECJPAKE_WITH_AES_128_CCM_8, 0 };
     mbedtls_ssl_conf_ciphersuites(&conf, ciphers);
     mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &drbg);
+#endif
+    mbedtls_ssl_conf_handshake_timeout(&conf, 1000, 8000);
 
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0) {
         ESP_LOGE(TAG, "ssl_setup: -0x%04x", (unsigned) -ret);
@@ -283,41 +434,38 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         goto done;
     }
 
-    mbedtls_ssl_set_bio(&ssl, &fd, mbedtls_net_send, mbedtls_net_recv,
-                        mbedtls_net_recv_timeout);
+    mbedtls_ssl_set_bio(&ssl, &transport, transport_send, transport_recv, NULL);
     mbedtls_ssl_set_timer_cb(&ssl, &timer, timer_set_delay, timer_get_delay);
 
     ESP_LOGI(TAG, "DTLS handshake (EC-JPAKE), internal heap free %u",
              (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
-        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-            /* Distinguish "we could not send" from "the peer rejected us" --
-             * reporting a transport failure as a bad passcode sends debugging
-             * in entirely the wrong direction. */
-            const char *why;
-            switch (ret) {
-            case MBEDTLS_ERR_NET_SEND_FAILED:
-            case MBEDTLS_ERR_NET_RECV_FAILED:
-            case MBEDTLS_ERR_NET_CONN_RESET:
-                why = "router unreachable or out of buffers";
-                break;
-            case MBEDTLS_ERR_SSL_TIMEOUT:
-                why = "timed out, router not responding";
-                break;
-            case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
-            case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:
-                why = "wrong passcode or key already used";
-                break;
-            default:
-                why = "unexpected";
-                break;
-            }
-            ESP_LOGE(TAG, "handshake FAILED: -0x%04x (%s); internal heap free %u",
-                     (unsigned) -ret, why,
-                     (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-            snprintf(s_last_error, sizeof(s_last_error), "Handshake failed: %s", why);
-            goto done;
+    if ((ret = handshake_until(&ssl, transport.deadline_us)) != 0) {
+        /* Distinguish "we could not send" from "the peer rejected us" --
+         * reporting a transport failure as a bad passcode sends debugging
+         * in entirely the wrong direction. */
+        const char *why;
+        switch (ret) {
+        case MBEDTLS_ERR_NET_SEND_FAILED:
+        case MBEDTLS_ERR_NET_RECV_FAILED:
+        case MBEDTLS_ERR_NET_CONN_RESET:
+            why = "router unreachable or out of buffers";
+            break;
+        case MBEDTLS_ERR_SSL_TIMEOUT:
+            why = "timed out, router not responding";
+            break;
+        case MBEDTLS_ERR_SSL_HANDSHAKE_FAILURE:
+        case MBEDTLS_ERR_SSL_FATAL_ALERT_MESSAGE:
+            why = "wrong passcode or key already used";
+            break;
+        default:
+            why = "unexpected";
+            break;
         }
+        ESP_LOGE(TAG, "handshake FAILED: -0x%04x (%s); internal heap free %u",
+                 (unsigned) -ret, why,
+                 (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        snprintf(s_last_error, sizeof(s_last_error), "Handshake failed: %s", why);
+        goto done;
     }
     ESP_LOGI(TAG, "handshake OK: %s", mbedtls_ssl_get_ciphersuite(&ssl));
 
@@ -334,12 +482,12 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         pn += strlen(cid);
 
         size_t n = coap_post(out, URI_PETITION, pl, pn);
-        if ((ret = mbedtls_ssl_write(&ssl, out, n)) <= 0) {
+        if ((ret = write_until(&ssl, out, n, transport.deadline_us)) <= 0) {
             ESP_LOGE(TAG, "petition write: -0x%04x", (unsigned) -ret);
             set_err("Petition send failed (-0x%04x)", ret);
             goto done;
         }
-        ret = read_real_response(&ssl, in, sizeof(in));
+        ret = read_real_response(&ssl, in, sizeof(in), transport.deadline_us);
         if (ret <= 0) {
             ESP_LOGE(TAG, "petition read failed: -0x%04x", (unsigned) -ret);
             set_err("No reply to petition (-0x%04x)", ret);
@@ -360,12 +508,12 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
         ESP_LOGI(TAG, "petition response accepted (%d bytes)", ret);
 
         n = coap_post(out, URI_ACTIVE_GET, NULL, 0);
-        if ((ret = mbedtls_ssl_write(&ssl, out, n)) <= 0) {
+        if ((ret = write_until(&ssl, out, n, transport.deadline_us)) <= 0) {
             ESP_LOGE(TAG, "active_get write: -0x%04x", (unsigned) -ret);
             set_err("Dataset request failed (-0x%04x)", ret);
             goto done;
         }
-        ret = read_real_response(&ssl, in, sizeof(in));
+        ret = read_real_response(&ssl, in, sizeof(in), transport.deadline_us);
         if (ret <= 0) {
             ESP_LOGE(TAG, "active_get read: -0x%04x", (unsigned) -ret);
             set_err("No dataset reply (-0x%04x)", ret);
@@ -398,10 +546,15 @@ esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *pas
     mbedtls_ssl_close_notify(&ssl);
 
 done:
-    mbedtls_net_free(&fd);
+    if (ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+        err = ESP_ERR_TIMEOUT;
+    }
+    mbedtls_net_free(&transport.net);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ctr_drbg_free(&drbg);
     mbedtls_entropy_free(&entropy);
+#endif
     return err;
 }

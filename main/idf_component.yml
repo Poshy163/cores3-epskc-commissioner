@@ -1,11 +1,13 @@
 dependencies:
   idf:
-    version: ">=5.4"
+    version: "6.0.2"
   espressif/m5stack_core_s3:
-    version: "^4"
+    version: "4.1.0"
   espressif/mdns:
-    version: "^1"
+    version: "1.14.0"
   espressif/quirc:
-    version: "^1.2"
+    version: "1.2.0"
   espressif/esp_matter:
-    version: "1.5.1"
+    version: "1.6.1"
+  lvgl/lvgl:
+    version: "9.6.0~1"

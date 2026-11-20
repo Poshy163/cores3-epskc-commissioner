@@ -25,6 +25,7 @@
 #define HALF_MAGIC 0x48474f4cu   /* "LOGH" */
 #define PENDING_SLOTS 4
 #define FORMAT_BUFFER 192
+#define DUPLICATE_RETAIN_MS 60000u
 #define MSYNC_FLAGS (ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA | \
                      ESP_CACHE_MSYNC_FLAG_UNALIGNED)
 
@@ -40,7 +41,11 @@ typedef struct {
     uint32_t magic;
     uint32_t boot_count;
     uint64_t boot_id;
-    uint8_t reserved[48];
+    /* Reuse the old reserved header, preserving slot alignment/layout. The
+     * complement rejects uninitialised headers from older firmware. */
+    uint32_t duplicate_mle_count;
+    uint32_t duplicate_mle_check;
+    uint8_t reserved[40];
     slot_t slots[LOG_RING_LINES];
 } half_t;
 
@@ -74,6 +79,8 @@ static uint32_t s_latest, s_last_ms;
 static uint32_t s_prev_latest, s_prev_last_ms;
 static bool s_writeback;
 static vprintf_like_t s_console;
+static bool s_duplicate_seen;
+static uint32_t s_duplicate_last_ms, s_duplicate_since;
 
 static uint32_t slot_check(const slot_t *s, uint64_t boot_id)
 {
@@ -179,7 +186,12 @@ static void finish_locked(slot_t *s, uint32_t seq, uint32_t now_ms)
  * committed slots out so a crash right after a line still keeps it. */
 static void write_back(uint32_t first, uint32_t last)
 {
-    if (!s_writeback || first == 0) {
+    if (!s_writeback) {
+        return;
+    }
+    /* Persist the event count even when this occurrence was coalesced. */
+    esp_cache_msync(s_cur, offsetof(half_t, slots), MSYNC_FLAGS);
+    if (first == 0) {
         return;
     }
     if (last - first >= LOG_RING_LINES) {
@@ -206,16 +218,42 @@ static void note_written(uint32_t seq, uint32_t *first, uint32_t *last)
 static void commit_locked(pending_t *p, const char *seg, size_t seg_len, uint32_t now_ms,
                           uint32_t *first, uint32_t *last)
 {
-    uint32_t seq;
-    slot_t *s = begin_locked(&seq);
+    char text[LOG_RING_TEXT];
     size_t used = 0;
     if (p) {
-        memcpy(s->text, p->text, p->len + 1);
+        memcpy(text, p->text, p->len + 1);
         used = p->len;
         p->task = NULL;
         p->len = 0;
     }
-    append_clean(s->text, used, seg, seg_len);
+    append_clean(text, used, seg, seg_len);
+    /* Only these exact, noisy OpenThread warnings (IDF 5 and 6 formatting)
+     * are coalesced in the retained ring. Console output and replay rejection
+     * remain unchanged. Other warnings and extra peer details stay untouched. */
+    const char *mle = strstr(text, "OPENTHREAD:");
+    if (mle &&
+        (!strcmp(mle, "OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated") ||
+         !strcmp(mle, "OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated"))) {
+        if (s_cur->duplicate_mle_count != UINT32_MAX) {
+            ++s_cur->duplicate_mle_count;
+        }
+        s_cur->duplicate_mle_check = ~s_cur->duplicate_mle_count;
+        ++s_duplicate_since;
+        if (s_duplicate_seen && now_ms - s_duplicate_last_ms < DUPLICATE_RETAIN_MS) {
+            return;
+        }
+        if (s_duplicate_seen) {
+            size_t n = strlen(text);
+            snprintf(text + n, sizeof(text) - n, " [count %" PRIu32 ", total %" PRIu32 "]",
+                     s_duplicate_since, s_cur->duplicate_mle_count);
+        }
+        s_duplicate_seen = true;
+        s_duplicate_last_ms = now_ms;
+        s_duplicate_since = 0;
+    }
+    uint32_t seq;
+    slot_t *s = begin_locked(&seq);
+    memcpy(s->text, text, strlen(text) + 1);
     finish_locked(s, seq, now_ms);
     note_written(seq, first, last);
 }
@@ -354,6 +392,8 @@ esp_err_t log_ring_init(void)
     half_t *h = &r->half[r->active];
     h->magic = 0;
     h->boot_count = r->boot_count;
+    h->duplicate_mle_count = 0;
+    h->duplicate_mle_check = UINT32_MAX;
     esp_fill_random(&h->boot_id, sizeof(h->boot_id));
     h->magic = HALF_MAGIC;
 
@@ -363,6 +403,8 @@ esp_err_t log_ring_init(void)
         esp_cache_msync(h, offsetof(half_t, slots), MSYNC_FLAGS);
     }
     s_latest = 0;
+    s_duplicate_seen = false;
+    s_duplicate_last_ms = s_duplicate_since = 0;
     s_cur = h;
     s_console = esp_log_set_vprintf(capture_vprintf);
     return ESP_OK;
@@ -399,6 +441,8 @@ bool log_ring_info(log_ring_boot_t boot, log_ring_info_t *out)
     out->latest_seq = latest;
     out->oldest_seq = latest == 0 ? 0 : latest > LOG_RING_LINES ? latest - LOG_RING_LINES + 1 : 1;
     out->last_uptime_ms = h == s_cur ? s_last_ms : s_prev_last_ms;
+    out->duplicate_mle_count = h->duplicate_mle_check == ~h->duplicate_mle_count
+                                  ? h->duplicate_mle_count : 0;
     portEXIT_CRITICAL(&s_lock);
     return true;
 }

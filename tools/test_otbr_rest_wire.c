@@ -5,6 +5,14 @@
 
 int main(void)
 {
+    assert(otbr_rest_parse_reboot("\"reboot\""));
+    assert(otbr_rest_parse_reboot(" \t\r\n\"reboot\" \r\n"));
+    assert(!otbr_rest_parse_reboot(NULL));
+    assert(!otbr_rest_parse_reboot("reboot"));
+    assert(!otbr_rest_parse_reboot("\"reboot\" extra"));
+    assert(!otbr_rest_parse_reboot("\"reboot\"\v"));
+    assert(!otbr_rest_parse_reboot("\f\"reboot\""));
+
     char body[8] = { 'a', 'b', 'c' };
     assert(otbr_rest_terminate_body(body, 3, sizeof(body)));
     assert(strcmp(body, "abc") == 0);

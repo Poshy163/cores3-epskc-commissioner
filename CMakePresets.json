@@ -2,16 +2,16 @@
   "version": 3,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 16,
+    "minor": 22,
     "patch": 0
   },
   "configurePresets": [
     {
       "name": "esp32s3",
-      "displayName": "ESP32-S3 (ESP-IDF)",
-      "description": "Mirrors what idf.py configures, so CLion and the CLI share build/ without fighting over the cache.",
+      "displayName": "ESP32-S3 (ESP-IDF 6.0.2)",
+      "description": "Mirrors idf.py and keeps the ESP-IDF 6 build separate from earlier SDK caches.",
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build/idf6",
       "cacheVariables": {
         "IDF_TARGET": "esp32s3",
         "CCACHE_ENABLE": "1",

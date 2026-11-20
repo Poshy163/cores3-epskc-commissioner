@@ -9,6 +9,24 @@
 
 /* Small, allocation-free wire helpers kept separate so their edge cases can
  * be exercised by a host compiler as well as the firmware build. */
+static inline bool otbr_rest_parse_reboot(const char *body)
+{
+    if (body == NULL) {
+        return false;
+    }
+    while (*body == ' ' || *body == '\t' || *body == '\r' || *body == '\n') {
+        ++body;
+    }
+    if (strncmp(body, "\"reboot\"", 8) != 0) {
+        return false;
+    }
+    body += 8;
+    while (*body == ' ' || *body == '\t' || *body == '\r' || *body == '\n') {
+        ++body;
+    }
+    return *body == '\0';
+}
+
 static inline bool otbr_rest_terminate_body(char *buf, size_t length, size_t capacity)
 {
     if (buf == NULL || length >= capacity || memchr(buf, '\0', length) != NULL) {

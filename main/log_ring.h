@@ -37,6 +37,7 @@ typedef struct {
     uint32_t boot_count;       /* consecutive boots without a power cut */
     uint32_t oldest_seq, latest_seq;
     uint32_t last_uptime_ms;   /* uptime of the newest line */
+    uint32_t duplicate_mle_count; /* all occurrences, including coalesced lines */
 } log_ring_info_t;
 
 /* Install the esp_log hook and recover the previous boot's lines. Call once,

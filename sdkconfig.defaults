@@ -55,6 +55,7 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # EC-JPAKE is the whole point: off by default, and DTLS needs turning on too.
 CONFIG_MBEDTLS_ECJPAKE_C=y
 CONFIG_MBEDTLS_KEY_EXCHANGE_ECJPAKE=y
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_CCM_C=y
 CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
@@ -73,10 +74,8 @@ CONFIG_LWIP_IPV6=y
 # the LAN and led UniFi to fingerprint this one as a Mysa thermostat.
 CONFIG_LWIP_LOCAL_HOSTNAME="cores3-thread-br"
 
-# OpenThread host stack driving the on-board ESP32-H2 over spinel/UART, so the
-# device can actually attach to the network whose credentials it retrieved.
-# MTD rather than FTD: it only needs to join as a child, and FTD costs more RAM
-# than this board has spare.
+# OpenThread full-device host stack driving the on-board ESP32-H2 over
+# Spinel/UART. A border router needs FTD support and an always-listening radio.
 CONFIG_OPENTHREAD_ENABLED=y
 # FTD, not MTD: the spinel/RCP callbacks IDF's radio port calls
 # (SetCompatibilityErrorCallback, SetCoprocessorResetFailureCallback) are only
@@ -89,8 +88,7 @@ CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
 # the H2 RCP with its own front end, and the hardware-validated build has it on;
 # without this line a fresh (CI) configuration silently differs.
 CONFIG_OPENTHREAD_RX_ON_WHEN_IDLE=y
-# 1024 buffers is a 128 KB pool -- far more than a joining end device needs,
-# and this board has no internal RAM to spare for it.
+# Bound the message pool to preserve internal RAM for the camera and radio.
 CONFIG_OPENTHREAD_NUM_MESSAGE_BUFFERS=128
 CONFIG_OPENTHREAD_CLI=n
 CONFIG_OPENTHREAD_DIAG=n
@@ -102,7 +100,6 @@ CONFIG_OPENTHREAD_LOG_LEVEL_NOTE=y
 # need the end-device SRP and DNS client roles linked into the host stack.
 CONFIG_OPENTHREAD_SRP_CLIENT=n
 CONFIG_OPENTHREAD_DNS_CLIENT=n
-CONFIG_MBEDTLS_HKDF_C=y
 CONFIG_VFS_SUPPORT_SELECT=y
 
 # Border Router. This is what publishes _meshcop._udp over Wi-Fi and makes the
@@ -127,7 +124,7 @@ CONFIG_LWIP_FORCE_ROUTER_FORWARDING=y
 # Heavy work is deferred off `sys_evt` to its own task rather than relying on
 # this figure -- an event handler is the wrong place for stack-hungry init.
 
-# Matter 1.5.1 Thread Border Router device type (0x0091).  Use the shared IDF
+# ESP-Matter 1.6.1 Thread Border Router device type (0x0091). Use the shared IDF
 # mDNS responder and ESP-IDF border-router route hook, not duplicate CHIP
 # implementations.  The existing app remains the Wi-Fi connection owner.
 CONFIG_THREAD_NETWORK_COMMISSIONING_DRIVER=n
@@ -288,6 +285,18 @@ CONFIG_SUPPORT_WINDOW_COVERING_CLUSTER=n
 CONFIG_SUPPORT_WATER_HEATER_MANAGEMENT_CLUSTER=n
 CONFIG_SUPPORT_WATER_HEATER_MODE_CLUSTER=n
 CONFIG_SUPPORT_ZONE_MANAGEMENT_CLUSTER=n
+# ESP-Matter 1.6 adds these default-on clusters. This appliance exposes only
+# its root, Thread border router and battery power source endpoints.
+CONFIG_SUPPORT_AMBIENT_CONTEXT_SENSING_CLUSTER=n
+CONFIG_SUPPORT_HUMIDISTAT_CLUSTER=n
+CONFIG_SUPPORT_MEDIA_FILE_MANAGEMENT_CLUSTER=n
+CONFIG_SUPPORT_NETWORK_IDENTITY_MANAGEMENT_CLUSTER=n
+CONFIG_SUPPORT_PROXIMITY_RANGING_CLUSTER=n
+CONFIG_SUPPORT_FLOW_MEASUREMENT_CLUSTER=n
+CONFIG_SUPPORT_ILLUMINANCE_MEASUREMENT_CLUSTER=n
+CONFIG_SUPPORT_PRESSURE_MEASUREMENT_CLUSTER=n
+CONFIG_SUPPORT_RELATIVE_HUMIDITY_MEASUREMENT_CLUSTER=n
+CONFIG_SUPPORT_TEMPERATURE_MEASUREMENT_CLUSTER=n
 
 # LVGL fonts used by the status screen.
 CONFIG_LV_FONT_MONTSERRAT_14=y
@@ -305,6 +314,7 @@ CONFIG_LV_FONT_MONTSERRAT_20=y
 # the driver derives a 7680-byte staging buffer and recreates it on every
 # STREAMON. The reduced Wi-Fi RX/TX footprint above leaves that contiguous
 # internal block available while cache-sensitive task stacks remain internal.
+CONFIG_CAM_CTRL_DVP_ENABLE=y
 CONFIG_CAM_CTRL_DVP_DMA_BUFFER_SIZE=8192
 
 CONFIG_CAMERA_GC0308=y

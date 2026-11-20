@@ -1,6 +1,6 @@
 # CoreS3 Thread Border Router + Matter
 
-Firmware that turns an [M5Stack CoreS3 Thread BR](https://docs.m5stack.com/en/core/CoreS3_Thread_BR) into a Thread 1.4 border router you can drive from the touch screen. It does both halves of ePSKc: it can **fetch** credentials from another border router, and **hand its own out** to a commissioner. It also serves the OpenThread Border Router REST API and exposes the standard Matter 1.5.1 Thread Border Router device type (`0x0091`), so Home Assistant can manage it as both an OTBR and a Matter node.
+Firmware that turns an [M5Stack CoreS3 Thread BR](https://docs.m5stack.com/en/core/CoreS3_Thread_BR) into a Thread 1.4 border router you can drive from the touch screen. It does both halves of ePSKc: it can **fetch** credentials from another border router, and **hand its own out** to a commissioner. It also serves the OpenThread Border Router REST API and uses ESP-Matter 1.6.1 to expose the standard Thread Border Router device type (`0x0091`), so Home Assistant can manage it as both an OTBR and a Matter node.
 
 ## Web flashing
 
@@ -57,6 +57,9 @@ A new password is tested in RAM and only written to flash once it has actually c
 
 Failures name the stage that went wrong rather than sending you to the serial log.
 
+The camera preview uses the sensor's native orientation. QR decoding retries
+mirrored codes, so a mirrored preview does not prevent scanning.
+
 ## Running its own network
 
 **New network** generates fresh credentials (random key, PSKc, extended PAN, channel), forms the network and becomes leader. It appears in Home Assistant's Thread panel as a separate network named `CoreS3-XXXX`. Handy for validating things against a mesh that is yours alone.
@@ -90,9 +93,97 @@ The `ba-epskc` endpoints follow [python-otbr-api #267](https://github.com/home-a
 
 Plain HTTP with no authentication, exactly like ot-br-posix: anyone who can reach port 8081 can read the Active Operational Dataset, which contains the network key. Keep it on a trusted network.
 
+### Optional remote management
+
+The packaged image and its validation/deployment status are recorded in
+[`firmware/build-info.json`](firmware/build-info.json), including whether it
+has been tested on hardware and deployed.
+
+Remote management adds a provisioning-preserving reboot and a health snapshot
+on the same port. It is **disabled by default** and uses a unique, randomly
+generated 256-bit device token. The standard OTBR endpoints above keep their
+existing behavior for Home Assistant compatibility.
+
+Set it up once using the USB console after installing this firmware:
+
+```text
+remote enable
+remote token
+```
+
+Save the displayed token in a private file outside the repository. `remote
+status` reports whether management is enabled without showing the token;
+`remote disable` closes access while retaining the token; `remote rotate`
+replaces the token and immediately invalidates the old one. These changes are
+persisted in the settings namespace. Factory reset clears the token along with
+the settings. No token is compiled into the firmware, returned by HTTP, or
+included in the ordinary status/log output.
+
+| Endpoint | Method | Behavior |
+| --- | --- | --- |
+| `/device/status` | GET | Authenticated JSON health snapshot |
+| `/device/reboot` | POST | Requires JSON string `"reboot"`; responds `202 Accepted` and queues one reboot |
+
+Both require `Authorization: Bearer <device-token>`. Disabled management
+returns 503; missing, malformed or incorrect authorization returns 401. Tokens
+in URLs or cookies are not accepted. This uses the existing **plain HTTP**
+transport: authentication does not encrypt the token or status. Use a trusted
+LAN or VPN; do not expose the port to the Internet.
+
+The reboot worker waits for the HTTP reply to finish, then allows a short grace
+period before calling the same normal reboot path as the touchscreen. Duplicate
+requests while a reboot is pending do not queue additional reboots. A failed or
+lost response can leave the outcome unknown; verify the new boot ID instead of
+blindly retrying. The route does not erase Wi-Fi, Thread or Matter provisioning.
+
+`/device/status` includes firmware/ELF identity, uptime and reset reason, Wi-Fi
+association age/RSSI/channel/reconnect count and reason, retry state, internal
+heap/free-largest-minimum and PSRAM, LVGL stack headroom, Thread attachment and
+traffic counters, Matter commissioning state, and cached power/log counters.
+Wi-Fi disconnect counts include deliberate leaves and provisioning attempts.
+Unavailable ages/signals are `null`; Thread can be reported unavailable if its
+100 ms diagnostic lock attempt times out. Cached power exposes its sample age
+and `fresh` flag (valid and no older than 30 seconds), so a stale reading is not
+presented as a fresh measurement. No Wi-Fi password, active dataset, TAP or
+Matter onboarding code is included.
+
+The PC helper accepts the token file or `CORES3_REMOTE_TOKEN`; it has no
+command-line token argument:
+
+```powershell
+python tools/remote.py --ip 192.168.1.62 --token-file C:\private\cores3.token status
+python tools/remote.py --ip 192.168.1.62 --token-file C:\private\cores3.token reboot
+python tools/remote.py --ip 192.168.1.62 --token-file C:\private\cores3.token bundle --output C:\private\cores3-diagnostics.zip
+```
+
+The reboot helper sends the POST once, then observes boot identity and reported
+Wi-Fi/Thread/Matter recovery for up to 90 seconds. A 202 response alone is not a
+successful reboot. It also verifies unchanged firmware and commissioning state;
+that check does not establish exact fabric identity or an end-to-end Thread
+traffic test. Requests bypass proxies and refuse redirects, preventing an
+authorization header from being forwarded elsewhere.
+
+`bundle` collects allowlisted status, paged current/previous logs and cached
+power history into a new ZIP or JSON file. It does not request dataset, ePSKc
+key, onboarding or token endpoints. Free-form log redaction is pattern based;
+review a bundle before sharing it. Existing REST/log exposure switches still
+apply, and missing history is reported rather than fabricated.
+
+Useful next remote features are OTA with signed-image validation and rollback
+(requires a separate partition-layout migration), Home Assistant alerts for
+repeated reconnects/Thread detachment or falling heap, a short diagnostic log
+window that automatically returns to quiet mode, and a screen identify
+action. This release implements reboot, health reporting and diagnostic export;
+those further controls are not implemented yet.
+
 ### Logs over Wi-Fi
 
-Every line the firmware logs, including Matter and OpenThread, is also kept in PSRAM: the last 1,024 lines of this boot and the last 1,024 of the previous one. `GET /logs` serves them, so seeing what the device has been doing no longer needs a USB cable.
+Firmware logs, including Matter and OpenThread, are also kept in PSRAM: the last 1,024 retained lines of this boot and the last 1,024 of the previous one. `GET /logs` serves them, so seeing what the device has been doing no longer needs a USB cable.
+
+Repeated identical OpenThread MLE duplicate warnings occupy at most one retained
+line per minute, keeping other diagnostics visible. The `/logs` JSON field
+`duplicate_mle_count` counts every occurrence, including coalesced lines; the
+text response includes the same count in its header. USB console output is unchanged.
 
 | Query | Meaning |
 |---|---|
@@ -233,17 +324,37 @@ If either NVS partition cannot initialize, boot preserves its contents instead o
 
 ## Building
 
-See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` uses that local install, reuses `build/` and ccache, so a rebuild after a source edit takes seconds. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
+See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.0.2 SDK and reuses `build/idf6/` and ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
 
 ```powershell
 .\build-native.ps1 -Port COM5
 ```
 
-`build.ps1` uses the same ESP-IDF v5.5.4 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
+For the first ESP-IDF 5.5 to 6.0 upgrade, retain a verified full-flash backup
+and use `-Full` to update the bootloader, the unchanged partition table and app
+as separate ranges. This preserves both NVS partitions. Subsequent app updates
+can use the default app-only flash:
+
+```powershell
+.\build-native.ps1 -Port COM5 -Full
+```
+
+`build.ps1` uses the same ESP-IDF v6.0.2 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Its `epskc-work-idf6` volume keeps the build cache separate from the earlier SDK. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
 
 ```powershell
 .\build.ps1 -Port COM5
 ```
+
+The manifest pins ESP-IDF 6.0.2, ESP-Matter 1.6.1, CoreS3 BSP 4.1.0,
+mDNS 1.14.0, LVGL 9.6.0~1 and quirc 1.2.0. `dependencies.lock` fixes the
+compatible transitive graph. The upstream BSP still requires `esp_video ~2.0`
+and `esp_codec_dev ~1.5`; retain those supported ranges rather than overriding
+them to newer video/audio releases. Camera scanning handles mirrored QR codes
+without depending on an internal video sensor accessor.
+
+Project CMake supplies the Scenes helpers required by ESP-Matter 1.6.1's legacy
+command dispatcher when unused lighting/Scenes clusters are disabled. The
+workaround is limited to that SDK version and does not create a Scenes endpoint.
 
 CI publishes four files under `firmware/`:
 

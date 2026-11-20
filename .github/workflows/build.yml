@@ -33,10 +33,10 @@ jobs:
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.5.4
+          esp_idf_version: v6.0.2
           target: esp32s3
           command: |
-            idf.py build
+            idf.py -B build build
             mkdir -p firmware
             cp build/bootloader/bootloader.bin firmware/bootloader.bin
             cp build/partition_table/partition-table.bin firmware/partition-table.bin

@@ -7,20 +7,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <string.h>
 
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "device_status.h"
 #include "log_ring.h"
 #include "power_log.h"
+#include "remote_admin.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "settings.h"
 #include "thread.h"
 #include "ui.h"
+#include "wifi_ctl.h"
 
 static const char *TAG = "otbr_rest";
 static httpd_handle_t s_server;
@@ -29,6 +33,7 @@ typedef enum {
     REST_CONTROL_RUNNING,
     REST_CONTROL_EPSKC,
     REST_CONTROL_LOGS,
+    REST_CONTROL_REBOOT,
 } rest_control_type_t;
 
 typedef struct {
@@ -39,6 +44,9 @@ typedef struct {
 static QueueHandle_t s_control_queue;
 static TaskHandle_t s_control_task;
 static bool s_control_start_failed;
+static atomic_bool s_reboot_pending;
+static atomic_bool s_reboot_reply_done;
+static bool request_control(rest_control_type_t type, bool on);
 
 /* A group of routes that exists only while its feature is switched on. */
 typedef struct {
@@ -608,15 +616,17 @@ static esp_err_t h_logs(httpd_req_t *r)
     char head[400];
     int n = text
         ? snprintf(head, sizeof(head), "# %s boot %" PRIu32 ", lines %" PRIu32 "..%" PRIu32
-                   ", this boot started by: %s\n", previous ? "previous" : "current",
-                   info.boot_count, info.oldest_seq, info.latest_seq, ui_reset_reason_str())
+                   ", this boot started by: %s, MLE duplicate warnings: %" PRIu32 "\n",
+                   previous ? "previous" : "current", info.boot_count,
+                   info.oldest_seq, info.latest_seq, ui_reset_reason_str(), info.duplicate_mle_count)
         : snprintf(head, sizeof(head),
                    "{\"schema\":1,\"boot\":\"%s\",\"boot_id\":\"%016" PRIx64 "\",\"boot_count\":%" PRIu32
                    ",\"reset_reason\":\"%s\",\"device_uptime_ms\":%" PRId64 ",\"capacity\":%u"
                    ",\"oldest_seq\":%" PRIu32 ",\"latest_seq\":%" PRIu32 ",\"last_uptime_ms\":%" PRIu32
-                   ",\"lines\":[", previous ? "previous" : "current", info.boot_id, info.boot_count,
+                   ",\"duplicate_mle_count\":%" PRIu32 ",\"lines\":[",
+                   previous ? "previous" : "current", info.boot_id, info.boot_count,
                    ui_reset_reason_str(), esp_timer_get_time() / 1000, LOG_RING_LINES,
-                   info.oldest_seq, info.latest_seq, info.last_uptime_ms);
+                   info.oldest_seq, info.latest_seq, info.last_uptime_ms, info.duplicate_mle_count);
     esp_err_t err = n > 0 && (size_t) n < sizeof(head) ? logs_send(r, s, head, (size_t) n) : ESP_FAIL;
 
     uint32_t start = after >= info.latest_seq ? 0 : after + 1;
@@ -654,6 +664,100 @@ static esp_err_t h_logs(httpd_req_t *r)
     return httpd_resp_send_chunk(r, NULL, 0);
 }
 
+/* These application routes intentionally leave the standard OTBR API alone.
+ * Provisioning and token recovery are local console operations, never HTTP. */
+static bool device_authorized(httpd_req_t *r)
+{
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    if (!remote_admin_enabled()) {
+        httpd_resp_set_status(r, "503 Service Unavailable");
+        send_json(r, "{\"error\":\"remote management disabled\"}");
+        return false;
+    }
+    char authorization[7 + REMOTE_ADMIN_TOKEN_BUFFER_SIZE];
+    const size_t length = httpd_req_get_hdr_value_len(r, "Authorization");
+    if (length != sizeof(authorization) - 1 ||
+        httpd_req_get_hdr_value_str(r, "Authorization", authorization, sizeof(authorization)) != ESP_OK ||
+        !remote_admin_authorize(authorization)) {
+        httpd_resp_set_status(r, "401 Unauthorized");
+        httpd_resp_set_hdr(r, "WWW-Authenticate", "Bearer realm=\"cores3\"");
+        send_json(r, "{\"error\":\"authentication required\"}");
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t h_device_status(httpd_req_t *r)
+{
+    if (!device_authorized(r)) {
+        return ESP_OK;
+    }
+    char *json = heap_caps_malloc(DEVICE_STATUS_JSON_SIZE, MALLOC_CAP_SPIRAM);
+    if (json == NULL) {
+        httpd_resp_set_status(r, "503 Service Unavailable");
+        return send_json(r, "{\"error\":\"status buffer unavailable\"}");
+    }
+    const size_t length = device_status_json(json, DEVICE_STATUS_JSON_SIZE,
+                                            atomic_load(&s_reboot_pending));
+    esp_err_t err;
+    if (length == 0) {
+        httpd_resp_set_status(r, "500 Internal Server Error");
+        err = send_json(r, "{\"error\":\"status snapshot unavailable\"}");
+    } else {
+        err = send_json(r, json);
+    }
+    heap_caps_free(json);
+    return err;
+}
+
+static esp_err_t h_device_reboot(httpd_req_t *r)
+{
+    if (!device_authorized(r)) {
+        return ESP_OK;
+    }
+    char body[24];
+    if (!recv_body(r, body, sizeof(body)) || !otbr_rest_parse_reboot(body)) {
+        httpd_resp_set_status(r, "400 Bad Request");
+        return send_json(r, "{\"error\":\"expected JSON string reboot\"}");
+    }
+    if (!atomic_load(&s_reboot_pending)) {
+        if (s_control_task == NULL) {
+            httpd_resp_set_status(r, "503 Service Unavailable");
+            return send_json(r, "{\"error\":\"control worker unavailable\"}");
+        }
+        atomic_store(&s_reboot_reply_done, false);
+        atomic_store(&s_reboot_pending, true);
+        if (!request_control(REST_CONTROL_REBOOT, false)) {
+            atomic_store(&s_reboot_pending, false);
+            httpd_resp_set_status(r, "503 Service Unavailable");
+            return send_json(r, "{\"error\":\"control queue unavailable\"}");
+        }
+        ESP_LOGW(TAG, "authenticated remote reboot accepted");
+    }
+    httpd_resp_set_status(r, "202 Accepted");
+    esp_err_t err = send_json(r, "{\"accepted\":true,\"reboot_pending\":true}");
+    /* The worker waits for this send to finish, then leaves a grace period.
+     * A lost response still means the authenticated request was accepted;
+     * clients must poll boot identity rather than blindly POSTing again. */
+    atomic_store(&s_reboot_reply_done, true);
+    return err;
+}
+
+static void perform_remote_reboot(void)
+{
+    for (unsigned i = 0; i < 600 && !atomic_load(&s_reboot_reply_done); ++i) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (!atomic_load(&s_reboot_reply_done)) {
+        atomic_store(&s_reboot_pending, false);
+        ESP_LOGW(TAG, "remote reboot cancelled: HTTP response did not complete");
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    app_reboot();
+    atomic_store(&s_reboot_pending, false); /* defensive if restart returns */
+}
+
 esp_err_t otbr_rest_start(void)
 {
     if (s_server) {
@@ -662,7 +766,7 @@ esp_err_t otbr_rest_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = OTBR_REST_PORT;
     cfg.ctrl_port = 32768 + OTBR_REST_PORT;   /* keep clear of other servers */
-    cfg.max_uri_handlers = 22;
+    cfg.max_uri_handlers = 24;
     cfg.max_open_sockets = 3;
     /* Keep HTTPD's default internal-RAM stack. Active-dataset reads reach the
      * OpenThread NVS backend, and ESP-IDF cannot disable the flash cache while
@@ -680,6 +784,8 @@ esp_err_t otbr_rest_start(void)
     }
 
     static const httpd_uri_t uris[] = {
+        { .uri = "/device/status",        .method = HTTP_GET,    .handler = h_device_status },
+        { .uri = "/device/reboot",        .method = HTTP_POST,   .handler = h_device_reboot },
         { .uri = "/power/history",        .method = HTTP_GET,    .handler = h_power_history },
         { .uri = "/node",                 .method = HTTP_GET,    .handler = h_node },
         { .uri = "/node",                 .method = HTTP_DELETE, .handler = h_node_delete },
@@ -851,6 +957,8 @@ static void rest_control_task(void *arg)
             otbr_rest_set_epskc(msg.on);
         } else if (msg.type == REST_CONTROL_LOGS) {
             otbr_rest_set_logs(msg.on);
+        } else if (msg.type == REST_CONTROL_REBOOT) {
+            perform_remote_reboot();
         }
     }
 }

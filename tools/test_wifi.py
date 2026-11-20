@@ -18,7 +18,7 @@ def main():
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     source = (args.source or root / 'main/main.c').read_text(encoding='utf-8')
-    start = source.index('esp_err_t app_wifi_join(')
+    start = source.index('static esp_err_t wifi_config_from_credentials(')
     end = source.index('static int cmd_wifi(', start)
     compiler = [args.cc]
     if Path(args.cc).stem == 'zig':
@@ -37,6 +37,23 @@ def main():
                                    '-Wno-unused-parameter', '-Wno-unused-function', str(tmp / 'test.c'),
                                    '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
+        # Exercise the actual status publisher plus event handler, including
+        # a driver query that races a disconnect/reconnect on the other task.
+        status_start = source.index('static portMUX_TYPE s_wifi_status_lock')
+        status_end = source.index('/*\n * Fast at first', status_start)
+        event_start = source.index('static void on_wifi(')
+        event_end = source.index('/* Stop the current station attempt', event_start)
+        (tmp / 'wifi_status_production.inc').write_text(
+            source[status_start:status_end] + source[event_start:event_end], encoding='utf-8')
+        (tmp / 'esp_err.h').write_text(
+            '#pragma once\ntypedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n', encoding='utf-8')
+        shutil.copyfile(root / 'tools/tests/wifi_status_harness.c', tmp / 'status.c')
+        status_exe = tmp / 'status.exe'
+        subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
+                                   '-Wno-unused-parameter', '-Wno-unused-function',
+                                   '-I', str(tmp), '-I', str(root / 'main'),
+                                   str(tmp / 'status.c'), '-o', str(status_exe)], check=True)
+        subprocess.run([str(status_exe)], check=True)
 
 
 if __name__ == '__main__':

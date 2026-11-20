@@ -1,8 +1,9 @@
 idf_component_register(
-    SRCS "main.c" "matter.cpp" "matter_battery.cpp" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c" "power_log.c" "log_ring.c" "settings.c" "otbr_rest.c"
+    SRCS "main.c" "matter.cpp" "matter_battery.cpp" "meshcop.c" "ui.c" "discover.c" "qrscan.c" "thread.c" "power.c" "power_log.c" "log_ring.c" "settings.c" "otbr_rest.c" "remote_admin.c" "device_status.c"
     INCLUDE_DIRS "."
     REQUIRES esp_wifi esp_netif nvs_flash console mbedtls esp_timer lwip esp_pm esp_mm
-             openthread driver vfs esp_driver_tsens esp_timer esp_http_server
+             openthread vfs esp_driver_gpio esp_driver_uart esp_driver_i2c
+             esp_driver_tsens esp_timer esp_http_server
              espressif__esp_matter
     LDFRAGMENTS "linker.lf"
 )

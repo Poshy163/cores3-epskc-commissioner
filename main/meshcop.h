@@ -29,6 +29,10 @@ const char *meshcop_tlv_name(unsigned type);
  * Agent's ephemeral-key endpoint: DTLS/EC-JPAKE, commissioner petition, then
  * MGMT_ACTIVE_GET.
  *
+ * `addr` must be a numeric IPv4 or IPv6 address (scoped IPv6 is supported).
+ * The exchange has a 30-second deadline, with at most 5 seconds for each CoAP
+ * reply; an expired deadline returns ESP_ERR_TIMEOUT. Fetches must be serialized.
+ *
  * On success `dataset` holds the raw Active Operational Dataset TLVs.
  */
 esp_err_t meshcop_fetch_dataset(const char *addr, uint16_t port, const char *passcode,

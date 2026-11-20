@@ -67,8 +67,8 @@ CHIP_ERROR copy_string(char *buf, size_t size, const char *text)
 /*
  * esp_matter serves VendorName, ProductName and HardwareVersionString through
  * the DeviceInstanceInfoProvider rather than from attribute storage, so the
- * only way to replace the SDK's TEST_VENDOR placeholders without a factory
- * partition is to wrap the provider the stack installs during start().
+ * hardware names can be supplied without changing the factory/test IDs by
+ * wrapping the provider the stack installs during start().
  * Everything else is forwarded unchanged.
  */
 class InstanceInfoProvider : public chip::DeviceLayer::DeviceInstanceInfoProvider
@@ -142,6 +142,42 @@ private:
 };
 
 InstanceInfoProvider s_instance_info;
+esp_matter::cluster::initialization_callback_t s_basic_information_init = nullptr;
+
+void initialize_basic_information(uint16_t endpoint_id)
+{
+    /* ESP-Matter 1.6's BasicInformation cluster retains this provider by
+     * reference during its init callback. Install the wrapper now, after the
+     * SDK selected its provider but before that reference is captured. This
+     * callback runs on the CHIP task while the stack is synchronized. */
+    s_instance_info.SetFallback(chip::DeviceLayer::GetDeviceInstanceInfoProvider());
+    chip::DeviceLayer::SetDeviceInstanceInfoProvider(&s_instance_info);
+    s_basic_information_init(endpoint_id);
+}
+
+esp_err_t install_instance_info_provider(esp_matter::node_t *node)
+{
+    esp_matter::endpoint_t *root = esp_matter::endpoint::get(node, 0);
+    if (root == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_matter::cluster_t *basic_information = esp_matter::cluster::get(
+        root, chip::app::Clusters::BasicInformation::Id);
+    if (basic_information == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    auto init_callback = esp_matter::cluster::get_init_callback(basic_information);
+    if (init_callback == initialize_basic_information) {
+        return ESP_OK;
+    }
+    if (init_callback == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_basic_information_init = init_callback;
+    return esp_matter::cluster::set_init_and_shutdown_callbacks(
+        basic_information, initialize_basic_information,
+        esp_matter::cluster::get_shutdown_callback(basic_information));
+}
 
 /*
  * NodeLabel is a writable, persisted attribute, so the config default handed
@@ -422,6 +458,10 @@ extern "C" esp_err_t matter_init(void)
     if (node == nullptr) {
         return fail_init(ESP_ERR_NO_MEM, "could not create Matter root node");
     }
+    error = install_instance_info_provider(node);
+    if (error != ESP_OK) {
+        return fail_init(error, "could not configure Matter device identity");
+    }
 
     CHIP_ERROR chip_error = s_tbr_storage_delegate.Init(
         &chip::DeviceLayer::PersistedStorage::KeyValueStoreMgr());
@@ -487,11 +527,6 @@ extern "C" esp_err_t matter_init(void)
         return fail_init(chip_error_to_esp(chip_error), "could not retain application-controlled Wi-Fi");
     }
     ESP_LOGI(kTag, "Wi-Fi station is application-controlled; CHIP will not drive it");
-
-    /* start() installed the SDK's provider; wrap it so the controller sees the
-     * hardware's names instead of TEST_VENDOR / TEST_PRODUCT. */
-    s_instance_info.SetFallback(chip::DeviceLayer::GetDeviceInstanceInfoProvider());
-    chip::DeviceLayer::SetDeviceInstanceInfoProvider(&s_instance_info);
 
     s_started.store(true, std::memory_order_release);
     s_commissioning_window_open.store(

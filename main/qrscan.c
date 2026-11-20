@@ -21,17 +21,11 @@
 #include "freertos/task.h"
 
 #include "bsp/esp-bsp.h"
-#include "esp_cam_sensor.h"
 #include "esp_log.h"
 #include "esp_video_device.h"   /* ESP_VIDEO_DVP_DEVICE_NAME, used by BSP_CAMERA_DEVICE */
 #include "esp_video_init.h"
 #include "linux/videodev2.h"
 #include "quirc.h"
-
-/* Private esp_video API (private_include/esp_video_device_internal.h): the
- * DVP video device owns the sensor handle; this is the only way to reach it
- * for raw register access. */
-extern esp_cam_sensor_device_t *esp_video_get_dvp_video_device_sensor(void);
 
 static const char *TAG = "qrscan";
 
@@ -270,26 +264,6 @@ esp_err_t qrscan_start(void)
         goto fail;
     }
 
-    /*
-     * The 320x240 subsample init table ships with horizontal mirror ON
-     * (reg 0x14 = 0x11, vs 0x10 in the 640x480 table). QR codes are not
-     * mirror-invariant and quirc never tries the flipped image, so with the
-     * mirror set decoding is impossible no matter how good the frame is.
-     *
-     * Written via the raw-register ioctl on the sensor handle, not
-     * VIDIOC_S_EXT_CTRLS: with the ext-ctrl path the board panicked in the
-     * console task after every camtest (frame-sized garbage over the REPL
-     * struct), and the direct write avoids that machinery entirely.
-     */
-    {
-        esp_cam_sensor_device_t *cam = esp_video_get_dvp_video_device_sensor();
-        esp_cam_sensor_reg_val_t reg = { .regaddr = 0x14, .value = 0x10 };
-        if (cam == NULL ||
-            esp_cam_sensor_ioctl(cam, ESP_CAM_SENSOR_IOC_S_REG, &reg) != ESP_OK) {
-            ESP_LOGW(TAG, "failed to clear sensor mirror - QR decode will fail");
-        }
-    }
-
     s_quirc = quirc_new();
     if (s_quirc == NULL || quirc_resize(s_quirc, s_w, s_h) < 0) {
         ESP_LOGE(TAG, "quirc alloc failed (%dx%d)", s_w, s_h);
@@ -321,6 +295,20 @@ void qrscan_stop(void)
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(s_fd, VIDIOC_STREAMOFF, &type);
     s_running = false;
+}
+
+/* The GC0308's subsample format may mirror the image. quirc's supported
+ * mirror retry handles either sensor orientation without changing registers
+ * through esp_video's private sensor handle. The preview stays as captured. */
+static quirc_decode_error_t decode_candidate(struct quirc_code *code,
+                                              struct quirc_data *data)
+{
+    quirc_decode_error_t error = quirc_decode(code, data);
+    if (error == QUIRC_ERROR_DATA_ECC) {
+        quirc_flip(code);
+        error = quirc_decode(code, data);
+    }
+    return error;
 }
 
 bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
@@ -424,7 +412,7 @@ bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
         struct quirc_code code;
         struct quirc_data data;
         quirc_extract(s_quirc, i, &code);
-        if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+        if (decode_candidate(&code, &data) == QUIRC_SUCCESS) {
             size_t len = data.payload_len < cap - 1 ? data.payload_len : cap - 1;
             memcpy(out, data.payload, len);
             out[len] = '\0';

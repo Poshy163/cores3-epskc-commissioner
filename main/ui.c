@@ -2391,7 +2391,7 @@ static void build_name(void)
 {
     panel_name = mk_panel();
 
-    mk_caption(panel_name, "Border router name (reboot)", 0);
+    mk_caption(panel_name, "Border router name", 0);
 
     name_ta = lv_textarea_create(panel_name);
     lv_textarea_set_one_line(name_ta, true);

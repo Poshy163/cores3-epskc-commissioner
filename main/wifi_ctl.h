@@ -15,6 +15,32 @@ typedef struct {
     bool secured;
 } wifi_scan_rec_t;
 
+/* Read-only link telemetry. No credentials, SSID or radio identifiers are
+ * included. Counts cover all station disconnect events since this boot,
+ * including deliberate leaves and provisioning attempts. */
+typedef struct {
+    bool connected;       /* station association; an IP address may follow */
+    bool signal_valid;    /* RSSI/channel read without a racing link event */
+    int rssi;
+    uint8_t channel;
+    uint32_t disconnect_count;
+    uint16_t last_disconnect_reason; /* zero if event supplied no reason */
+    bool association_valid;
+    uint64_t associated_ms;
+    bool last_disconnect_valid;
+    uint64_t last_disconnect_age_ms;
+    bool supervisor_on;
+    int retry_step;
+    bool reconnect_pending;
+    char ipv4[16];         /* "-" when unavailable */
+    char ipv6[48];
+} app_wifi_status_t;
+
+/* Safe before provisioning, during reconnects, and from an HTTP handler.
+ * Event metadata is copied under a short lock; radio/timer reads occur
+ * outside it. Missing ages and signal values have explicit validity flags. */
+void app_wifi_get_status(app_wifi_status_t *out);
+
 /* All three block; call from a worker task, never the LVGL task. */
 
 /* Scan and return up to `max` unique SSIDs, strongest first. */

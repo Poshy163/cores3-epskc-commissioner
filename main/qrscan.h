@@ -6,7 +6,8 @@
 
 #include "esp_err.h"
 
-/* Start the camera and the QR decoder. Idempotent. */
+/* Start the camera and the QR decoder. Idempotent. All acquisition, polling
+ * and stop calls, including the boot probe, run on the one UI worker task. */
 esp_err_t qrscan_start(void);
 void qrscan_stop(void);
 

@@ -33,7 +33,7 @@ typedef enum {
 } matter_runtime_status_t;
 
 /**
- * Start the Matter 1.5.1 Thread Border Router node.
+ * Start the ESP-Matter 1.6.1 Thread Border Router node.
  *
  * Wi-Fi and the default event loop may already be running. ESP-Matter adopts
  * them, while OpenThread is initialized and tasked by ESP-Matter itself.
