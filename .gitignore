@@ -8,3 +8,11 @@ sdkconfig.debug
 cmake-build-*/
 dist/
 __pycache__/
+
+# Device credentials and dumps that contain them. Remote-admin tokens
+# (tools/remote.py --token-file), diagnostic bundles, and NVS reads, which
+# hold the Wi-Fi password in clear plus the Thread and Matter keys.
+*.token
+*diagnostics*.zip
+nvs*.bin
+*_nvs*.bin
