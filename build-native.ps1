@@ -11,13 +11,13 @@
 #   .\build-native.ps1 -Port COM5 -Monitor  open the serial console after flashing
 #   .\build-native.ps1 -Clean             discard this build's output first
 #   .\build-native.ps1 -BuildDir build/test  use a separate build directory
-#   .\build-native.ps1 -IdfPath D:\esp-idf-v6.0.2  use another SDK installation
+#   .\build-native.ps1 -IdfPath D:\esp-idf-v6.1.1  use another SDK installation
 param([string]$Port = "", [switch]$Full, [switch]$Monitor, [switch]$Clean,
       [string]$BuildDir = "build/idf6", [string]$IdfPath = "")
 
 $ErrorActionPreference = "Stop"
 if (-not $IdfPath) {
-    $standardIdfPath = "$env:SystemDrive\Espressif\frameworks\esp-idf-v6.0.2"
+    $standardIdfPath = "$env:SystemDrive\Espressif\frameworks\esp-idf-v6.1.1"
     $IdfPath = if (Test-Path -LiteralPath "$standardIdfPath\export.ps1") {
         $standardIdfPath
     } else {
@@ -25,7 +25,7 @@ if (-not $IdfPath) {
     }
 }
 if (-not $IdfPath -or -not (Test-Path -LiteralPath "$IdfPath\export.ps1")) {
-    throw "ESP-IDF v6.0.2 not found. Install it as described in CLION.md or pass -IdfPath."
+    throw "ESP-IDF v6.1.1 not found. Install it as described in CLION.md or pass -IdfPath."
 }
 $IdfPath = (Resolve-Path -LiteralPath $IdfPath).ProviderPath
 
@@ -48,8 +48,8 @@ try {
         throw "ESP-IDF Python environment not found at $python. Run install.ps1 (see CLION.md)."
     }
     $idfVersion = (& $python $idf --version | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $idfVersion -notmatch '(?m)^ESP-IDF v6\.0\.2(?:$|-)') {
-        throw "This project requires ESP-IDF v6.0.2; activated SDK reports '$idfVersion'. See CLION.md."
+    if ($LASTEXITCODE -ne 0 -or $idfVersion -notmatch '(?m)^ESP-IDF v6\.1\.1(?:$|-)') {
+        throw "This project requires ESP-IDF v6.1.1; activated SDK reports '$idfVersion'. See CLION.md."
     }
 
     Push-Location $PSScriptRoot

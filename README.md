@@ -324,7 +324,7 @@ If either NVS partition cannot initialize, boot preserves its contents instead o
 
 ## Building
 
-See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.0.2 SDK and reuses `build/idf6/` and ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
+See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.1.1 SDK and reuses `build/idf6/` and ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes only the app partition, which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
 
 ```powershell
 .\build-native.ps1 -Port COM5
@@ -339,15 +339,19 @@ can use the default app-only flash:
 .\build-native.ps1 -Port COM5 -Full
 ```
 
-`build.ps1` uses the same ESP-IDF v6.0.2 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Its `epskc-work-idf6` volume keeps the build cache separate from the earlier SDK. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
+`build.ps1` uses the same ESP-IDF v6.1.1 release as CI and builds in Docker, so it stays reproducible regardless of what is installed. Its `epskc-work-idf61` volume keeps the build cache separate from the earlier SDK. Supplying `-Port` flashes the bootloader, partition table and app as separate ranges, so it does not overwrite NVS:
 
 ```powershell
 .\build.ps1 -Port COM5
 ```
 
-The manifest pins ESP-IDF 6.0.2, ESP-Matter 1.6.1, CoreS3 BSP 4.1.0,
-mDNS 1.14.0, LVGL 9.6.0~1 and quirc 1.2.0. `dependencies.lock` fixes the
-compatible transitive graph. The upstream BSP still requires `esp_video ~2.0`
+The manifest pins ESP-IDF 6.1.1, ESP-Matter 1.6.1, CoreS3 BSP 4.1.0,
+mDNS 1.15.1, LVGL 9.6.0~1 and quirc 1.2.0~1. `dependencies.lock` fixes the
+compatible transitive graph. ESP-Matter 1.6.1 itself is tested against ESP-IDF
+6.0.2; this firmware runs 6.1.1 after building and passing the same device
+checks on both 6.0.3 and 6.1.1 (see `UPGRADE-2026-11-20.md`). ESP-IDF 6.1
+changed `CONFIG_OPENTHREAD_PLATFORM_MSGPOOL_MANAGEMENT` to default off, so
+`sdkconfig.defaults` pins it on to keep OpenThread's message buffers in PSRAM. The upstream BSP still requires `esp_video ~2.0`
 and `esp_codec_dev ~1.5`; retain those supported ranges rather than overriding
 them to newer video/audio releases. Camera scanning handles mirrored QR codes
 without depending on an internal video sensor accessor.

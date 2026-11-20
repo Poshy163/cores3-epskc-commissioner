@@ -22,7 +22,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Test production parsers and failure paths on host
         run: python3 -B tools/run_host_tests.py --cc gcc
@@ -33,7 +33,7 @@ jobs:
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v6.0.2
+          esp_idf_version: v6.1.1
           target: esp32s3
           command: |
             idf.py -B build build

@@ -14,9 +14,9 @@ if ($Debug) { $defaults = "sdkconfig.defaults;sdkconfig.debug" }
 
 docker run --rm -e IDF_CCACHE_ENABLE=1 `
     -v epskc-ccache:/root/.cache/ccache `
-    -v epskc-work-idf6:/work `
+    -v epskc-work-idf61:/work `
     -v "${PSScriptRoot}:/host" `
-    espressif/idf:v6.0.2 bash /host/build.sh $defaults
+    espressif/idf:v6.1.1 bash /host/build.sh $defaults
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 if ($Port) {

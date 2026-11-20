@@ -15,22 +15,22 @@ are on the include path.
 
 Both are fixed by a local ESP-IDF plus the checked-in CMake preset.
 
-## 1. Install ESP-IDF v6.0.2
+## 1. Install ESP-IDF v6.1.1
 
-Use `C:\Espressif\frameworks\esp-idf-v6.0.2`, with the tools under
+Use `C:\Espressif\frameworks\esp-idf-v6.1.1`, with the tools under
 `%USERPROFILE%\.espressif`. Keep earlier SDK installations for rollback:
 
 ```powershell
-git clone -b v6.0.2 --depth 1 --recursive --shallow-submodules `
-    https://github.com/espressif/esp-idf.git C:\Espressif\frameworks\esp-idf-v6.0.2
-cd C:\Espressif\frameworks\esp-idf-v6.0.2
+git clone -b v6.1.1 --depth 1 --recursive --shallow-submodules `
+    https://github.com/espressif/esp-idf.git C:\Espressif\frameworks\esp-idf-v6.1.1
+cd C:\Espressif\frameworks\esp-idf-v6.1.1
 .\install.ps1 esp32s3
 ```
 
 Run that from PowerShell, not Git Bash. `idf_tools.py` detects MSYS and refuses
 with "MSys/Mingw is not supported".
 
-The manifest pins v6.0.2 to match the Docker image and CI. ESP-IDF 6 uses
+The manifest pins v6.1.1 to match the Docker image and CI. ESP-IDF 6 uses
 Mbed TLS 4 and PSA Crypto; this firmware's DTLS and EC-JPAKE configuration
 must be built with the matching SDK.
 
@@ -39,15 +39,15 @@ must be built with the matching SDK.
 Activate the selected SDK before starting CLion. If persistent user variables
 still point to the previous SDK, launch CLion from the activated shell without
 changing global user variables. The build wrapper automatically selects the
-standard v6.0.2 installation; pass `-IdfPath` if it is installed elsewhere. It
+standard v6.1.1 installation; pass `-IdfPath` if it is installed elsewhere. It
 restores the caller's process environment on exit.
 
 If you ever need to redo it, source the export script and copy what it sets:
 
 ```powershell
-$env:IDF_PATH = 'C:\Espressif\frameworks\esp-idf-v6.0.2'
+$env:IDF_PATH = 'C:\Espressif\frameworks\esp-idf-v6.1.1'
 Remove-Item Env:\IDF_PYTHON_ENV_PATH -ErrorAction SilentlyContinue
-. C:\Espressif\frameworks\esp-idf-v6.0.2\export.ps1
+. C:\Espressif\frameworks\esp-idf-v6.1.1\export.ps1
 ```
 
 Environment changes only reach newly started processes, so restart CLion (fully,
@@ -59,7 +59,7 @@ The repo ships `CMakePresets.json` with an **esp32s3** preset that mirrors what
 `idf.py` configures: Ninja, `build/idf6/` as the binary directory, `IDF_TARGET`, and
 ESP-IDF's `toolchain-esp32s3.cmake`. CLion picks presets up automatically.
 
-Open the project, choose the **ESP32-S3 (ESP-IDF 6.0.2)** profile, and let it reload.
+Open the project, choose the **ESP32-S3 (ESP-IDF 6.1.1)** profile, and let it reload.
 Because the preset points at the same `build/idf6/` the wrapper uses, CLion and `idf.py`
 share one cache instead of fighting over two.
 
@@ -104,4 +104,4 @@ CMake cache.
 .\build.ps1 -Port COM5
 ```
 
-Reference: [Espressif's CLion guide](https://docs.espressif.com/projects/esp-idf/en/v6.0.2/esp32s3/third-party-tools/clion.html)
+Reference: [Espressif's CLion guide](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/third-party-tools/clion.html)

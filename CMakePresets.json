@@ -8,7 +8,7 @@
   "configurePresets": [
     {
       "name": "esp32s3",
-      "displayName": "ESP32-S3 (ESP-IDF 6.0.2)",
+      "displayName": "ESP32-S3 (ESP-IDF 6.1.1)",
       "description": "Mirrors idf.py and keeps the ESP-IDF 6 build separate from earlier SDK caches.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/idf6",

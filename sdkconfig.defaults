@@ -90,6 +90,10 @@ CONFIG_OPENTHREAD_RADIO_SPINEL_UART=y
 CONFIG_OPENTHREAD_RX_ON_WHEN_IDLE=y
 # Bound the message pool to preserve internal RAM for the camera and radio.
 CONFIG_OPENTHREAD_NUM_MESSAGE_BUFFERS=128
+# Allocate that pool from PSRAM at runtime. ESP-IDF 6.0 did this by default;
+# 6.1 changed the default to n, which puts all 128 buffers in OpenThread's
+# static instance in internal RAM instead.
+CONFIG_OPENTHREAD_PLATFORM_MSGPOOL_MANAGEMENT=y
 CONFIG_OPENTHREAD_CLI=n
 CONFIG_OPENTHREAD_DIAG=n
 # Quieten the stack: at INFO it logs every MLE advertisement on the mesh, which

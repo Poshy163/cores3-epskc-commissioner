@@ -339,7 +339,7 @@ dependencies:
     - esp32s3
     version: 4.1.0
   espressif/mdns:
-    component_hash: b5b30022c46302eab89c1d2e3b6fb5918a627563a7462f0ee284b22b9a934967
+    component_hash: 2fa43caa78cc170842255bc7bf71f306bc815cae12e9496bfb12372423019ac7
     dependencies:
     - name: idf
       require: private
@@ -347,9 +347,9 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.14.0
+    version: 1.15.1
   espressif/quirc:
-    component_hash: 3be250a06364f0d71a7903b66ac93084d2ce3998c2e75a168b9f1f0621dd6218
+    component_hash: dacf4cb39a49598642b812462c7b9fbe4e75b31ed14612814fd1b005505ef875
     dependencies:
     - name: idf
       require: private
@@ -357,7 +357,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.2.0
+    version: 1.2.0~1
   espressif/sensor_hub:
     component_hash: ea30db551c34aee2862482abf8b3164dd3855ecb4b4659b1e6878455c9cb9e22
     dependencies:
@@ -377,7 +377,7 @@ dependencies:
       type: service
     version: 0.1.5
   espressif/usb:
-    component_hash: 99eee72ea224d9117d4c342442717a1f20bf8112e2ab5d7d7038b827874f4c92
+    component_hash: 5bcbf1bde509faef0750bbae5595b38e91cbbbd9aa0e3d308be64f9279b78aa0
     dependencies:
     - name: idf
       require: private
@@ -392,7 +392,7 @@ dependencies:
     - esp32p4
     - esp32h4
     - linux
-    version: 1.6.0
+    version: 1.6.1
   espressif/usb_host_uvc:
     component_hash: f20c4e4dea50536e2e29daaf589b5f5984402284c155867daef27d6b64869f78
     dependencies:
@@ -419,7 +419,7 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 6.0.2
+    version: 6.1.1
   lvgl/lvgl:
     component_hash: 7d82410747bbfb319531449749e940f440f8414f041f9eaba13f0d1dd7f58cdd
     dependencies:
@@ -458,6 +458,6 @@ direct_dependencies:
 - espressif/quirc
 - idf
 - lvgl/lvgl
-manifest_hash: 5eb7c901557b9573a7b7f90daaa3b087b9cf99c1b366f37d6dfdd6d83b196772
+manifest_hash: bee0d40d74c293a60f6d377720aef1a930b03651ee18c52938767ce31b0c2a88
 target: esp32s3
 version: 3.0.0
