@@ -46,7 +46,8 @@ jobs:
           command: |
             set -e
             RCP_EPOCH=$(git log -1 --format=%ct -- rcp)
-            SOURCE_DATE_EPOCH=${RCP_EPOCH:-$(git log -1 --format=%ct)} IDF_TARGET=esp32h2 idf.py -C rcp -B "$PWD/build-rcp" -D SDKCONFIG="$PWD/build-rcp/sdkconfig" build
+            RCP_EPOCH=${RCP_EPOCH:-$(git log -1 --format=%ct)}
+            SOURCE_DATE_EPOCH=$RCP_EPOCH IDF_TARGET=esp32h2 idf.py -C rcp -B "$PWD/build-rcp" -D SDKCONFIG="$PWD/build-rcp/sdkconfig" -D RCP_SOURCE_DATE_EPOCH=$RCP_EPOCH build
             idf.py -B build -DRCP_BUILD_DIR="$PWD/build-rcp" build
             mkdir -p firmware
             cp build/bootloader/bootloader.bin firmware/bootloader.bin

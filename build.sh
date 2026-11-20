@@ -42,10 +42,13 @@ fi
 # The ESP32-H2 radio firmware first: the S3 image packs it into rcp_fw. Its
 # version string carries this timestamp, pinned to rcp/'s last commit so a
 # rebuild of unchanged sources does not make the device reflash its radio.
+# The cache entry makes a new commit reconfigure the reused build directory,
+# since CMake fixes the timestamp when it configures (see rcp/CMakeLists.txt).
 rcp_epoch=$(git -C /host log -1 --format=%ct -- rcp 2>/dev/null || true)
 [ -n "$rcp_epoch" ] || rcp_epoch=$(git -C /host log -1 --format=%ct 2>/dev/null || date +%s)
 SOURCE_DATE_EPOCH="$rcp_epoch" IDF_TARGET=esp32h2 \
-    idf.py -C /work/rcp -B /work/build-rcp -D SDKCONFIG=/work/build-rcp/sdkconfig build
+    idf.py -C /work/rcp -B /work/build-rcp -D SDKCONFIG=/work/build-rcp/sdkconfig \
+        -D RCP_SOURCE_DATE_EPOCH="$rcp_epoch" build
 
 idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" -DRCP_BUILD_DIR=/work/build-rcp build
 

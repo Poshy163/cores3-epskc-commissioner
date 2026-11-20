@@ -61,14 +61,20 @@ try {
             if ($LASTEXITCODE -ne 0) { exit 1 }
         }
         # The ESP32-H2 radio firmware first: the app packs it into rcp_fw. Its
-        # version string carries SOURCE_DATE_EPOCH, pinned to rcp/'s last
-        # commit, so rebuilding unchanged sources does not make the device
-        # reflash its radio. Only this build sees the variable.
+        # version string's timestamp is pinned to rcp/'s last commit, so
+        # rebuilding unchanged sources does not make the device reflash its
+        # radio. CMake fixes the timestamp when it configures; the epoch as a
+        # cache entry makes a new commit reconfigure this build (see
+        # rcp/CMakeLists.txt). Only this build sees SOURCE_DATE_EPOCH.
         $rcpBuildDir = (Join-Path $PSScriptRoot "build/rcp") -replace '\\', '/'
         $rcpEpoch = (git log -1 --format=%ct -- rcp | Out-String).Trim()
         if (-not $rcpEpoch) { $rcpEpoch = (git log -1 --format=%ct | Out-String).Trim() }
-        if ($rcpEpoch) { $env:SOURCE_DATE_EPOCH = $rcpEpoch }
-        & $python $idf -C rcp -B $rcpBuildDir -D "SDKCONFIG=$rcpBuildDir/sdkconfig" build
+        $rcpArgs = @("-C", "rcp", "-B", $rcpBuildDir, "-D", "SDKCONFIG=$rcpBuildDir/sdkconfig")
+        if ($rcpEpoch) {
+            $env:SOURCE_DATE_EPOCH = $rcpEpoch
+            $rcpArgs += @("-D", "RCP_SOURCE_DATE_EPOCH=$rcpEpoch")
+        }
+        & $python $idf @rcpArgs build
         $rcpStatus = $LASTEXITCODE
         Remove-Item Env:\SOURCE_DATE_EPOCH -ErrorAction SilentlyContinue
         if ($rcpStatus -ne 0) { exit 1 }

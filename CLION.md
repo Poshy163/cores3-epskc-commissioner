@@ -75,12 +75,17 @@ The app packs the ESP32-H2 radio firmware into its `rcp_fw` partition, so build
 absolute paths; `SDKCONFIG` is otherwise resolved under `rcp/`:
 
 ```powershell
-idf.py -C rcp -B "$PWD/build/rcp" -D "SDKCONFIG=$PWD/build/rcp/sdkconfig" build
+$env:SOURCE_DATE_EPOCH = git log -1 --format=%ct -- rcp
+idf.py -C rcp -B "$PWD/build/rcp" -D "SDKCONFIG=$PWD/build/rcp/sdkconfig" -D "RCP_SOURCE_DATE_EPOCH=$env:SOURCE_DATE_EPOCH" build
+Remove-Item Env:\SOURCE_DATE_EPOCH
 ```
 
-`build-native.ps1` does this every time, pinning the radio firmware's version
-timestamp to `rcp/`'s last commit (`SOURCE_DATE_EPOCH`); a manual build without
-that variable gets a new version, and the device reflashes its H2 once.
+`build-native.ps1` does this every time. The S3 reflashes the H2 when the radio
+firmware's version string changes, and CMake fixes that string's timestamp when
+it configures. These commands pin it to `rcp/`'s last commit, and the
+`RCP_SOURCE_DATE_EPOCH` cache entry makes a new commit reconfigure an existing
+build. A fresh build directory configured without them gets a new version, and
+the device reflashes its H2 once.
 
 Then build the `app` target, or from a terminal:
 
