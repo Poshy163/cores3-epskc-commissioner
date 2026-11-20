@@ -549,6 +549,25 @@ esp_err_t thread_forget(void)
     return ESP_OK;
 }
 
+/*
+ * otInstanceErasePersistentInfo() wipes every OpenThread setting, including
+ * the Border Agent ID that identifies this border router to Home Assistant and
+ * other commissioners. The ID stays cached in RAM, so the change only shows at
+ * the next boot, when OpenThread generates a fresh random one. Write the
+ * previous ID back after the wipe. otBorderAgentSetId() skips both the save and
+ * the MeshCoP TXT refresh when the value equals the cached ID, so write a
+ * one-bit-different ID first. Call with the OpenThread lock held.
+ */
+static void restore_border_agent_id(otInstance *ins, const otBorderAgentId *id)
+{
+    otBorderAgentId other = *id;
+    other.mId[0] ^= 0x01;
+    if (otBorderAgentSetId(ins, &other) != OT_ERROR_NONE ||
+        otBorderAgentSetId(ins, id) != OT_ERROR_NONE) {
+        ESP_LOGW(TAG, "could not restore the Border Agent ID; a new one appears after reboot");
+    }
+}
+
 esp_err_t thread_join(const uint8_t *tlvs, size_t len)
 {
     if (!s_ready) {
@@ -593,6 +612,8 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     otOperationalDatasetTlvs previous;
     bool had_previous = otDatasetGetActiveTlvs(ins, &previous) == OT_ERROR_NONE &&
                         previous.mLength > 0;
+    otBorderAgentId ba_id;
+    bool had_ba_id = otBorderAgentGetId(ins, &ba_id) == OT_ERROR_NONE;
 
     /*
      * Wipe stored network info before applying the new dataset.
@@ -606,6 +627,9 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     otThreadSetEnabled(ins, false);
     otIp6SetEnabled(ins, false);
     otError oterr = otInstanceErasePersistentInfo(ins);
+    if (oterr == OT_ERROR_NONE && had_ba_id) {
+        restore_border_agent_id(ins, &ba_id);
+    }
     if (oterr != OT_ERROR_NONE) {
         ESP_LOGE(TAG, "could not erase stored network info (%d); candidate not applied", oterr);
         if (had_previous) {
@@ -640,6 +664,8 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
             otError erase_err = otInstanceErasePersistentInfo(ins);
             if (erase_err != OT_ERROR_NONE) {
                 ESP_LOGE(TAG, "failed candidate could not be erased: %d", erase_err);
+            } else if (had_ba_id) {
+                restore_border_agent_id(ins, &ba_id);
             }
         }
     }
