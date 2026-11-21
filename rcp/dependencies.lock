@@ -1,68 +1,10 @@
 dependencies:
-  cmd_ieee802154_debug:
-    dependencies: []
-    source:
-      path: ../../../Espressif/frameworks/esp-idf-v6.1.1/examples/ieee802154/components/cmd_ieee802154_debug
-      type: local
-    version: '*'
-  cmd_system:
-    dependencies: []
-    source:
-      path: ../../../Espressif/frameworks/esp-idf-v6.1.1/examples/system/console/advanced/components/cmd_system
-      type: local
-    version: '*'
-  esp-qa/coexist-cmd:
-    component_hash: 71156a75746d1da3d5534b9acd45be37c293395e271f9712db197ce810555ae5
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.3'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.0.2
-  espressif/iperf:
-    component_hash: 347409903a97d7b2a03c51c1cdca3ebca98b72d5b4db150dab18b10a752d7a0b
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=4.3'
-    source:
-      registry_url: https://components.espressif.com
-      type: service
-    version: 1.0.4
-  espressif/iperf-cmd:
-    component_hash: a57aac97272ddc4f4e6f7f20734a78d44d5341667e56b644ca075c2ed04741be
-    dependencies:
-    - name: espressif/iperf
-      registry_url: https://components.espressif.com
-      require: private
-      version: =1.0.4
-    - name: idf
-      require: private
-      version: '>=4.3'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 1.0.4
   idf:
     source:
       type: idf
     version: 6.1.1
-  ot_examples_common:
-    dependencies:
-    - name: espressif/iperf-cmd
-      version: ^1.0.2
-    - name: cmd_system
-      path: ${IDF_PATH}/examples/system/console/advanced/components/cmd_system
-    source:
-      path: ../../../Espressif/frameworks/esp-idf-v6.1.1/examples/openthread/ot_common_components/ot_examples_common
-      type: local
-    version: '*'
 direct_dependencies:
-- cmd_ieee802154_debug
-- esp-qa/coexist-cmd
-- ot_examples_common
-manifest_hash: 6e61613f0af03bc6dbf6ca56c9ad5de9925adfcbe737c795ee976bd2fa08751f
+- idf
+manifest_hash: 39119c1fd23f1030cbf7a658378537485024fa793b92a4a99e52228a8817848d
 target: esp32h2
 version: 3.0.0
