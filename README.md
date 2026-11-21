@@ -12,8 +12,8 @@ https://espressif.github.io/esp-launchpad/?flashConfigURL=https://raw.githubuser
 
 [ESP Launchpad](https://espressif.github.io/esp-launchpad/) reads `launchpad.toml` and offers two deliberately different images:
 
-* **Factory install (resets settings)** writes the bootloader, partition table and app as one complete image. Use it for stock M5Stack firmware, recovery, or a changed bootloader or partition layout. Because the image spans the NVS partition, it clears saved Wi-Fi, Thread credentials and settings.
-* **Update (keeps settings)** writes only the app at `0x10000`. Use it only when the device already runs this project with a compatible bootloader and the layout in `partitions.csv`; it leaves NVS untouched.
+* **Factory install (resets settings)** writes the bootloader, partition table, app and H2 radio firmware as one complete image. Use it for stock M5Stack firmware, recovery, or a changed bootloader or partition layout. Because the image spans both NVS partitions, it clears saved Wi-Fi, Thread credentials, Matter fabrics and settings.
+* **Update (keeps settings)** writes only the app at `0x10000`. Use it only when the device already runs this project with a compatible bootloader and the layout in `partitions.csv`; it leaves NVS untouched. It does not update the H2 radio firmware; the sparse PC flash under **Building** does.
 
 The first upgrade from a pre-Matter build must also write the new partition table, which adds the dedicated `matter_nvs` partition. To keep the existing Wi-Fi and Thread dataset, use the sparse PC flash described under **Building**; an app-only browser update cannot migrate the layout, while the merged factory image resets NVS.
 
@@ -29,7 +29,7 @@ Flashing replaces M5Stack's stock border-router firmware. To go back, use M5Burn
 
 The H2 runs OpenThread's radio co-processor (RCP) firmware built from `rcp/`: ESP-IDF 6.1.1's `ot_rcp` example plus `rcp/main/ack_length_fix.c`. That file removes the cause of the `Handle radio frame failed: Parse` / `RCP failure detected` resets the stock firmware produced every few hours. ESP-IDF clears the reserved PHR bit of received data frames but not of acknowledgements, so an ACK arriving with that bit set reached the S3 claiming more than 127 bytes, failed to parse, and made the S3 reset the radio. The fix wraps the driver's ACK hand-off with `-Wl,--wrap` and clears the bit there; no ESP-IDF source is modified.
 
-The S3 image carries the H2 build in the `rcp_fw` partition. At boot, before OpenThread opens the UART, `main/rcp_update.c` flashes the H2 when the bundled version is new to it, which takes about 12 seconds, then restarts the S3 so the radio comes up from a normal boot. It holds the H2's BOOT strap (GPIO18) and pulses RESET (GPIO7), as Espressif's M5Stack border router example does, so the H2's ROM bootloader is always reachable and an interrupted flash is retried on the next boot. After three attempts without a boot that shows the H2 running the bundled version, it stops; `rcp update` in the console requests another. The version string pins its timestamp to `rcp/`'s last commit, so rebuilding unchanged sources never reflashes the radio.
+The S3 image carries the H2 build in the `rcp_fw` partition. At boot, before OpenThread opens the UART, `main/rcp_update.c` flashes the H2 when the bundled version is new to it, which takes about 12 seconds, then restarts the S3 so the radio comes up from a normal boot. It holds the H2's BOOT strap (GPIO18) and pulses RESET (GPIO7), as Espressif's M5Stack border router example does, so the H2's ROM bootloader is always reachable and an interrupted flash is retried on the next boot. After three attempts without a boot that shows the H2 running the bundled version, it stops; `rcp update` in the console requests another. The version string carries the time of `rcp/`'s last commit and fixed-length commit names, so CI and local builds of unchanged sources report the same version and never reflash the radio.
 
 ## Wi-Fi
 
@@ -390,7 +390,7 @@ python -m esptool --chip esp32s3 -p COM5 -b 460800 `
   0x720000 .\firmware\rcp-fw.bin
 ```
 
-The merged image necessarily spans NVS and resets provisioning. Launchpad's app-only **Update** does not write `rcp_fw`, so it leaves the H2's radio firmware as it was; the factory image and the PC flashes above carry it.
+The merged image necessarily spans NVS and resets provisioning. Because it carries `rcp_fw`, which follows `matter_nvs`, it also clears Matter fabrics. Launchpad's app-only **Update** does not write `rcp_fw`, so it leaves the H2's radio firmware as it was; the factory image and the PC flashes above carry it.
 
 `tools/layout_check.py` models the 320x240 screen geometry and reports overlapping widgets before you flash; it exits non-zero if anything collides.
 
