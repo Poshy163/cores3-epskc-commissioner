@@ -40,9 +40,10 @@ jobs:
           esp_idf_version: v6.1.1
           target: esp32s3
           # The ESP32-H2 radio firmware (rcp/) builds first: the S3 image packs
-          # it into the rcp_fw partition. SOURCE_DATE_EPOCH pins its version to
-          # rcp/'s last commit so CI and local builds of the same sources match
-          # and the device does not reflash its radio for a rebuild.
+          # it into the rcp_fw partition. Its version string is pinned (see
+          # rcp/CMakeLists.txt), with the timestamp of rcp/'s last commit, so
+          # CI and local builds of the same sources match and the device does
+          # not reflash its radio for a rebuild.
           command: |
             set -e
             RCP_EPOCH=$(git log -1 --format=%ct -- rcp)
