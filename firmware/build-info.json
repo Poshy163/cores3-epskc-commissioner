@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "version": "b544c18",
+  "version": "a24bb75",
   "sdk": "6.1.1",
   "matter": "1.6.1",
   "build_purpose": "ESP32-H2 radio firmware with the ACK length fix, flashed by the S3 from rcp_fw; OpenThread/mDNS lock-order deadlock fixed",
@@ -13,23 +13,23 @@
     "nvs_unchanged_across_flash": true,
     "matter_nvs_unchanged_across_flash": true,
     "partition_table_matches_device": true,
-    "running_version": "b544c18",
+    "running_version": "a24bb75",
     "running_elf_matches_artifact": true,
-    "rcp_firmware": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 05:59:50 UTC",
-    "rcp_flashed_by_s3_ms": 11696,
+    "rcp_firmware": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 06:27:58 UTC",
+    "rcp_flashed_by_s3_ms": 11779,
     "rcp_verified_after_restart": true,
     "rcp_update_attempts_after_verify": 0,
     "thread_dataset_preserved": true,
     "home_assistant_fabric_preserved": true,
     "home_assistant_available": true,
-    "home_assistant_reports_software_version": "b544c18",
+    "home_assistant_reports_software_version": "a24bb75",
     "border_agent_id_kept_after_epskc_self_fetch_and_reboot": true,
-    "epskc_self_fetch_seconds": 10.7,
+    "epskc_self_fetch_seconds": 9.6,
     "epskc_cipher_suite": "TLS-ECJPAKE-WITH-AES-128-CCM-8",
     "camera_capture_passed": true,
     "captured_rcp_failure_lines": 0,
     "captured_panic_watchdog_lines": 0,
-    "internal_heap_free_bytes_after_boot": 50471,
+    "internal_heap_free_bytes_after_boot": 50315,
     "internal_heap_largest_block_bytes_after_boot": 19456
   },
   "esptool": "5.6.0",
@@ -46,18 +46,18 @@
     },
     "epskc-commissioner-app.bin": {
       "bytes": 2970688,
-      "sha256": "24465246ff2110da48aac395c2e89647345164b43c6289cae0958e959bf8b5a3",
+      "sha256": "8029c479dd2059f20aeb2223b25b1c4524e1fbad960e33517c8a3e57b6fc6a24",
       "offset": "0x10000"
     },
     "rcp-fw.bin": {
       "bytes": 655360,
-      "sha256": "4d855bf42eba4b022b0917c976ff096e09e0a80117c4310b8e0ece68fc49162d",
+      "sha256": "4c3b46f4d7a24006897f9e67e3a30f544b77e67f467cb665afb239772ea95298",
       "offset": "0x720000",
       "content": "ESP32-H2 radio firmware image for the rcp_fw partition"
     },
     "cores3-epskc-commissioner.bin": {
       "bytes": 8126464,
-      "sha256": "38e08d69583e7b757e8b91dcb261fea3aedec945d951c34e827ea17f440e131e",
+      "sha256": "f7d91b4163a6eeb45d8ebebbbe4187b8b4b7257586a1f89fdd6c9d7f8da7e18a",
       "offset": "0x0",
       "usage": "fresh-install only; do not use for an upgrade that preserves provisioning"
     }
@@ -65,13 +65,13 @@
   "elf": {
     "path": "build/idf6/epskc_commissioner.elf",
     "bytes": 128981548,
-    "sha256": "369e957a8022b1d40a8d2b4044c6a12d27cce94067067f65b31ae833e893f864"
+    "sha256": "804c1741bf789b4a64308e1d474189834b0a0cf4da3746f3e7c8a7055a8d20ac"
   },
   "rcp_elf": {
     "path": "build/rcp/esp_ot_rcp.elf",
     "bytes": 7414912,
-    "sha256": "54712f018a556986867540554b101d0d19680ef5fa8b3080239139b3bc443a14",
-    "version": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 05:59:50 UTC"
+    "sha256": "6104e4a3f2c3976a3b11939b84852cd38b23c9f1ac3287e85f57a6751f135ac1",
+    "version": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 06:27:58 UTC"
   },
   "validation": {
     "native_build_passed": true,
