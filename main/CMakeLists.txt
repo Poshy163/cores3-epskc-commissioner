@@ -10,6 +10,13 @@ idf_component_register(
 
 target_compile_options(${COMPONENT_LIB} PRIVATE "-DCHIP_HAVE_CONFIG_H")
 
+# ESP-IDF's MeshCoP publisher registers its own TXT callback, with
+# mn=BorderRouter, each time it adds _meshcop._udp. Route every registration
+# through thread.c so the firmware's callback stays installed.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=otBorderAgentSetMeshCoPServiceChangedCallback"
+    "-u __wrap_otBorderAgentSetMeshCoPServiceChangedCallback")
+
 # The top-level CMakeLists.txt derives the version from git (or version.txt)
 # and hands it to ESP-IDF as PROJECT_VER, so the app descriptor that Matter
 # reports as SoftwareVersionString and the FW_VERSION the console prints are

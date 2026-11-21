@@ -9,6 +9,7 @@
  */
 #include "thread.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -70,67 +71,105 @@ static void mdns_section_end(void)
 }
 
 /*
- * ---------------- MeshCoP TXT record correction ----------------
+ * ---------------- MeshCoP TXT record ----------------
  *
- * ESP-IDF's prebuilt border-router library publishes _meshcop._udp itself and
- * assembles the TXT record by hand. In v5.5.4 three entries come out wrong:
- * "sb" reports the Thread role as detached whatever the real role, "at" is the
- * Active Timestamp shifted by two bytes, and "omr" is this device's own local
- * OMR prefix rather than the network's favoured one. OpenThread already encodes
- * the whole record correctly, so whenever it reports a change this re-applies
- * OpenThread's entries over the library's, through the same mDNS responder and
- * the same item-set call the library uses. The ephemeral-key service
- * (_meshcop-e) carries the same record, as ot-br-posix publishes it.
+ * ESP-IDF's prebuilt border-router library (6.1.1) publishes _meshcop._udp
+ * itself: its state handler adds the service, with an empty TXT record, each
+ * time the device attaches, and removes it on detach. Every add also registers
+ * the library's own TXT callback, which copies OpenThread's record and then
+ * sets mn=BorderRouter and vn=OpenThread; every remove registers NULL.
+ * OpenThread keeps one such callback, so each attach used to drop the
+ * firmware's, and the model name went back to BorderRouter at the next TXT
+ * change. The firmware therefore links with
+ * --wrap=otBorderAgentSetMeshCoPServiceChangedCallback (main/CMakeLists.txt):
+ * once the border router has started, every registration, the library's
+ * included, installs meshcop_service_changed_cb instead. That callback writes
+ * OpenThread's record with this device's model name, and does the same for
+ * the ephemeral-key service (_meshcop-e), which carries the same record, as
+ * ot-br-posix publishes it.
  *
  * meshcop_txt_apply() makes mDNS calls only, so it runs inside an mDNS
  * section; meshcop_txt_apply_locked() reads OpenThread's record first and is
  * called with the stack lock held.
  */
+#define MESHCOP_VENDOR_NAME "OpenThread"   /* the library's, and _meshcop-e's */
+
 static void meshcop_txt_apply(const char *service_type,
                               const otBorderAgentMeshCoPServiceTxtData *txt)
 {
     if (!mdns_service_exists(service_type, "_udp", NULL)) {
-        /* The first callback fires before the library has added the service;
-         * the responder would log an error for the missing record, and the
-         * next state change applies it anyway. */
+        /* The first callback can fire before the service is added; the
+         * responder would log an error for the missing record, and the next
+         * change applies it anyway. */
         ESP_LOGD(TAG, "%s not published yet", service_type);
         return;
     }
 
-    unsigned applied = 0;
-    for (uint16_t at = 0; at < txt->mLength;) {
-        const uint8_t entry_len = txt->mData[at];
-        const uint8_t *entry = &txt->mData[at + 1];
+    const uint16_t length = txt->mLength < sizeof(txt->mData) ? txt->mLength : sizeof(txt->mData);
+    size_t capacity = 2;   /* vn and mn */
+    for (uint16_t at = 0; at < length; at += 1u + txt->mData[at]) {
+        capacity++;
+    }
+    /* The items, then a copy of the record with each key ended at its '=',
+     * so the keys are C strings in place. Values keep explicit lengths:
+     * several are binary. */
+    mdns_txt_item_with_value_len_t *items = malloc(capacity * sizeof(*items) + length);
+    if (items == NULL) {
+        ESP_LOGW(TAG, "%s TXT record not refreshed: out of memory", service_type);
+        return;
+    }
+    uint8_t *data = (uint8_t *) &items[capacity];
+    memcpy(data, txt->mData, length);
+
+    size_t count = 0;
+    for (uint16_t at = 0; at < length;) {
+        const uint8_t entry_len = data[at];
+        uint8_t *entry = &data[at + 1];
         at += 1u + entry_len;
-        if (at > txt->mLength) {
+        if (at > length) {
             break;   /* truncated entry */
         }
-        const uint8_t *eq = memchr(entry, '=', entry_len);
+        uint8_t *eq = memchr(entry, '=', entry_len);
         if (eq == NULL || eq == entry) {
             continue;
         }
-        char key[16];
-        const size_t key_len = (size_t) (eq - entry);
-        if (key_len >= sizeof(key)) {
-            continue;
+        *eq = '\0';
+        const char *key = (const char *) entry;
+        if (strcmp(key, "vn") == 0 || strcmp(key, "mn") == 0) {
+            continue;   /* set below */
         }
-        memcpy(key, entry, key_len);
-        key[key_len] = '\0';
-        const uint8_t *value = eq + 1;
-        const size_t value_len = entry_len - key_len - 1;
-        esp_err_t err = mdns_service_txt_item_set_with_explicit_value_len(
-            service_type, "_udp", key, (const char *) value, (uint8_t) value_len);
-        if (err != ESP_OK) {
-            /* ESP_ERR_NOT_FOUND means the library has not added the service
-             * yet; the next state change applies the record then. */
-            ESP_LOGD(TAG, "%s TXT %s not applied: %s", service_type, key, esp_err_to_name(err));
-            return;
-        }
-        applied++;
+        items[count++] = (mdns_txt_item_with_value_len_t) {
+            .key = key,
+            .value = eq + 1,
+            .value_len = (uint8_t) (entry + entry_len - (eq + 1)),
+        };
     }
-    /* The library hard-codes mn=BorderRouter. */
-    mdns_service_txt_item_set(service_type, "_udp", "mn", THREAD_MESHCOP_MODEL_NAME);
-    ESP_LOGI(TAG, "%s TXT record refreshed (%u entries)", service_type, applied);
+    items[count++] = (mdns_txt_item_with_value_len_t) {
+        .key = "vn",
+        .value = (const uint8_t *) MESHCOP_VENDOR_NAME,
+        .value_len = sizeof(MESHCOP_VENDOR_NAME) - 1,
+    };
+    items[count++] = (mdns_txt_item_with_value_len_t) {
+        .key = "mn",
+        .value = (const uint8_t *) THREAD_MESHCOP_MODEL_NAME,
+        .value_len = sizeof(THREAD_MESHCOP_MODEL_NAME) - 1,
+    };
+
+    /* One call replaces the whole record: one announcement, and no key
+     * outlives OpenThread dropping it (sq and bb go with the BBR role). */
+    esp_err_t err = mdns_service_txt_set_with_explicit_txt_item_value_len(
+        service_type, "_udp", items, (uint8_t) count);
+    free(items);
+    if (err == ESP_ERR_NOT_FOUND) {
+        /* Removed since the check; the next change applies the record. */
+        ESP_LOGD(TAG, "%s not published any more", service_type);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "%s TXT record not refreshed: %s", service_type, esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "%s TXT record refreshed (%u entries)", service_type, (unsigned) count);
 }
 
 static void meshcop_txt_apply_locked(otInstance *instance, const char *service_type)
@@ -165,8 +204,8 @@ static void meshcop_service_changed_cb(void *context)
                 return;
             }
         }
-        /* An early role notification can precede the Border Agent socket.
-         * IDF refreshes TXT on subsequent changes but not the SRV port. */
+        /* An early role notification can precede the Border Agent socket,
+         * and the library reads the port only when it adds the service. */
         const uint16_t port = otBorderAgentGetUdpPort(instance);
         mdns_section_begin();
         esp_err_t err = mdns_service_port_set("_meshcop", "_udp", port);
@@ -179,6 +218,35 @@ static void meshcop_service_changed_cb(void *context)
     if (s_meshcop_e_published) {
         meshcop_txt_apply_locked(instance, "_meshcop-e");
     }
+}
+
+/*
+ * Every TXT callback registration lands here (see the MeshCoP section above):
+ * the firmware's, and the library's on each publish (its own callback) and
+ * remove (NULL). Until the border router has started the library's choice
+ * stands, so an early publication cannot run meshcop_service_changed_cb before
+ * the saved name is applied. Callers hold the stack lock, as OpenThread
+ * requires. Registering also makes OpenThread invoke the callback soon after,
+ * so the record is rewritten right after the library has added the service.
+ */
+static bool s_meshcop_cb_claimed;
+
+void __real_otBorderAgentSetMeshCoPServiceChangedCallback(
+    otInstance *instance, otBorderAgentMeshCoPServiceChangedCallback callback, void *context);
+void __wrap_otBorderAgentSetMeshCoPServiceChangedCallback(
+    otInstance *instance, otBorderAgentMeshCoPServiceChangedCallback callback, void *context);
+
+void __wrap_otBorderAgentSetMeshCoPServiceChangedCallback(
+    otInstance *instance, otBorderAgentMeshCoPServiceChangedCallback callback, void *context)
+{
+    if (s_meshcop_cb_claimed) {
+        if (callback != NULL && callback != meshcop_service_changed_cb) {
+            ESP_LOGI(TAG, "_meshcop TXT callback kept after the library published");
+        }
+        callback = meshcop_service_changed_cb;
+        context = NULL;
+    }
+    __real_otBorderAgentSetMeshCoPServiceChangedCallback(instance, callback, context);
 }
 
 /* Mesh Diagnostics calls back on OpenThread's own task with the OT API lock
@@ -424,7 +492,10 @@ static void run_border_router_start_claimed(esp_netif_t *backbone)
      * cannot survive after the saved name has been applied. */
     esp_openthread_remove_meshcop_mdns();
     /* OpenThread invokes this immediately and on record changes. Reconcile
-     * publication as well as TXT so startup ordering cannot strand discovery. */
+     * publication as well as TXT so startup ordering cannot strand discovery.
+     * From here on the wrapper keeps it installed whenever the library
+     * publishes or removes _meshcop._udp. */
+    s_meshcop_cb_claimed = true;
     otBorderAgentSetMeshCoPServiceChangedCallback(esp_openthread_get_instance(),
                                                   meshcop_service_changed_cb, NULL);
     /* border_router_init installed the library's own ephemeral-key callback,
@@ -935,7 +1006,7 @@ static void share_state_cb(void *ctx)
         mdns_txt_item_t txt[] = {
             { "rv", "1" },
             { "tv", "1.4.0" },
-            { "vn", "OpenThread" },
+            { "vn", MESHCOP_VENDOR_NAME },
             { "mn", THREAD_MESHCOP_MODEL_NAME },
             { "nn", nn },
         };
