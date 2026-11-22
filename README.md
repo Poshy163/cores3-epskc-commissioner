@@ -222,9 +222,15 @@ On the serial console:
 matter status
 matter code
 matter open 900
+matter close
+matter ble on
 ```
 
-Use the manual code or QR payload from `matter code` in Home Assistant's Matter add-device flow. An uncommissioned device advertises on the LAN and over BLE; after it has a fabric, `matter open` follows the Matter requirement to open subsequent commissioning on the operational network only. Once commissioned, Matter Server can interview endpoint `0x0091` and include the border router and its diagnostics in the Matter network topology.
+Use the manual code or QR payload from `matter code` in Home Assistant's Matter add-device flow. An uncommissioned device advertises on the LAN, and also over Bluetooth when Bluetooth pairing is on (see below); after it has a fabric, `matter open` follows the Matter requirement to open subsequent commissioning on the operational network only. Once commissioned, Matter Server can interview endpoint `0x0091` and include the border router and its diagnostics in the Matter network topology.
+
+On the screen, **Settings > Matter** shows how many controllers the node is paired with and whether pairing is open. **Open pairing** opens a 15-minute window and shows its QR code and the 11-digit manual code, with a countdown. **Stop pairing** closes any open window. The screen stays on while the QR code is showing. When a controller opens the window itself, as Home Assistant's **Share device** does, only the one-time code that controller shows works. The page and `matter code` then say so instead of offering this device's code, and `matter status` reports which kind of window is open.
+
+The **Bluetooth** switch on the same page (or `matter ble on|off`) lets a phone app that only looks for new devices over Bluetooth find this one before its first pairing. It is off by default, and a factory reset turns it off again. The device is already on Wi-Fi, so controllers find it on the network, and starting Bluetooth costs about 22 KB of internal RAM during every boot; with it off, the RAM Bluetooth would otherwise keep reserved goes to the heap instead. Matter reads the switch only when it starts, so a change applies after a restart; until then the page shows "Restart to apply." and `matter status` shows the pending value. The pairing code advertises Bluetooth only while it is actually running. Even when on, Bluetooth serves only the first pairing: once the device belongs to a controller, ESP-Matter shuts Bluetooth down, and further controllers are added over the network.
 
 ### Matter battery entities
 
@@ -250,15 +256,30 @@ For an already-paired device, refresh its Matter interview if the new endpoint
 is not discovered after the firmware update. Preserve the existing pairing;
 removing the device or factory-resetting it is not required by this change.
 
+### Matter temperature
+
+A Temperature Sensor endpoint carries the ESP32-S3's die temperature, so Home
+Assistant shows a **Temperature** entity under the same device. It is the
+chip's temperature, not the room's: about 45 to 55 C in normal use. The firmware
+samples it every 30 seconds and reports a change of half a degree at once,
+otherwise every five minutes. Matter has no attribute for CPU clock speed or
+free memory that Home Assistant displays, so those stay on the Power and
+Diagnostics pages, `status`, and `/device/status`. Uptime and reboot count are
+standard General Diagnostics attributes; Home Assistant creates them as
+diagnostic entities, disabled by default.
+
 ## Settings
 
-Wi-Fi, screen brightness and sleep timeout, a live power page, Thread options (router preference, fixed channel for new networks, share-code lifetime, REST toggles), device name, an About page with firmware hash and uptime, plus Reboot and Factory reset.
+Wi-Fi, screen brightness and sleep timeout, a live power page, Thread options (router preference, fixed channel for new networks, share-code lifetime, REST toggles), Matter pairing (see [Matter and Home Assistant topology](#matter-and-home-assistant-topology)), device name, an About page with firmware hash and uptime, plus Reboot and Factory reset.
 
 The power page reports battery percentage, voltages, PMIC and ESP32 temperatures, charge state, and a discharge rate estimated from the gauge. There is no live wattage: the AXP2101 has no current-sense channel.
 
-The CPUs scale between 80 MHz when idle and the configured maximum (normally
-160 MHz) during work, keeping the peripheral bus at 80 MHz. Automatic light
-sleep is disabled so the H2 radio, USB console and border routing stay available.
+On USB power the CPUs run at 240 MHz all the time; on battery they run at
+80 MHz unless a driver asks for more. The peripheral bus stays at 80 MHz either
+way. ESP-IDF raises the CPU clock only for a driver that requests it, so without
+the USB profile even the elliptic-curve work of Matter pairing and ePSKc would
+run at 80 MHz. Automatic light sleep is disabled so the H2 radio, USB console
+and border routing stay available.
 On battery, the screen dims to at most 20% after 30 seconds without a touch,
 then turns off at the saved sleep timeout. Touching restores the saved brightness;
 camera and sharing screens stay bright. Live labels stop refreshing while the
@@ -319,7 +340,7 @@ Wi-Fi power management follows the power source. On USB the radio never dozes, w
 | `settings` | show persisted settings |
 | `batt` | battery %, voltage, charge state |
 | `name <name>` | set the shared Matter/MeshCoP border-router name; republished immediately |
-| `matter [status\|code\|open [seconds]]` | inspect or open Matter commissioning |
+| `matter [status\|code\|open [seconds]\|close\|ble on\|off]` | inspect, open or close Matter commissioning; switch Bluetooth pairing |
 | `camtest` | grab frames, print stats and ASCII art |
 | `rcp [update]` | ESP32-H2 radio firmware: running, bundled and last-flashed versions; `update` reflashes it on restart |
 | `reveal 1` | unmask the network key in output. It prints secrets, so leave it off |

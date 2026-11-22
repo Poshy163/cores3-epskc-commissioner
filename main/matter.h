@@ -50,6 +50,31 @@ bool matter_is_commissioned(void);
 bool matter_is_commissioning_window_open(void);
 uint16_t matter_get_thread_border_router_endpoint_id(void);
 
+typedef enum {
+    MATTER_WINDOW_CLOSED = 0,
+    MATTER_WINDOW_BASIC,     /* accepts this device's own setup code */
+    MATTER_WINDOW_ENHANCED,  /* opened by a controller, with its own one-time code */
+} matter_window_t;
+
+matter_window_t matter_get_commissioning_window(void);
+
+/* Seconds left in a window this firmware opened, or -1 when unknown: a window
+ * a controller opened, or the initial one of an uncommissioned device. */
+int matter_get_commissioning_window_seconds_left(void);
+
+/* Controllers (fabrics) this node is commissioned into. */
+unsigned matter_get_fabric_count(void);
+
+/* Ask the CHIP event loop to close whichever commissioning window is open.
+ * Asynchronous like matter_open_commissioning_window(); ESP_OK if none is. */
+esp_err_t matter_close_commissioning_window(void);
+
+/* Whether Bluetooth pairing (Settings > Matter) was on when Matter started.
+ * The setting is read only then, so a change applies after a restart. Even
+ * when on, Bluetooth serves only a first pairing: ESP-Matter shuts it down
+ * once the device belongs to a controller. */
+bool matter_ble_commissioning_enabled(void);
+
 /**
  * Ask the CHIP event loop to open a basic commissioning window.
  *
@@ -81,9 +106,11 @@ esp_err_t matter_set_border_router_name(const char *name);
 /**
  * Return the device's QR payload and manual setup code.
  *
- * Codes are available while the device is uncommissioned, or while an
- * explicitly opened commissioning window is active. Both output buffers are
- * always NUL-terminated on success. Use the buffer-size constants above.
+ * Codes are available while the device is uncommissioned, or while a basic
+ * commissioning window is open. An enhanced window, opened by a controller,
+ * accepts only that controller's code, so this returns ESP_ERR_INVALID_STATE.
+ * Both output buffers are always NUL-terminated on success. Use the
+ * buffer-size constants above.
  */
 esp_err_t matter_get_onboarding_codes(char *qr_code, size_t qr_code_size,
                                       char *manual_code, size_t manual_code_size);

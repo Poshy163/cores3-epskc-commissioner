@@ -24,6 +24,7 @@ typedef struct {
     bool    rest_api;            /* serve the OTBR REST API on port 8081 */
     bool    rest_epskc;          /* also serve the ba-epskc endpoints (PR #267) */
     bool    rest_logs;           /* also serve /logs, this and the previous boot */
+    bool    ble_commissioning;   /* Matter pairing over Bluetooth; read at start-up */
 } settings_t;
 
 /* Sleep-timeout choices, in ms; 0 means never. Matches the on-screen roller. */

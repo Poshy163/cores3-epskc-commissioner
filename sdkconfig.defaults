@@ -38,14 +38,19 @@ CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
 # EXT_RAM_NOINIT_ATTR would fall back to internal RAM; log_ring.c refuses that.
 CONFIG_SPIRAM_ALLOW_NOINIT_SEG_EXTERNAL_MEMORY=y
 
-# Matter commissioning uses NimBLE.  Keep the controller, Matter allocations,
-# TLS allocations and large static tables in PSRAM because the camera and H2
-# radio paths both need scarce internal/DMA-capable SRAM.
+# Matter can pair over NimBLE (Settings > Matter > Bluetooth, off by default).
+# Keep the controller, Matter allocations, TLS allocations and large static
+# tables in PSRAM because the camera and H2 radio paths both need scarce
+# internal/DMA-capable SRAM.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_ESP_MATTER_MEM_ALLOC_MODE_EXTERNAL=y
+# ESP-Matter's option covers only its data model. The Matter SDK's allocator
+# has its own switch; by default it uses plain malloc, which keeps every
+# allocation under 16 KB in internal RAM.
+CONFIG_CHIP_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 
 # Camera + quirc + LVGL + mbedTLS outgrew the 1.5 MB default app partition.
@@ -59,6 +64,14 @@ CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 CONFIG_MBEDTLS_SSL_PROTO_DTLS=y
 CONFIG_MBEDTLS_CCM_C=y
 CONFIG_MBEDTLS_ECP_DP_SECP256R1_ENABLED=y
+# Precomputed base-point tables, kept in flash, speed up the generator
+# multiplications in ECDSA (Matter attestation and CASE), key generation,
+# EC-JPAKE and SPAKE2+.
+CONFIG_MBEDTLS_ECP_FIXED_POINT_OPTIM=y
+
+# 240 MHz is the S3's fastest clock. On USB power the power profile in
+# main.c holds it there; on battery the clock still scales down to 80 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # Roomier stacks/buffers than the defaults; DTLS handshakes are stack-hungry.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
@@ -136,7 +149,9 @@ CONFIG_USE_MINIMAL_MDNS=n
 CONFIG_ENABLE_ROUTE_HOOK=n
 CONFIG_ENABLE_CHIP_SHELL=n
 CONFIG_ENABLE_OTA_REQUESTOR=n
-CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=3
+# Root node, Thread Border Router, battery (Power Source) and the ESP32-S3
+# die temperature (Temperature Sensor).
+CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=4
 # Advertise the Thread Border Router device type (0x0091 = 145) in the
 # commissionable-node record, so a commissioner can label the device before
 # it pairs. Vendor, product and hardware strings come from the provider in
@@ -300,7 +315,8 @@ CONFIG_SUPPORT_FLOW_MEASUREMENT_CLUSTER=n
 CONFIG_SUPPORT_ILLUMINANCE_MEASUREMENT_CLUSTER=n
 CONFIG_SUPPORT_PRESSURE_MEASUREMENT_CLUSTER=n
 CONFIG_SUPPORT_RELATIVE_HUMIDITY_MEASUREMENT_CLUSTER=n
-CONFIG_SUPPORT_TEMPERATURE_MEASUREMENT_CLUSTER=n
+# The ESP32-S3 die temperature endpoint (main/matter_temperature.cpp).
+CONFIG_SUPPORT_TEMPERATURE_MEASUREMENT_CLUSTER=y
 
 # LVGL fonts used by the status screen.
 CONFIG_LV_FONT_MONTSERRAT_14=y

@@ -414,6 +414,7 @@ PANEL_TITLES = {
     "thread": "Thread & REST",
     "device_name": "Device name",
     "diagnostics": "Diagnostics",
+    "matter": "Matter",
 }
 
 
@@ -604,8 +605,8 @@ def panels() -> dict[str, list[Box]]:
     add_list_rows(
         p["settings"], "settings:list",
         [
-            "Wi-Fi", "Screen", "Camera test", "Power", "Thread", "Device name", "Diagnostics",
-            "Reboot", "Factory reset",
+            "Wi-Fi", "Screen", "Camera test", "Power", "Thread", "Matter", "Device name",
+            "Diagnostics", "Reboot", "Factory reset",
         ], 298, label_offset=8,
     )
 
@@ -665,6 +666,49 @@ def panels() -> dict[str, list[Box]]:
         parent=about_content.name, clip=about_content.name,
     ))
     p["diagnostics"].append(button("Back", "BOTTOM_MID", 0, -6, 110, 40))
+
+    # The QR card exists only while this device's own code is offered. The
+    # status runs to five lines: the controller count, three lines about the
+    # window, and the restart note after the Bluetooth switch changes. The
+    # Bluetooth row (mk_row resized to the status column) sits below it.
+    matter_qr_x, matter_qr_y = align("TOP_LEFT", 128, 128, 2, 2)
+    ble_row_w = W - 152
+    ble_row_x, ble_row_y = align("TOP_RIGHT", ble_row_w, 40, -2, 92)
+    ble_caption_w = ble_row_w - 50 - 8
+    matter_ble_row = [
+        label_at(
+            "caption:Bluetooth", "Bluetooth", 14,
+            ble_row_x, ble_row_y + (40 - LINE_H[14]) / 2, ble_caption_w,
+        ),
+        Box(
+            "switch:Bluetooth", ble_row_x + ble_row_w - 50, ble_row_y + 7, 50, 26,
+            "widget", touch=True, touch_size=(64, 40),
+        ),
+    ]
+    p["matter"] = [
+        Box("pairing QR", matter_qr_x, matter_qr_y, 128, 128, "qrcode"),
+        label(
+            "pairing status",
+            "Paired: 16 controllers\nA controller opened\npairing. Use the\n"
+            "code its app shows.\nRestart to apply.",
+            14, "TOP_RIGHT", -2, 4, object_w=W - 152, text_align="left",
+        ),
+        *matter_ble_row,
+        button("Stop pairing", "BOTTOM_MID", -78, -6, 148, 40),
+        button("Back", "BOTTOM_MID", 78, -6, 148, 40),
+    ]
+    p["matter:code"] = [
+        Box("pairing QR", matter_qr_x, matter_qr_y, 128, 128, "qrcode"),
+        label(
+            "pairing status",
+            "Paired: 16 controllers\nPairing open  14:59\nScan, or enter:\n"
+            "0000-000-0000\nRestart to apply.",
+            14, "TOP_RIGHT", -2, 4, object_w=W - 152, text_align="left",
+        ),
+        *matter_ble_row,
+        button("Open pairing", "BOTTOM_MID", -78, -6, 148, 40),
+        button("Back", "BOTTOM_MID", 78, -6, 148, 40),
+    ]
 
     return p
 
@@ -745,7 +789,7 @@ MODELED_BUILDERS = {
     "build_wifi", "build_wpass", "build_net", "build_thread_activity",
     "build_share", "build_dsqr",
     "build_settings", "build_screen", "build_power", "build_tset",
-    "build_name", "build_about",
+    "build_name", "build_about", "build_matter",
 }
 
 

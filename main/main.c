@@ -365,20 +365,61 @@ static int cmd_log(int argc, char **argv)
     return 1;
 }
 
+/*
+ * Power profile, applied whenever the power source changes.
+ *
+ * On USB power the CPU stays at its maximum. ESP-IDF's frequency scaling
+ * raises the clock only while a driver holds a CPU lock; Wi-Fi, the UARTs and
+ * BLE hold only the APB lock, which on the S3 leaves the CPU at 80 MHz. The
+ * crypto behind Matter pairing and sessions and ePSKc's EC-JPAKE therefore ran
+ * at 80 MHz. On battery the clock still drops to 80 MHz when nothing needs
+ * more, and Wi-Fi modem sleep is on.
+ *
+ * The UI's battery poll calls this before Wi-Fi is initialized, and
+ * app_main() calls it again after esp_wifi_start(); the mutex keeps the two
+ * callers' applied state consistent.
+ */
+static SemaphoreHandle_t s_power_profile_lock;
+
 void app_wifi_set_power_profile(bool external_power)
 {
-    static int s_applied = -1;
+    static int s_cpu_applied = -1;
+    static int s_ps_applied = -1;
     const int wanted = external_power ? 1 : 0;
-    if (wanted == s_applied) {
-        return;
+
+    if (s_power_profile_lock) {
+        xSemaphoreTake(s_power_profile_lock, portMAX_DELAY);
     }
-    esp_err_t err = esp_wifi_set_ps(external_power ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "could not change Wi-Fi power save: %s", esp_err_to_name(err));
-        return;
+    if (wanted != s_cpu_applied) {
+        const esp_pm_config_t pm = {
+            .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
+            .min_freq_mhz = external_power ? CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ : 80,
+            .light_sleep_enable = false,
+        };
+        esp_err_t err = esp_pm_configure(&pm);
+        if (err == ESP_OK) {
+            s_cpu_applied = wanted;
+            ESP_LOGI(TAG, "CPU %d-%d MHz (%s)", pm.min_freq_mhz, pm.max_freq_mhz,
+                     external_power ? "external power" : "battery");
+        } else {
+            ESP_LOGW(TAG, "could not change the CPU clock profile: %s", esp_err_to_name(err));
+        }
     }
-    s_applied = wanted;
-    ESP_LOGI(TAG, "Wi-Fi power save %s", external_power ? "off (external power)" : "on (battery)");
+    if (wanted != s_ps_applied) {
+        esp_err_t err = esp_wifi_set_ps(external_power ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+        if (err == ESP_OK) {
+            s_ps_applied = wanted;
+            ESP_LOGI(TAG, "Wi-Fi power save %s",
+                     external_power ? "off (external power)" : "on (battery)");
+        } else if (err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED) {
+            /* Before Wi-Fi starts, app_main()'s call after esp_wifi_start()
+             * applies it; only a failure after that is worth a warning. */
+            ESP_LOGW(TAG, "could not change Wi-Fi power save: %s", esp_err_to_name(err));
+        }
+    }
+    if (s_power_profile_lock) {
+        xSemaphoreGive(s_power_profile_lock);
+    }
 }
 
 void app_apply_device_name(const char *name)
@@ -998,10 +1039,36 @@ static int cmd_matter(int argc, char **argv)
         printf("endpoint: %u (Thread Border Router 0x0091)\n",
                (unsigned) matter_get_thread_border_router_endpoint_id());
         printf("fabric  : %s\n", matter_is_commissioned() ? "commissioned" : "not commissioned");
-        printf("window  : %s\n", matter_is_commissioning_window_open() ? "open" : "closed");
+        const matter_window_t window = matter_get_commissioning_window();
+        const int left = matter_get_commissioning_window_seconds_left();
+        if (window == MATTER_WINDOW_CLOSED) {
+            printf("window  : closed\n");
+        } else if (left >= 0) {
+            printf("window  : open (%s), %d:%02d left\n",
+                   window == MATTER_WINDOW_ENHANCED ? "opened by a controller" : "this device's code",
+                   left / 60, left % 60);
+        } else {
+            printf("window  : open (%s)\n",
+                   window == MATTER_WINDOW_ENHANCED ? "opened by a controller" : "this device's code");
+        }
         if (status == MATTER_RUNTIME_ERROR) {
             printf("error   : %s\n", esp_err_to_name(matter_get_last_error()));
         }
+        const bool ble_saved = settings_get()->ble_commissioning;
+        printf("ble     : %s%s\n", matter_ble_commissioning_enabled() ? "on" : "off",
+               ble_saved != matter_ble_commissioning_enabled()
+               ? (ble_saved ? " (on after a restart)" : " (off after a restart)") : "");
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "ble") == 0 &&
+        (strcmp(argv[2], "on") == 0 || strcmp(argv[2], "off") == 0)) {
+        /* Same setting as the Bluetooth switch in Settings > Matter. */
+        settings_get()->ble_commissioning = strcmp(argv[2], "on") == 0;
+        settings_save();
+        printf("Bluetooth pairing %s%s\n", argv[2],
+               settings_get()->ble_commissioning == matter_ble_commissioning_enabled()
+               ? "" : "; applies after a restart");
         return 0;
     }
 
@@ -1009,6 +1076,10 @@ static int cmd_matter(int argc, char **argv)
         char qr[MATTER_QR_CODE_BUFFER_SIZE];
         char manual[MATTER_MANUAL_CODE_BUFFER_SIZE];
         esp_err_t err = matter_get_onboarding_codes(qr, sizeof(qr), manual, sizeof(manual));
+        if (err != ESP_OK && matter_get_commissioning_window() == MATTER_WINDOW_ENHANCED) {
+            printf("a controller opened this pairing window: use the code it shows\n");
+            return 1;
+        }
         if (err != ESP_OK) {
             printf("pairing code unavailable: %s\n", esp_err_to_name(err));
             return 1;
@@ -1041,7 +1112,22 @@ static int cmd_matter(int argc, char **argv)
         return 0;
     }
 
-    printf("usage: matter [status|code|open [180..900]]\n");
+    if (argc == 2 && strcmp(argv[1], "close") == 0) {
+        /* Closes either kind of window, like Settings > Matter > Stop pairing. */
+        esp_err_t err = matter_close_commissioning_window();
+        if (err != ESP_OK) {
+            printf("could not close Matter window: %s\n", esp_err_to_name(err));
+            return 1;
+        }
+        for (int i = 0; i < 20 && matter_is_commissioning_window_open(); i++) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        printf("Matter commissioning window %s\n",
+               matter_is_commissioning_window_open() ? "close requested" : "closed");
+        return 0;
+    }
+
+    printf("usage: matter [status|code|open [180..900]|close|ble on|off]\n");
     return 1;
 }
 
@@ -1635,6 +1721,7 @@ static int cmd_settings(int argc, char **argv)
     printf("rest api     : %s\n", c->rest_api ? "on" : "off");
     printf("rest epskc   : %s\n", c->rest_epskc ? "on" : "off");
     printf("rest logs    : %s\n", c->rest_logs ? "on" : "off");
+    printf("matter ble   : %s\n", c->ble_commissioning ? "on" : "off");
     return 0;
 }
 
@@ -1801,7 +1888,7 @@ static void register_commands(void)
         { .command = "name", .help = "name <name> - set the Matter/MeshCoP border-router name", .func = cmd_name },
         { .command = "camtest", .help = "start the camera and try 30 frames", .func = cmd_camtest },
         { .command = "thread", .help = "thread [scan] - activity and best-effort mesh topology", .func = cmd_thread },
-        { .command = "matter", .help = "matter [status|code|open [seconds]]", .func = cmd_matter },
+        { .command = "matter", .help = "matter [status|code|open [seconds]|close|ble on|off]", .func = cmd_matter },
         { .command = "forget", .help = "erase stored Thread credentials", .func = cmd_forget },
         { .command = "wifi", .help = "wifi <ssid> <password>", .func = cmd_wifi },
         { .command = "status", .help = "show wifi/ip state", .func = cmd_status },
@@ -1837,15 +1924,17 @@ void app_main(void)
     log_ring_init();
     apply_quiet_log_profile();
 
-    /* Keep APB at 80 MHz for the H2 UART, camera and USB console. The CPUs
-     * can idle at 80 MHz and return to the configured maximum for work.
-     * Automatic sleep would require coordinating wakeup with the H2 RCP. */
+    /* Keep APB at 80 MHz for the H2 UART, camera and USB console. This is
+     * the battery profile; app_wifi_set_power_profile() holds the CPU at its
+     * maximum instead once the PMIC reports USB power. Automatic sleep would
+     * require coordinating wakeup with the H2 RCP. */
     const esp_pm_config_t pm = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = 80,
         .light_sleep_enable = false,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
+    s_power_profile_lock = xSemaphoreCreateMutex();
 
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {

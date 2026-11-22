@@ -19,6 +19,7 @@
 #include "power.h"
 
 #include <limits.h>
+#include <stdatomic.h>
 
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
@@ -26,6 +27,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 static const char *TAG = "power";
 
@@ -228,27 +231,46 @@ esp_err_t power_read(power_status_t *out)
 
 /* ---------------- ESP32-S3 die temperature ---------------- */
 
+/* The console, the Power page and Matter's temperature sampler all read the
+ * sensor, so the lazy install and every read run under one mutex: two first
+ * calls racing the install would otherwise mark the sensor unavailable. */
 static temperature_sensor_handle_t s_tsens;
 static bool s_tsens_failed;
+static StaticSemaphore_t s_tsens_lock_buf;
+static SemaphoreHandle_t s_tsens_lock;
+static atomic_int s_tsens_lock_state;   /* 0 none, 1 being created, 2 ready */
+
+static void tsens_lock(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&s_tsens_lock_state, &expected, 1)) {
+        s_tsens_lock = xSemaphoreCreateMutexStatic(&s_tsens_lock_buf);
+        atomic_store(&s_tsens_lock_state, 2);
+    }
+    while (atomic_load(&s_tsens_lock_state) != 2) {
+        vTaskDelay(1);
+    }
+    xSemaphoreTake(s_tsens_lock, portMAX_DELAY);
+}
 
 bool power_esp_temp(float *celsius)
 {
     if (celsius == NULL) {
         return false;
     }
+    tsens_lock();
     if (s_tsens == NULL && !s_tsens_failed) {
         temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
         if (temperature_sensor_install(&cfg, &s_tsens) != ESP_OK ||
             temperature_sensor_enable(s_tsens) != ESP_OK) {
             s_tsens_failed = true;
             ESP_LOGW(TAG, "internal temperature sensor unavailable");
-            return false;
         }
     }
-    if (s_tsens == NULL) {
-        return false;
-    }
-    return temperature_sensor_get_celsius(s_tsens, celsius) == ESP_OK;
+    const bool ok = s_tsens != NULL && !s_tsens_failed &&
+                    temperature_sensor_get_celsius(s_tsens, celsius) == ESP_OK;
+    xSemaphoreGive(s_tsens_lock);
+    return ok;
 }
 
 /* ---------------- discharge rate ---------------- */

@@ -130,8 +130,11 @@ static volatile uint32_t s_share_request_id;
 static volatile bool s_share_stop_pending;
 /* Settings screens. */
 static lv_obj_t *panel_settings, *panel_screen, *panel_power, *panel_tset, *panel_name, *panel_about,
-                *panel_camera;
+                *panel_camera, *panel_matter;
 static lv_obj_t *lbl_power_info, *lbl_about_info, *name_ta;
+/* Matter pairing page. The QR card exists only while a code is shown. */
+static lv_obj_t *lbl_matter_info, *btn_matter_pair, *matter_qr_card, *matter_qr, *sw_matter_ble;
+static char s_matter_manual[MATTER_MANUAL_CODE_BUFFER_SIZE];
 static lv_obj_t *s_sleep_shield;   /* full-screen tap catcher while asleep */
 static bool s_asleep;
 static bool s_dimmed;
@@ -383,7 +386,8 @@ static void role_timer_cb(lv_timer_t *t)
      */
     uint32_t timeout = settings_sleep_ms[settings_get()->sleep_idx];
     bool sharing = panel_share && !lv_obj_has_flag(panel_share, LV_OBJ_FLAG_HIDDEN);
-    bool showing_secret = panel_dsqr && !lv_obj_has_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN);
+    bool showing_secret = (panel_dsqr && !lv_obj_has_flag(panel_dsqr, LV_OBJ_FLAG_HIDDEN)) ||
+                          (matter_qr_card && !lv_obj_has_flag(panel_matter, LV_OBJ_FLAG_HIDDEN));
     bool camera_open = (panel_qr && !lv_obj_has_flag(panel_qr, LV_OBJ_FLAG_HIDDEN)) ||
                        (panel_camera && !lv_obj_has_flag(panel_camera, LV_OBJ_FLAG_HIDDEN));
     bool held_awake = settings_get()->keep_awake_powered && s_on_external_power;
@@ -563,6 +567,7 @@ static void refresh_header_title(lv_obj_t *p)
     else if (p == panel_tset)     title = "Thread & REST";
     else if (p == panel_name)     title = "Device name";
     else if (p == panel_about)    title = "Diagnostics";
+    else if (p == panel_matter)   title = "Matter";
     lv_label_set_text(lbl_title, title);
 }
 
@@ -585,6 +590,9 @@ static void show_panel(lv_obj_t *p)
     lv_obj_add_flag(panel_tset, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_name, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(panel_about, LV_OBJ_FLAG_HIDDEN);
+    if (panel_matter) {
+        lv_obj_add_flag(panel_matter, LV_OBJ_FLAG_HIDDEN);
+    }
     if (panel_qr) {
         lv_obj_add_flag(panel_qr, LV_OBJ_FLAG_HIDDEN);
     }
@@ -2101,6 +2109,178 @@ static void on_about_open(lv_event_t *e)
     show_panel(panel_about);
 }
 
+/* -- Matter pairing -- */
+
+/* A pairing window opened here lasts the longest a basic window may. */
+#define MATTER_PAIRING_WINDOW_S 900
+
+static void matter_qr_hide(void)
+{
+    if (matter_qr_card) {
+        lv_obj_delete(matter_qr_card);   /* takes the QR child with it */
+        matter_qr_card = NULL;
+        matter_qr = NULL;
+    }
+    s_matter_manual[0] = '\0';
+}
+
+/* Built on demand and torn down when hidden, like the dataset QR: the widget
+ * and its encoder scratch come out of internal RAM. The white card is the
+ * quiet zone a scanner needs against the dark panel. */
+static void matter_qr_show(const char *payload)
+{
+    if (matter_qr_card == NULL) {
+        matter_qr_card = lv_obj_create(panel_matter);
+        lv_obj_set_size(matter_qr_card, 128, 128);
+        lv_obj_align(matter_qr_card, LV_ALIGN_TOP_LEFT, 2, 2);
+        lv_obj_set_style_bg_color(matter_qr_card, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_border_width(matter_qr_card, 0, LV_PART_MAIN);
+        lv_obj_set_style_radius(matter_qr_card, 4, LV_PART_MAIN);
+        lv_obj_set_style_pad_all(matter_qr_card, 0, LV_PART_MAIN);
+        lv_obj_clear_flag(matter_qr_card, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        matter_qr = lv_qrcode_create(matter_qr_card);
+        lv_qrcode_set_size(matter_qr, 112);
+        lv_qrcode_set_dark_color(matter_qr, lv_color_hex(0x000000));
+        lv_qrcode_set_light_color(matter_qr, lv_color_hex(0xFFFFFF));
+        lv_obj_center(matter_qr);
+    }
+    lv_qrcode_update(matter_qr, payload, strlen(payload));
+}
+
+/* 11 digits read as 4-3-4, the grouping Matter labels print. */
+static void matter_group_manual_code(const char *in, char *out, size_t cap)
+{
+    if (strlen(in) == 11) {
+        snprintf(out, cap, "%.4s-%.3s-%.4s", in, in + 4, in + 7);
+    } else {
+        snprintf(out, cap, "%s", in);
+    }
+}
+
+static void refresh_matter_info(void)
+{
+    const matter_runtime_status_t status = matter_get_status();
+    const bool running = status == MATTER_RUNTIME_COMMISSIONABLE ||
+                         status == MATTER_RUNTIME_COMMISSIONED;
+    const matter_window_t window = running ? matter_get_commissioning_window()
+                                           : MATTER_WINDOW_CLOSED;
+    char buf[200];
+    size_t n = 0;
+    bool code_shown = false;
+
+    if (!running) {
+        appendf(buf, sizeof(buf), &n, "Matter is %s.", matter_status_string(status));
+        if (status == MATTER_RUNTIME_ERROR) {
+            appendf(buf, sizeof(buf), &n, "\n%s", esp_err_to_name(matter_get_last_error()));
+        }
+    } else {
+        const unsigned fabrics = matter_get_fabric_count();
+        if (fabrics == 0) {
+            appendf(buf, sizeof(buf), &n, "Not paired yet.\n");
+        } else {
+            appendf(buf, sizeof(buf), &n, "Paired: %u controller%s\n",
+                    fabrics, fabrics == 1 ? "" : "s");
+        }
+        if (window == MATTER_WINDOW_CLOSED) {
+            appendf(buf, sizeof(buf), &n, "Pairing is closed.\nOpen it to add\nanother controller.");
+        } else if (window == MATTER_WINDOW_ENHANCED) {
+            appendf(buf, sizeof(buf), &n, "A controller opened\npairing. Use the\ncode its app shows.");
+        } else {
+            /* The codes are fixed for the life of a window, so they are read
+             * once rather than on every refresh. */
+            if (matter_qr_card == NULL) {
+                char qr[MATTER_QR_CODE_BUFFER_SIZE];
+                char manual[MATTER_MANUAL_CODE_BUFFER_SIZE];
+                if (matter_get_onboarding_codes(qr, sizeof(qr), manual, sizeof(manual)) == ESP_OK) {
+                    matter_qr_show(qr);
+                    matter_group_manual_code(manual, s_matter_manual, sizeof(s_matter_manual));
+                }
+            }
+            const int left = matter_get_commissioning_window_seconds_left();
+            if (left >= 0) {
+                appendf(buf, sizeof(buf), &n, "Pairing open  %d:%02d\n", left / 60, left % 60);
+            } else {
+                appendf(buf, sizeof(buf), &n, "Pairing open\n");
+            }
+            if (matter_qr_card) {
+                appendf(buf, sizeof(buf), &n, "Scan, or enter:\n%s", s_matter_manual);
+                code_shown = true;
+            }
+        }
+    }
+    /* Matter reads the Bluetooth setting only when it starts. The console's
+     * "matter ble" changes it too, so the switch follows the saved value. */
+    const bool ble_saved = settings_get()->ble_commissioning;
+    if (ble_saved != matter_ble_commissioning_enabled()) {
+        appendf(buf, sizeof(buf), &n, "\nRestart to apply.");
+    }
+    if (lv_obj_has_state(sw_matter_ble, LV_STATE_CHECKED) != ble_saved) {
+        if (ble_saved) {
+            lv_obj_add_state(sw_matter_ble, LV_STATE_CHECKED);
+        } else {
+            lv_obj_clear_state(sw_matter_ble, LV_STATE_CHECKED);
+        }
+    }
+    if (!code_shown) {
+        matter_qr_hide();
+    }
+    lv_label_set_text(lbl_matter_info, buf);
+
+    lv_label_set_text(lv_obj_get_child(btn_matter_pair, 0),
+                      window == MATTER_WINDOW_CLOSED ? "Open pairing" : "Stop pairing");
+    if (running) {
+        lv_obj_clear_state(btn_matter_pair, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(btn_matter_pair, LV_STATE_DISABLED);
+    }
+}
+
+static void on_matter_pair(lv_event_t *e)
+{
+    (void) e;
+    const esp_err_t err = matter_get_commissioning_window() == MATTER_WINDOW_CLOSED
+                          ? matter_open_commissioning_window(MATTER_PAIRING_WINDOW_S)
+                          : matter_close_commissioning_window();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Matter pairing window change failed: %s", esp_err_to_name(err));
+    }
+    refresh_matter_info();
+}
+
+static void on_matter_ble(lv_event_t *e)
+{
+    settings_get()->ble_commissioning =
+        lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_save();
+    refresh_matter_info();
+}
+
+static void on_matter_open(lv_event_t *e)
+{
+    (void) e;
+    refresh_matter_info();
+    show_panel(panel_matter);
+}
+
+static void on_matter_back(lv_event_t *e)
+{
+    matter_qr_hide();
+    on_settings_open(e);
+}
+
+/* The window opens and closes on the CHIP event loop, and the countdown runs
+ * down, so the page refreshes every second while it is showing. Leaving it
+ * any other way frees the QR here. */
+static void matter_timer_cb(lv_timer_t *t)
+{
+    (void) t;
+    if (lv_obj_has_flag(panel_matter, LV_OBJ_FLAG_HIDDEN)) {
+        matter_qr_hide();
+    } else if (!s_asleep) {
+        refresh_matter_info();
+    }
+}
+
 static void on_screen_open(lv_event_t *e)   { (void) e; show_panel(panel_screen); }
 static void on_tset_open(lv_event_t *e)     { (void) e; show_panel(panel_tset); }
 
@@ -2295,6 +2475,7 @@ static void build_settings(void)
     settings_row(list, "Camera test", on_camera_open);
     settings_row(list, "Power", on_power_open);
     settings_row(list, "Thread", on_tset_open);
+    settings_row(list, "Matter", on_matter_open);
     settings_row(list, "Device name", on_name_open);
     settings_row(list, "Diagnostics", on_about_open);
     lv_obj_t *rb = settings_row(list, "Reboot", on_reboot);
@@ -2424,6 +2605,31 @@ static void build_about(void)
 
     lv_obj_t *bk = mk_button(panel_about, "Back", on_settings_open, COL_DIM, 110, 40);
     lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 0, -6);
+}
+
+/* QR on the left while pairing with this device's code; status, the manual
+ * code and the countdown on the right, at most five lines, with the
+ * Bluetooth switch below them. */
+static void build_matter(void)
+{
+    panel_matter = mk_panel();
+
+    lbl_matter_info = mk_label(panel_matter, &lv_font_montserrat_14, COL_TEXT, "");
+    lv_obj_set_width(lbl_matter_info, BSP_LCD_H_RES - 152);
+    lv_obj_set_style_text_align(lbl_matter_info, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+    lv_obj_align(lbl_matter_info, LV_ALIGN_TOP_RIGHT, -2, 4);
+
+    lv_obj_t *ble = mk_row(panel_matter, "Bluetooth", 40);
+    lv_obj_set_width(ble, BSP_LCD_H_RES - 152);
+    lv_obj_align(ble, LV_ALIGN_TOP_RIGHT, -2, 92);
+    sw_matter_ble = mk_switch(ble, settings_get()->ble_commissioning, on_matter_ble);
+
+    btn_matter_pair = mk_button(panel_matter, "Open pairing", on_matter_pair, COL_ACCENT, 148, 40);
+    lv_obj_align(btn_matter_pair, LV_ALIGN_BOTTOM_MID, -78, -6);
+    lv_obj_t *bk = mk_button(panel_matter, "Back", on_matter_back, COL_DIM, 148, 40);
+    lv_obj_align(bk, LV_ALIGN_BOTTOM_MID, 78, -6);
+
+    lv_timer_create(matter_timer_cb, 1000, NULL);
 }
 
 static void build_net(void)
@@ -2792,6 +2998,7 @@ esp_err_t ui_init(void)
     build_tset();
     build_name();
     build_about();
+    build_matter();
     refresh_network_label();
     lv_timer_create(role_timer_cb, 2000, NULL);
     lv_timer_ready(lv_timer_create(batt_timer_cb, 10000, NULL));

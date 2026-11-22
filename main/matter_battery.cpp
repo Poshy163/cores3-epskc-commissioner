@@ -133,11 +133,11 @@ esp_err_t matter_battery_create(esp_matter::node_t *node)
     return ESP_OK;
 }
 
-esp_err_t matter_battery_start(uint16_t tbr_endpoint)
+esp_err_t matter_battery_start(uint16_t tbr_endpoint, uint16_t temperature_endpoint)
 {
     {
         esp_matter::lock::ScopedChipStackLock lock(portMAX_DELAY);
-        chip::EndpointId powered[] = {0, tbr_endpoint, s_endpoint};
+        chip::EndpointId powered[] = {0, tbr_endpoint, temperature_endpoint, s_endpoint};
         if (chip::app::Clusters::PowerSourceServer::Instance().SetEndpointList(
                 s_endpoint, chip::Span<chip::EndpointId>(powered)) != CHIP_NO_ERROR) {
             return ESP_FAIL;

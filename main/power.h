@@ -14,6 +14,10 @@
 
 #include "esp_err.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     int  percent;    /* 0-100, -1 if no battery / gauge unreadable */
     int  batt_mv;    /* VBAT rail in mV, -1 if unreadable; valid even when
@@ -50,3 +54,7 @@ bool power_esp_temp(float *celsius);
  */
 void power_note_sample(int percent, bool on_battery);
 bool power_discharge_rate(float *pct_per_hour, int *minutes_left);
+
+#ifdef __cplusplus
+}
+#endif

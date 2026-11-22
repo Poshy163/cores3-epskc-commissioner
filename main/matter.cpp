@@ -1,6 +1,7 @@
 #include "matter.h"
 #include "log_ring.h"
 #include "matter_battery.h"
+#include "matter_temperature.h"
 #include "rcp_update.h"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_matter.h"
 #include "esp_openthread_types.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -27,6 +29,11 @@
 #include <platform/KvsPersistentStorageDelegate.h>
 #include <platform/OpenThread/GenericThreadBorderRouterDelegate.h>
 #include <setup_payload/OnboardingCodesUtil.h>
+
+#if CONFIG_ENABLE_CHIPOBLE
+#include "esp_bt.h"
+#include "host/ble_hs.h"
+#endif
 
 #if !defined(CONFIG_ESP_MATTER_ENABLE_OPENTHREAD)
 #error "The CoreS3 Matter TBR requires CONFIG_ESP_MATTER_ENABLE_OPENTHREAD=y"
@@ -216,9 +223,23 @@ std::atomic<esp_err_t> s_last_error{ESP_OK};
 std::atomic<bool> s_started{false};
 std::atomic<bool> s_commissioned{false};
 std::atomic<bool> s_commissioning_window_open{false};
+/* Opened through the Administrator Commissioning cluster with a controller's
+ * own one-time passcode (Home Assistant's "Share device"), so this device's
+ * setup code is not accepted while it lasts. */
+std::atomic<bool> s_window_enhanced{false};
+/* esp_timer time at which a window this firmware opened closes; 0 if none. */
+std::atomic<int64_t> s_window_deadline_us{0};
+std::atomic<unsigned> s_fabric_count{0};
 std::atomic<bool> s_window_request_pending{false};
 std::atomic<bool> s_factory_reset_pending{false};
 std::atomic<uint16_t> s_tbr_endpoint_id{0};
+/* Settings > Matter > Bluetooth as it stood when Matter started. The SDK
+ * brings Bluetooth up once, at start-up, so a change waits for a restart. */
+std::atomic<bool> s_ble_commissioning{false};
+/* ESP-Matter shuts Bluetooth down for good the first time it sees a fabric,
+ * at start-up or when commissioning completes; it stays down for this boot
+ * even if every fabric is later removed. */
+std::atomic<bool> s_ble_shut_down{false};
 
 chip::KvsPersistentStorageDelegate s_tbr_storage_delegate;
 chip::app::Clusters::ThreadBorderRouterManagement::GenericOpenThreadBorderRouterDelegate
@@ -335,8 +356,13 @@ esp_openthread_platform_config_t make_openthread_platform_config()
 
 void refresh_fabric_state()
 {
-    const bool commissioned = chip::Server::GetInstance().GetFabricTable().FabricCount() != 0;
+    const unsigned fabrics = chip::Server::GetInstance().GetFabricTable().FabricCount();
+    const bool commissioned = fabrics != 0;
+    s_fabric_count.store(fabrics, std::memory_order_release);
     s_commissioned.store(commissioned, std::memory_order_release);
+    if (commissioned) {
+        s_ble_shut_down.store(true, std::memory_order_release);
+    }
     s_status.store(commissioned ? MATTER_RUNTIME_COMMISSIONED : MATTER_RUNTIME_COMMISSIONABLE,
                    std::memory_order_release);
 }
@@ -350,11 +376,21 @@ void matter_event_callback(const chip::DeviceLayer::ChipDeviceEvent *event, intp
     using chip::DeviceLayer::DeviceEventType::kFabricRemoved;
 
     switch (event->Type) {
-    case kCommissioningWindowOpened:
+    case kCommissioningWindowOpened: {
+        /* Only windows opened through the cluster report a status there, and
+         * only an enhanced one replaces the device's own setup code. */
+        using chip::app::Clusters::AdministratorCommissioning::CommissioningWindowStatusEnum;
+        const auto status =
+            chip::Server::GetInstance().GetCommissioningWindowManager().CommissioningWindowStatusForCluster();
+        s_window_enhanced.store(status == CommissioningWindowStatusEnum::kEnhancedWindowOpen,
+                                std::memory_order_release);
         s_commissioning_window_open.store(true, std::memory_order_release);
         break;
+    }
     case kCommissioningWindowClosed:
         s_commissioning_window_open.store(false, std::memory_order_release);
+        s_window_enhanced.store(false, std::memory_order_release);
+        s_window_deadline_us.store(0, std::memory_order_release);
         break;
     case kCommissioningComplete:
     case kFabricCommitted:
@@ -378,12 +414,24 @@ void open_commissioning_window_work(intptr_t argument)
             ? chip::CommissioningWindowAdvertisement::kAllSupported
             : chip::CommissioningWindowAdvertisement::kDnssdOnly;
         error = manager.OpenBasicCommissioningWindow(timeout, advertisement);
+        if (error == CHIP_NO_ERROR) {
+            s_window_deadline_us.store(esp_timer_get_time() + static_cast<int64_t>(argument) * 1000000,
+                                       std::memory_order_release);
+        }
     }
     s_window_request_pending.store(false, std::memory_order_release);
     if (error != CHIP_NO_ERROR) {
         s_last_error.store(chip_error_to_esp(error), std::memory_order_relaxed);
         ESP_LOGE(kTag, "could not open commissioning window: %" CHIP_ERROR_FORMAT, error.Format());
     }
+}
+
+void close_commissioning_window_work(intptr_t)
+{
+    /* Closes either kind, as the cluster's RevokeCommissioning does. A
+     * commissioning already past PASE keeps its fail-safe and either
+     * completes or expires on its own. */
+    chip::Server::GetInstance().GetCommissioningWindowManager().CloseCommissioningWindow();
 }
 
 /*
@@ -394,6 +442,15 @@ void open_commissioning_window_work(intptr_t argument)
  */
 void log_chip_line(const char *module, uint8_t category, const char *msg, va_list args)
 {
+#if CONFIG_ENABLE_CHIPOBLE
+    /* With Bluetooth pairing off, __wrap_nimble_port_init() refuses on purpose
+     * and logs that itself; the SDK's error line for it would only alarm. */
+    if (category == chip::Logging::kLogCategory_Error &&
+        !s_ble_commissioning.load(std::memory_order_relaxed) &&
+        std::strncmp(msg, "Disabling CHIPoBLE service", 26) == 0) {
+        return;
+    }
+#endif
     char letter = 'I';
     const char *color = LOG_COLOR_I;
     esp_log_level_t level = ESP_LOG_INFO;
@@ -427,6 +484,33 @@ void log_chip_line(const char *module, uint8_t category, const char *msg, va_lis
 
 } // namespace
 
+#if CONFIG_ENABLE_CHIPOBLE
+/*
+ * main/CMakeLists.txt routes the Matter SDK's one call to nimble_port_init()
+ * through here. Nothing else in the firmware uses Bluetooth. With Bluetooth
+ * pairing off, refusing it takes the SDK's own "no Bluetooth" path:
+ * BLEManagerImpl disables its CHIPoBLE service, pairing windows advertise on
+ * the network only, and the shutdown ESP-Matter runs once the device is
+ * paired finds nothing to stop. The controller and NimBLE host never start,
+ * which keeps about 22 KB of internal RAM free through start-up.
+ */
+extern "C" esp_err_t __real_nimble_port_init(void);
+extern "C" esp_err_t __wrap_nimble_port_init(void)
+{
+    if (!s_ble_commissioning.load(std::memory_order_relaxed)) {
+        ESP_LOGI(kTag, "Bluetooth pairing is off (Settings > Matter); not starting Bluetooth");
+        /* The SDK maps this to CHIP_ERROR_UNSUPPORTED_CHIP_FEATURE. */
+        return BLE_HS_ENOTSUP;
+    }
+    return __real_nimble_port_init();
+}
+#endif
+
+extern "C" bool matter_ble_commissioning_enabled(void)
+{
+    return s_ble_commissioning.load(std::memory_order_relaxed);
+}
+
 extern "C" esp_err_t matter_init(void)
 {
     matter_runtime_status_t expected = MATTER_RUNTIME_STOPPED;
@@ -435,6 +519,19 @@ extern "C" esp_err_t matter_init(void)
         return s_started.load(std::memory_order_acquire) ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
+#if CONFIG_ENABLE_CHIPOBLE
+    s_ble_commissioning.store(settings_get()->ble_commissioning, std::memory_order_relaxed);
+    if (!s_ble_commissioning.load(std::memory_order_relaxed)) {
+        /* Bluetooth cannot start in this boot (__wrap_nimble_port_init), so
+         * hand its static RAM and the ROM controller's DRAM to the heap now,
+         * as ESP-Matter does when it shuts Bluetooth down on a paired device.
+         * ESP-IDF allows this before the controller is first initialised. */
+        const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BLE);
+        if (released != ESP_OK) {
+            ESP_LOGW(kTag, "Bluetooth memory not released: %s", esp_err_to_name(released));
+        }
+    }
+#endif
     chip::Logging::SetLogRedirectCallback(log_chip_line);
 
     esp_err_t error = validate_storage_configuration();
@@ -488,6 +585,10 @@ extern "C" esp_err_t matter_init(void)
     error = matter_battery_create(node);
     if (error != ESP_OK) {
         return fail_init(error, "could not create Matter battery endpoint");
+    }
+    error = matter_temperature_create(node);
+    if (error != ESP_OK) {
+        return fail_init(error, "could not create Matter temperature endpoint");
     }
 
     esp_matter::cluster_t *management_cluster = esp_matter::cluster::get(
@@ -558,9 +659,14 @@ extern "C" esp_err_t matter_init(void)
         ESP_LOGW(kTag, "NodeLabel keeps its stored value");
     }
 
-    error = matter_battery_start(s_tbr_endpoint_id.load(std::memory_order_relaxed));
+    error = matter_battery_start(s_tbr_endpoint_id.load(std::memory_order_relaxed),
+                                 matter_temperature_endpoint());
     if (error != ESP_OK) {
         return fail_init(error, "could not start Matter battery reporting");
+    }
+    error = matter_temperature_start();
+    if (error != ESP_OK) {
+        return fail_init(error, "could not start Matter temperature reporting");
     }
 
     ESP_LOGI(kTag, "Matter TBR endpoint %u started (%s)",
@@ -659,6 +765,42 @@ extern "C" esp_err_t matter_open_commissioning_window(uint16_t timeout_seconds)
     return ESP_OK;
 }
 
+extern "C" esp_err_t matter_close_commissioning_window(void)
+{
+    if (!s_started.load(std::memory_order_acquire)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_commissioning_window_open.load(std::memory_order_acquire)) {
+        return ESP_OK;
+    }
+    return chip_error_to_esp(
+        chip::DeviceLayer::PlatformMgr().ScheduleWork(close_commissioning_window_work, 0));
+}
+
+extern "C" matter_window_t matter_get_commissioning_window(void)
+{
+    if (!s_commissioning_window_open.load(std::memory_order_acquire)) {
+        return MATTER_WINDOW_CLOSED;
+    }
+    return s_window_enhanced.load(std::memory_order_acquire) ? MATTER_WINDOW_ENHANCED
+                                                             : MATTER_WINDOW_BASIC;
+}
+
+extern "C" int matter_get_commissioning_window_seconds_left(void)
+{
+    const int64_t deadline = s_window_deadline_us.load(std::memory_order_acquire);
+    if (deadline == 0 || !s_commissioning_window_open.load(std::memory_order_acquire)) {
+        return -1;
+    }
+    const int64_t left_us = deadline - esp_timer_get_time();
+    return left_us > 0 ? static_cast<int>((left_us + 999999) / 1000000) : 0;
+}
+
+extern "C" unsigned matter_get_fabric_count(void)
+{
+    return s_fabric_count.load(std::memory_order_acquire);
+}
+
 extern "C" esp_err_t matter_factory_reset(void)
 {
     if (!s_started.load(std::memory_order_acquire)) {
@@ -719,10 +861,18 @@ extern "C" esp_err_t matter_get_onboarding_codes(char *qr_code, size_t qr_code_s
         !s_commissioning_window_open.load(std::memory_order_acquire)) {
         return ESP_ERR_INVALID_STATE;
     }
+    /* An enhanced window accepts only the passcode of the controller that
+     * opened it; this device's code would just fail the pairing. */
+    if (matter_get_commissioning_window() == MATTER_WINDOW_ENHANCED) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     chip::RendezvousInformationFlags rendezvous(chip::RendezvousInformationFlag::kOnNetwork);
 #if defined(CONFIG_ENABLE_CHIPOBLE)
-    if (!s_commissioned.load(std::memory_order_acquire)) {
+    /* Bluetooth runs only for a first pairing, and only if it was on when
+     * Matter started; otherwise the code must not send phones looking for it. */
+    if (s_ble_commissioning.load(std::memory_order_relaxed) &&
+        !s_ble_shut_down.load(std::memory_order_acquire)) {
         rendezvous.Set(chip::RendezvousInformationFlag::kBLE);
     }
 #endif
