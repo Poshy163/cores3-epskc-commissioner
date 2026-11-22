@@ -955,7 +955,9 @@ def svg(panel_map: dict[str, list[Box]], path: Path) -> None:
             'fill="#1B2119"/>'
         )
 
-        all_boxes = header_boxes(PANEL_TITLES[panel_name], maximum_wifi=False) + boxes
+        # A variant such as "matter:code" shares its panel's title.
+        title = PANEL_TITLES[panel_name.split(":", 1)[0]]
+        all_boxes = header_boxes(title, maximum_wifi=False) + boxes
         panel_lookup = {box.name: box for box in boxes}
         for box in all_boxes:
             is_header = box.name.startswith("header:")
