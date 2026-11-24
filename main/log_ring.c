@@ -25,7 +25,11 @@
 #define HALF_MAGIC 0x48474f4cu   /* "LOGH" */
 #define PENDING_SLOTS 4
 #define FORMAT_BUFFER 192
-#define DUPLICATE_RETAIN_MS 60000u
+/* One retained example of the MLE duplicate warning per window. Routers that
+ * send broadcasts twice produce one per copy, about 17 a minute on the bench
+ * network; at one a minute they filled the 1,024-line ring in about 17 hours
+ * and pushed everything else out. Every occurrence is still counted. */
+#define DUPLICATE_RETAIN_MS (15u * 60u * 1000u)
 #define MSYNC_FLAGS (ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_TYPE_DATA | \
                      ESP_CACHE_MSYNC_FLAG_UNALIGNED)
 

@@ -272,7 +272,7 @@ int main(int argc, char **argv)
     assert(log_ring_init() == ESP_OK && !log_ring_info(LOG_RING_PREVIOUS, &info));
 
     /* Repeated MLE replay warnings keep exact persisted counts while only
-     * retaining one example per minute. Other errors are never coalesced. */
+     * retaining one example per 15 minutes. Other errors are never coalesced. */
     task(1);
     test_time = 1000000;
     emit("W(1) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated\n");
@@ -301,15 +301,20 @@ int main(int argc, char **argv)
         assert(info.latest_seq == i + 2 && info.duplicate_mle_count == 10);
         assert(!strcmp(line(LOG_RING_CURRENT, i + 2), untouched[i]));
     }
+    /* A minute later is still inside the window: counted, not retained. */
     test_time = 61000000;
     emit("W(61) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated\n");
     assert(log_ring_info(LOG_RING_CURRENT, &info));
-    assert(info.latest_seq == untouched_count + 2 && info.duplicate_mle_count == 11);
+    assert(info.latest_seq == untouched_count + 1 && info.duplicate_mle_count == 11);
+    test_time = 901000000;
+    emit("W(901) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated\n");
+    assert(log_ring_info(LOG_RING_CURRENT, &info));
+    assert(info.latest_seq == untouched_count + 2 && info.duplicate_mle_count == 12);
     assert(!strcmp(line(LOG_RING_CURRENT, untouched_count + 2),
-        "W(61) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated [count 10, total 11]"));
+        "W(901) OPENTHREAD:[W] Mle-----------: Failed to process UDP - Duplicated [count 11, total 12]"));
     reboot();
     assert(log_ring_init() == ESP_OK);
-    assert(log_ring_info(LOG_RING_PREVIOUS, &info) && info.duplicate_mle_count == 11);
+    assert(log_ring_info(LOG_RING_PREVIOUS, &info) && info.duplicate_mle_count == 12);
     assert(log_ring_info(LOG_RING_CURRENT, &info) && info.duplicate_mle_count == 0);
     emit("W(1) OPENTHREAD:[W] Mle-----------: Failed to process UDP: Duplicated\n");
     assert(log_ring_info(LOG_RING_CURRENT, &info) && info.latest_seq == 1);

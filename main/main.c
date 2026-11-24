@@ -536,10 +536,15 @@ static void on_wifi(void *arg, esp_event_base_t base, int32_t id, void *data)
             char ip6[sizeof(s_ip6)] = { 0 };
             snprintf(ip6, sizeof(ip6), IPV6STR, IPV62STR(e->ip6_info.ip));
             portENTER_CRITICAL(&s_wifi_status_lock);
+            /* ESP-IDF repeats this event for an unchanged address every few
+             * hours. A disconnect resets s_ip6, so a reconnect still logs. */
+            const bool changed = strcmp(s_ip6, ip6) != 0;
             memcpy(s_ip6, ip6, sizeof(s_ip6));
             ++s_wifi_status_generation;
             portEXIT_CRITICAL(&s_wifi_status_lock);
-            ESP_LOGI(TAG, "backbone IPv6 %s", ip6);
+            if (changed) {
+                ESP_LOGI(TAG, "backbone IPv6 %s", ip6);
+            }
             xEventGroupSetBits(s_wifi_events, WIFI_BACKBONE_READY_BIT);
             /* IPv4 is not a prerequisite for Thread border routing.  Start on
              * a usable backbone IPv6 address too; the operation is idempotent

@@ -187,7 +187,10 @@ those further controls are not implemented yet.
 Firmware logs, including Matter and OpenThread, are also kept in PSRAM: the last 1,024 retained lines of this boot and the last 1,024 of the previous one. `GET /logs` serves them, so seeing what the device has been doing no longer needs a USB cable.
 
 Repeated identical OpenThread MLE duplicate warnings occupy at most one retained
-line per minute, keeping other diagnostics visible. The `/logs` JSON field
+line per 15 minutes, keeping other diagnostics visible. They come from routers
+that send broadcasts more than once: OpenThread drops each extra copy, about
+17 a minute on a large network, which at one line a minute filled the ring in
+under a day. The `/logs` JSON field
 `duplicate_mle_count` counts every occurrence, including coalesced lines; the
 text response includes the same count in its header. USB console output is unchanged.
 
