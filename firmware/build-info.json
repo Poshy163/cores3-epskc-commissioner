@@ -1,14 +1,14 @@
 {
   "schema": 2,
-  "source_commit": "3266f6e98a103b6c55a9cb96c6f1aa2a65c98bc1",
-  "version": "3266f6e",
+  "source_commit": "a240dbe1a59028c605436922e9a414dea62d87aa",
+  "version": "a240dbe",
   "sdk": "v6.1.1",
-  "app_elf_sha256": "3cf72d970422d6e217b6546ebdee23d8b7a7ad9774337bf2c783411f4e004fab",
+  "app_elf_sha256": "47f55eff0fc5a1f94ccd63e87f7d4f888fb916dc4e3617e6f0c84d48909af32d",
   "artifacts": {
     "bootloader.bin": {
       "offset": "0x0",
       "bytes": 22128,
-      "sha256": "ba7d4dbaa2fc858c7f73a7fb9f934d70de187a9796c492665a863b51a5a65fa9"
+      "sha256": "e5e16e9b664be2c857199052c116700b75f1c14b96ee854faf70356a7fc0d036"
     },
     "partition-table.bin": {
       "offset": "0x8000",
@@ -17,18 +17,18 @@
     },
     "epskc-commissioner-app.bin": {
       "offset": "0x10000",
-      "bytes": 3019728,
-      "sha256": "1403c1218cf2d788c499767de270ebdd94f7a71295859e3f3c26436b4ab6b1b3"
+      "bytes": 3017024,
+      "sha256": "0570c593295b2d455d4a19e2d8f6cc531e870abdf869f0bd0f4f5c5e211b8318"
     },
     "rcp-fw.bin": {
       "offset": "0x720000",
       "bytes": 655360,
-      "sha256": "5e36879716dd06f431a04b523acd6e1aeb66e339276a5bb81342fe034e713444"
+      "sha256": "bb71b56bfcd2c5563fbb1a4960aa58c9dc10a73411cd43fe7dd1196391097731"
     },
     "cores3-epskc-commissioner.bin": {
       "offset": "0x0",
       "bytes": 8126464,
-      "sha256": "af18a919c183d591fb5832af5f41b251988c2de2972ac7d1e9abcd25288b5451"
+      "sha256": "bad15e55bc25a1a32848eec2b6785975d9bfb9aac2b4c2674218ce3c6d0dbb98"
     }
   }
 }
