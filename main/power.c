@@ -372,9 +372,12 @@ esp_err_t power_sampling_start(void)
      * heap availability after display/Wi-Fi initialization. IDF takes bytes.
      * main/linker.lf moves this component's .bss to PSRAM; FreeRTOS requires
      * an internal TCB, and the stack stays internal because this task drives
-     * I2C and esp_pm_configure(). */
+     * I2C and esp_pm_configure(). Measured on the bench, its deepest path (a
+     * power-source change switching the CPU and Wi-Fi profile both ways) uses
+     * about 1.6 KB; 3 KB leaves room for error paths. `status` reports the
+     * headroom as "power st". */
     static DRAM_ATTR StaticTask_t task_storage;
-    static DRAM_ATTR StackType_t stack[4096 / sizeof(StackType_t)];
+    static DRAM_ATTR StackType_t stack[3072 / sizeof(StackType_t)];
     s_pmic_mutex = xSemaphoreCreateMutexStatic(&s_pmic_mutex_storage);
     sample_power(true);
     s_power_task = xTaskCreateStatic(power_task, "power", sizeof(stack), NULL, 3, stack,

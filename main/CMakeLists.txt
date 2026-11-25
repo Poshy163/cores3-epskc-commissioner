@@ -26,6 +26,12 @@ if(CONFIG_ENABLE_CHIPOBLE)
         "-u __wrap_nimble_port_init")
 endif()
 
+# CHIP makes one station connect of its own while Matter starts, racing the
+# firmware's Wi-Fi supervisor. matter.cpp skips just that call.
+target_link_libraries(${COMPONENT_LIB} INTERFACE
+    "-Wl,--wrap=esp_wifi_connect"
+    "-u __wrap_esp_wifi_connect")
+
 # The top-level CMakeLists.txt derives the version from git (or version.txt)
 # and hands it to ESP-IDF as PROJECT_VER, so the app descriptor that Matter
 # reports as SoftwareVersionString and the FW_VERSION the console prints are

@@ -59,7 +59,7 @@ A new password is tested in RAM and only written to flash once it has actually c
 ## Joining someone else's network
 
 1. Ask your border router for an ephemeral key. In Home Assistant that's the Thread panel once ePSKc support lands; today you can run `ot-ctl ba ephemeralkey start <9 digits> 300000` inside the OTBR add-on container.
-2. **Scan**, pick your router from the list.
+2. **Scan**, pick your router from the list. Routers that publish only IPv6 addresses are listed too: the device dials IPv4 when a router has it, otherwise its global or ULA IPv6 address, and a link-local one scoped to the Wi-Fi interface as a last resort.
 3. Type the code, or press **QR** and hold the code up to the camera.
 4. Watch it join. Keys are single use and expire, so if the join fails, mint a fresh one.
 

@@ -62,6 +62,10 @@ static char s_ip6[46] = "-";       /* backbone link-local, for RS on the infra l
 static char s_ssid[33] = "";
 static int s_retries;
 static bool s_wifi_hold;   /* true after an intentional leave: no auto-reconnect */
+/* esp_restart() stops Wi-Fi from its own shutdown handler. The disconnect that
+ * raises must not start the reconnect ladder against a stopping driver, which
+ * logged a burst of ESP_ERR_WIFI_NOT_STARTED warnings on every reboot. */
+static volatile bool s_shutting_down;
 
 /*
  * ---------------- reconnect supervisor ----------------
@@ -209,8 +213,16 @@ static void cancel_reconnect(void)
 }
 
 /* Arm the next attempt. Never gives up while credentials are stored. */
+static void on_shutdown(void)
+{
+    s_shutting_down = true;
+}
+
 static void schedule_reconnect(void)
 {
+    if (s_shutting_down) {
+        return;
+    }
     if (s_reconnect_timer == NULL) {
         /* No timer: fall back to the old bounded behaviour rather than
          * silently doing nothing. */
@@ -235,8 +247,8 @@ static void schedule_reconnect(void)
 static void reconnect_timer_cb(void *arg)
 {
     (void) arg;
-    if (!s_supervisor_on || s_wifi_hold || s_join_active) {
-        return;   /* the join path or a deliberate leave owns the radio */
+    if (!s_supervisor_on || s_wifi_hold || s_join_active || s_shutting_down) {
+        return;   /* the join path, a deliberate leave or a restart owns the radio */
     }
     if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) {
         return;
@@ -266,7 +278,8 @@ static esp_timer_handle_t s_watchdog_timer;
 static void wifi_watchdog_cb(void *arg)
 {
     (void) arg;
-    if (!s_supervisor_on || s_join_active || s_wifi_hold || s_wifi_events == NULL) {
+    if (!s_supervisor_on || s_join_active || s_wifi_hold || s_shutting_down ||
+        s_wifi_events == NULL) {
         return;
     }
     if (xEventGroupGetBits(s_wifi_events) & WIFI_CONNECTED_BIT) {
@@ -1361,7 +1374,8 @@ static int cmd_thread(int argc, char **argv)
     thread_activity_t activity;
     bool have_activity = thread_activity_get(&activity);
     printf("role       : %s\n", have_activity ? activity.role : thread_role());
-    printf("credentials: %s\n", thread_has_dataset() ? "stored" : "none");
+    printf("credentials: %s\n", !thread_available() ? "unknown (Thread not running)"
+                                : thread_has_dataset() ? "stored" : "none");
     printf("br boot    : %s\n", thread_border_router_status());
     char rcp[128];
     if (thread_rcp_version(rcp, sizeof(rcp))) {
@@ -1998,6 +2012,9 @@ void app_main(void)
 
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+    /* Registered after esp_wifi_init() so it runs first: esp_restart() calls
+     * shutdown handlers newest first, and Wi-Fi's stops the driver. */
+    ESP_ERROR_CHECK(esp_register_shutdown_handler(on_shutdown));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(

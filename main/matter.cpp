@@ -240,6 +240,9 @@ std::atomic<bool> s_ble_commissioning{false};
  * at start-up or when commissioning completes; it stays down for this boot
  * even if every fabric is later removed. */
 std::atomic<bool> s_ble_shut_down{false};
+/* From just before esp_matter::start() until the station is declared
+ * application-controlled; see __wrap_esp_wifi_connect(). */
+std::atomic<bool> s_chip_wifi_startup{false};
 
 chip::KvsPersistentStorageDelegate s_tbr_storage_delegate;
 chip::app::Clusters::ThreadBorderRouterManagement::GenericOpenThreadBorderRouterDelegate
@@ -506,6 +509,27 @@ extern "C" esp_err_t __wrap_nimble_port_init(void)
 }
 #endif
 
+/*
+ * main/CMakeLists.txt routes esp_wifi_connect() through here. The firmware's
+ * Wi-Fi supervisor connects the station before Matter starts. While Matter
+ * starts, CHIP's connectivity manager makes one esp_wifi_connect() call of its
+ * own, before matter_init() can declare the station application-controlled;
+ * with the supervisor's attempt still in flight, the driver ("sta is
+ * connecting") and CHIP both logged it as an error at every boot. Only that
+ * call, from the CHIP task inside that window, is skipped. CHIP then follows
+ * the supervisor's connection through the driver's events like any other.
+ */
+extern "C" esp_err_t __real_esp_wifi_connect(void);
+extern "C" esp_err_t __wrap_esp_wifi_connect(void)
+{
+    if (s_chip_wifi_startup.load(std::memory_order_acquire) &&
+        std::strcmp(pcTaskGetName(nullptr), CHIP_DEVICE_CONFIG_CHIP_TASK_NAME) == 0) {
+        ESP_LOGI(kTag, "Matter start: station connect left to the Wi-Fi supervisor");
+        return ESP_OK;
+    }
+    return __real_esp_wifi_connect();
+}
+
 extern "C" bool matter_ble_commissioning_enabled(void)
 {
     return s_ble_commissioning.load(std::memory_order_relaxed);
@@ -629,8 +653,10 @@ extern "C" esp_err_t matter_init(void)
         return fail_init(error, "could not reset the ESP32-H2 RCP");
     }
 
+    s_chip_wifi_startup.store(true, std::memory_order_release);
     error = esp_matter::start(matter_event_callback);
     if (error != ESP_OK) {
+        s_chip_wifi_startup.store(false, std::memory_order_release);
         return fail_init(error, "ESP-Matter start failed");
     }
 
@@ -646,6 +672,7 @@ extern "C" esp_err_t matter_init(void)
         chip_error = chip::DeviceLayer::ConnectivityMgr().SetWiFiStationMode(
             chip::DeviceLayer::ConnectivityManager::kWiFiStationMode_ApplicationControlled);
     }
+    s_chip_wifi_startup.store(false, std::memory_order_release);
     if (chip_error != CHIP_NO_ERROR) {
         return fail_init(chip_error_to_esp(chip_error), "could not retain application-controlled Wi-Fi");
     }

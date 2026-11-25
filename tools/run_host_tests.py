@@ -19,7 +19,7 @@ def main():
                    'test_matter_battery_worker.py', 'test_matter_identity.py', 'test_ui_wake.py', 'test_log_ring.py',
                    'test_camera.py', 'test_meshcop_transport.py', 'test_remote_admin.py',
                    'test_remote_http.py', 'test_device_status.py', 'test_thread_join.py',
-                   'test_rcp_recovery.py']:
+                   'test_rcp_recovery.py', 'test_discover.py']:
         subprocess.run([sys.executable, str(root / 'tools' / script), '--cc', args.cc], check=True)
     subprocess.run([sys.executable, str(root / 'tools' / 'test_remote_client.py')], check=True)
     compiler = [args.cc]

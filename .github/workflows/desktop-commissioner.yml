@@ -6,7 +6,7 @@ name: desktop-commissioner
 
 on:
   push:
-    branches: [main, "ci/**"]
+    branches: [main]
     paths:
       - "tools/Dockerfile"
       - "tools/epskc_commissioner.c"

@@ -228,7 +228,11 @@ esp_err_t qrscan_start(void)
             }
         }
         int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
+        const esp_log_level_t gpio_level = esp_log_level_get("gpio");
+        esp_log_level_set("gpio", ESP_LOG_NONE);   /* see the cold start below */
+        int streamed = ioctl(s_fd, VIDIOC_STREAMON, &type);
+        esp_log_level_set("gpio", gpio_level);
+        if (streamed != 0) {
             ESP_LOGE(TAG, "warm restart STREAMON failed");
             /* STREAMON cleans up a controller it could not create, but the
              * V4L2 buffers above remain queued. Reset the stopped userspace
@@ -308,8 +312,16 @@ esp_err_t qrscan_start(void)
         }
     }
 
+    /* esp_cam_sensor's DVP controller is created on every STREAMON and installs
+     * the GPIO ISR service each time. The touch driver installed it at boot, so
+     * the GPIO driver logs "GPIO isr service already installed" as an error,
+     * although the camera driver ignores that result. Mute only that tag. */
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    if (ioctl(s_fd, VIDIOC_STREAMON, &type) != 0) {
+    const esp_log_level_t gpio_level = esp_log_level_get("gpio");
+    esp_log_level_set("gpio", ESP_LOG_NONE);
+    int streamed = ioctl(s_fd, VIDIOC_STREAMON, &type);
+    esp_log_level_set("gpio", gpio_level);
+    if (streamed != 0) {
         ESP_LOGE(TAG, "VIDIOC_STREAMON failed");
         goto fail;
     }

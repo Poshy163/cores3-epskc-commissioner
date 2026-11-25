@@ -71,6 +71,10 @@ esp_err_t thread_forget(void);
 
 /* True if an Active Operational Dataset is stored. */
 bool thread_has_dataset(void);
+/* Bounded reads for the touchscreen's timers and tap handlers: ESP_ERR_TIMEOUT
+ * when the OpenThread lock stays busy for timeout_ms (capped at 1 s), so the
+ * display can keep its last value instead of freezing. */
+esp_err_t thread_has_dataset_with_timeout(bool *has, uint32_t timeout_ms);
 
 /* "disabled" / "detached" / "child" / "router" / "leader", for the UI. */
 const char *thread_role(void);
@@ -138,6 +142,7 @@ typedef struct {
 } thread_topology_t;
 
 esp_err_t thread_topology_refresh(void);
+esp_err_t thread_topology_refresh_with_timeout(uint32_t timeout_ms);
 void thread_topology_get(thread_topology_t *topology);
 
 /*
@@ -150,6 +155,8 @@ esp_err_t thread_share_start(char *code, size_t cap, uint32_t lifetime_ms);
 void thread_share_stop(void);
 /* "off" / "waiting" / "connected" / "accepted" */
 const char *thread_share_state(void);
+/* NULL when the OpenThread lock stayed busy for timeout_ms. */
+const char *thread_share_state_with_timeout(uint32_t timeout_ms);
 
 /* Active Operational Dataset as lowercase hex TLVs, the form HA's Thread panel
  * accepts for "add network". Contains the network key. */
@@ -203,3 +210,6 @@ esp_err_t thread_share_start_on(char *code, size_t cap, uint32_t lifetime_ms, ui
  * from the console), and a cache silently goes stale.
  */
 bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *panid);
+/* ESP_ERR_NOT_FOUND without an active dataset, ESP_ERR_TIMEOUT when busy. */
+esp_err_t thread_network_info_with_timeout(char *name, size_t name_len, int *channel,
+                                           uint16_t *panid, uint32_t timeout_ms);

@@ -316,7 +316,20 @@ static void topology_discover_cb(otError error, otMeshDiagRouterInfo *router, vo
     taskEXIT_CRITICAL(&s_topology_lock);
 }
 
-esp_err_t thread_topology_refresh(void)
+/*
+ * The *_with_timeout variants exist for the touchscreen. Its LVGL timers and
+ * tap handlers run on the display task, and waiting there for the OpenThread
+ * lock froze drawing and touch input for as long as the stack held it (a
+ * dataset apply, mesh diagnostics, Spinel recovery). They give up after the
+ * caller's short wait and say so, so the screen can keep its last values.
+ * The cap keeps a large timeout from turning back into a long stall.
+ */
+static TickType_t bounded_wait(uint32_t timeout_ms)
+{
+    return pdMS_TO_TICKS(timeout_ms > 1000 ? 1000 : timeout_ms);
+}
+
+static esp_err_t topology_refresh(TickType_t wait)
 {
     if (!s_ready) {
         topology_reset(THREAD_TOPOLOGY_FAILED);
@@ -326,7 +339,9 @@ esp_err_t thread_topology_refresh(void)
     /* OT -> topology is the lock order used by callbacks and cancellation.
      * Claim both sides atomically so a concurrent join cannot reset the state
      * between marking it SCANNING and starting the diagnostic query. */
-    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (!esp_openthread_lock_acquire(wait)) {
+        return ESP_ERR_TIMEOUT;
+    }
     taskENTER_CRITICAL(&s_topology_lock);
     if (s_topology.status == THREAD_TOPOLOGY_SCANNING) {
         taskEXIT_CRITICAL(&s_topology_lock);
@@ -370,6 +385,16 @@ esp_err_t thread_topology_refresh(void)
     return ESP_FAIL;
 }
 
+esp_err_t thread_topology_refresh(void)
+{
+    return topology_refresh(portMAX_DELAY);
+}
+
+esp_err_t thread_topology_refresh_with_timeout(uint32_t timeout_ms)
+{
+    return topology_refresh(bounded_wait(timeout_ms));
+}
+
 void thread_topology_get(thread_topology_t *topology)
 {
     if (topology == NULL) {
@@ -385,16 +410,34 @@ bool thread_available(void)
     return s_ready;
 }
 
-bool thread_has_dataset(void)
+static esp_err_t has_dataset_get(bool *has, TickType_t wait)
 {
+    *has = false;
     if (!s_ready) {
-        return false;
+        return ESP_ERR_INVALID_STATE;
     }
     otOperationalDatasetTlvs ds;
-    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (!esp_openthread_lock_acquire(wait)) {
+        return ESP_ERR_TIMEOUT;
+    }
     otError err = otDatasetGetActiveTlvs(esp_openthread_get_instance(), &ds);
     esp_openthread_lock_release();
-    return err == OT_ERROR_NONE && ds.mLength > 0;
+    *has = err == OT_ERROR_NONE && ds.mLength > 0;
+    return ESP_OK;
+}
+
+bool thread_has_dataset(void)
+{
+    bool has;
+    return has_dataset_get(&has, portMAX_DELAY) == ESP_OK && has;
+}
+
+esp_err_t thread_has_dataset_with_timeout(bool *has, uint32_t timeout_ms)
+{
+    if (has == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return has_dataset_get(has, bounded_wait(timeout_ms));
 }
 
 esp_err_t thread_init(void)
@@ -1102,26 +1145,47 @@ void thread_share_stop(void)
 }
 
 /* One read of the stack state; the two callers word it differently. */
+/* False only when the OpenThread lock was not free within `wait`. */
+static bool epskc_state_get(otBorderAgentEphemeralKeyState *st, TickType_t wait)
+{
+    *st = OT_BORDER_AGENT_STATE_DISABLED;
+    if (!s_ready) {
+        return true;
+    }
+    if (!esp_openthread_lock_acquire(wait)) {
+        return false;
+    }
+    *st = otBorderAgentEphemeralKeyGetState(esp_openthread_get_instance());
+    esp_openthread_lock_release();
+    return true;
+}
+
 static otBorderAgentEphemeralKeyState epskc_state(void)
 {
-    if (!s_ready) {
-        return OT_BORDER_AGENT_STATE_DISABLED;
-    }
-    esp_openthread_lock_acquire(portMAX_DELAY);
-    otBorderAgentEphemeralKeyState st =
-        otBorderAgentEphemeralKeyGetState(esp_openthread_get_instance());
-    esp_openthread_lock_release();
+    otBorderAgentEphemeralKeyState st;
+    epskc_state_get(&st, portMAX_DELAY);
     return st;
 }
 
-const char *thread_share_state(void)
+static const char *share_state_name(otBorderAgentEphemeralKeyState st)
 {
-    switch (epskc_state()) {
+    switch (st) {
     case OT_BORDER_AGENT_STATE_STARTED:   return "waiting";
     case OT_BORDER_AGENT_STATE_CONNECTED: return "connected";
     case OT_BORDER_AGENT_STATE_ACCEPTED:  return "accepted";
     default:                              return "off";
     }
+}
+
+const char *thread_share_state(void)
+{
+    return share_state_name(epskc_state());
+}
+
+const char *thread_share_state_with_timeout(uint32_t timeout_ms)
+{
+    otBorderAgentEphemeralKeyState st;
+    return epskc_state_get(&st, bounded_wait(timeout_ms)) ? share_state_name(st) : NULL;
 }
 
 bool thread_dataset_hex(char *out, size_t cap)
@@ -1193,7 +1257,11 @@ void thread_apply_router_preference(void)
     if (now - s_last_promote_us < 30LL * 1000 * 1000) {
         return;
     }
-    esp_openthread_lock_acquire(portMAX_DELAY);
+    /* The touchscreen's 2 s timer is the only caller: if OpenThread is busy,
+     * try again on its next tick rather than freezing the display. */
+    if (!esp_openthread_lock_acquire(bounded_wait(20))) {
+        return;
+    }
     otInstance *ins = esp_openthread_get_instance();
     if (otThreadGetDeviceRole(ins) == OT_DEVICE_ROLE_CHILD) {
         s_last_promote_us = now;
@@ -1370,17 +1438,20 @@ uint16_t thread_share_port(void)
     return p;
 }
 
-bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *panid)
+static esp_err_t network_info_get(char *name, size_t name_len, int *channel,
+                                  uint16_t *panid, TickType_t wait)
 {
     if (!s_ready) {
-        return false;
+        return ESP_ERR_INVALID_STATE;
     }
     otOperationalDataset ds;
-    esp_openthread_lock_acquire(portMAX_DELAY);
+    if (!esp_openthread_lock_acquire(wait)) {
+        return ESP_ERR_TIMEOUT;
+    }
     otError err = otDatasetGetActive(esp_openthread_get_instance(), &ds);
     esp_openthread_lock_release();
     if (err != OT_ERROR_NONE) {
-        return false;
+        return ESP_ERR_NOT_FOUND;
     }
     if (name != NULL && name_len > 0) {
         if (ds.mComponents.mIsNetworkNamePresent) {
@@ -1395,5 +1466,16 @@ bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *pa
     if (panid != NULL) {
         *panid = ds.mComponents.mIsPanIdPresent ? ds.mPanId : 0;
     }
-    return true;
+    return ESP_OK;
+}
+
+bool thread_network_info(char *name, size_t name_len, int *channel, uint16_t *panid)
+{
+    return network_info_get(name, name_len, channel, panid, portMAX_DELAY) == ESP_OK;
+}
+
+esp_err_t thread_network_info_with_timeout(char *name, size_t name_len, int *channel,
+                                           uint16_t *panid, uint32_t timeout_ms)
+{
+    return network_info_get(name, name_len, channel, panid, bounded_wait(timeout_ms));
 }

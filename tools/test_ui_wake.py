@@ -50,9 +50,8 @@ esp_err_t power_cached(power_status_t *out,float *die_temp) {
     assert(die_temp==NULL); ++reads; *out=pmic; return read_error;
 }
 void power_set_screen_percent(unsigned percent) { screen_report=percent; }
-static void lv_obj_add_flag(int *o,int flag) { (void)flag; *o=1; }
-static void lv_obj_clear_flag(int *o,int flag) { (void)flag; *o=0; }
-static bool lv_obj_has_flag(int *o,int flag) { (void)flag; return *o!=0; }
+static void lv_obj_set_hidden(int *o,bool hidden) { *o=hidden; }
+static bool lv_obj_is_hidden(int *o) { return *o!=0; }
 static void lv_label_set_text(int *o,const char *text) { (void)o; snprintf(label_text,sizeof(label_text),"%s",text); }
 static void lv_label_set_text_fmt(int *o,const char *fmt,...) {
     (void)o; va_list a; va_start(a,fmt); vsnprintf(label_text,sizeof(label_text),fmt,a); va_end(a);

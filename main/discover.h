@@ -6,10 +6,12 @@
 
 #define BA_NAME_LEN 48
 #define BA_MAX      8
+/* An IPv6 literal with a "%st1"-style zone and its terminator fits. */
+#define BA_ADDR_LEN 48
 
 typedef struct {
     char name[BA_NAME_LEN];  /* instance name from the PTR record */
-    char ip[16];             /* IPv4 */
+    char ip[BA_ADDR_LEN];    /* numeric IPv4, or IPv6 (link-local carries its zone) */
     uint16_t port;
 } ba_entry_t;
 
