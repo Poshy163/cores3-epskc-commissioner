@@ -1,0 +1,35 @@
+# Builds the optional desktop commissioner against the Mbed TLS release pinned
+# in tools/Dockerfile and runs Mbed TLS's own DTLS EC-JPAKE scenarios, the
+# handshake the commissioner uses with a Thread Border Agent. It runs only when
+# the client or its toolchain changes; the firmware has its own Mbed TLS.
+name: desktop-commissioner
+
+on:
+  push:
+    branches: [main, "ci/**"]
+    paths:
+      - "tools/Dockerfile"
+      - "tools/epskc_commissioner.c"
+      - ".github/workflows/desktop-commissioner.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-commissioner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop-commissioner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build desktop commissioner with Mbed TLS
+        run: docker build -t cores3-desktop-commissioner -f tools/Dockerfile tools
+      - name: Negotiate DTLS EC-JPAKE on loopback
+        # The upstream scenarios force TLS-ECJPAKE-WITH-AES-128-CCM-8 for the
+        # client. Cover HelloVerify cookies, no cookies, and a quiet exchange.
+        run: >-
+          docker run --rm --network none cores3-desktop-commissioner
+          /src/mbedtls/tests/ssl-opt.sh --filter 'ECJPAKE: working, DTLS' --min 3

@@ -42,21 +42,14 @@ static int *panel_power=&panel, *s_sleep_shield=&shield;
 static struct { int brightness; } settings={95};
 #define settings_get() (&settings)
 static power_status_t pmic;
-static int read_error, reads, logs, reports, flushed, lit, refreshed, deleted;
+static int read_error, reads, flushed, lit, refreshed, deleted;
+static unsigned screen_report;
 static char label_text[40], rendered[40];
 static const char *expected;
-static esp_err_t power_read_test(power_status_t *out) { ++reads; *out=pmic; return read_error; }
-#define power_read power_read_test
-static void power_log_note(const power_status_t *s,int e,unsigned screen) {
-    (void)s;(void)e; ++logs; assert(screen == (unsigned)(s_asleep ? 0 : settings.brightness));
+esp_err_t power_cached(power_status_t *out,float *die_temp) {
+    assert(die_temp==NULL); ++reads; *out=pmic; return read_error;
 }
-static void matter_note_power(const power_status_t *s,int e) {
-    ++reports; if(!e) assert(s->percent==pmic.percent);
-}
-static void app_wifi_set_power_profile(bool usb) { assert(usb==pmic.vbus); }
-void power_note_sample(int percent,bool on_battery) {
-    if(read_error) assert(percent==-1 && !on_battery);
-}
+void power_set_screen_percent(unsigned percent) { screen_report=percent; }
 static void lv_obj_add_flag(int *o,int flag) { (void)flag; *o=1; }
 static void lv_obj_clear_flag(int *o,int flag) { (void)flag; *o=0; }
 static bool lv_obj_has_flag(int *o,int flag) { (void)flag; return *o!=0; }
@@ -72,11 +65,11 @@ static void refresh_power_info(void) { assert(!lit); ++refreshed; }
 static void lv_refr_now(void *display) {
     (void)display; assert(!lit); ++flushed; strcpy(rendered,label_text);
 }
-static void bsp_display_brightness_set(int v) {
+static esp_err_t bsp_display_brightness_set(unsigned v) {
     assert(v==95 && flushed && !s_asleep && !s_dimmed);
     assert(!strcmp(rendered,expected)); // fresh frame before backlight
     if(!panel) assert(refreshed);
-    ++lit;
+    ++lit; return ESP_OK;
 }
 static void lv_obj_delete_async(int *obj) { assert(obj==&shield); ++deleted; }
 ''' + poll + wake + r'''
@@ -86,11 +79,11 @@ int main(void) {
     // Screen sleeps on USB, then unplugged samples continue for hours.
     s_asleep=true; pmic.percent=80; pmic.vbus=false;
     for(int i=0;i<10;++i) batt_timer_cb(NULL);
-    assert(logs==11 && reports==11 && !s_on_external_power);
+    assert(reads==11 && !s_on_external_power);
     assert(!strcmp(label_text,"bolt 100%")); // intentionally not drawing asleep
     expected="80%"; s_dimmed=true; on_wake(NULL);
     assert(lit==1 && refreshed==1 && deleted==1 && !s_sleep_shield);
-    assert(reads==12 && logs==12 && reports==12);
+    assert(reads==12 && screen_report==95);
     int before=reads; on_wake(NULL); assert(reads==before && lit==1);
     // Failure on wake must not expose the last good (but stale) percentage.
     s_asleep=true; s_dimmed=true; s_sleep_shield=&shield;
@@ -102,7 +95,7 @@ int main(void) {
     on_wake(NULL); assert(lit==1 && !refreshed);
     // Unknown/absent readings also clear text in the ordinary periodic poll.
     pmic.present=false; batt_timer_cb(NULL); assert(!strcmp(label_text,"--"));
-    puts("PASS real UI background polling, wake freshness, render-before-light and failed reads");
+    puts("PASS cached UI battery rendering, wake freshness, render-before-light and failed reads");
 }
 ''')
         command = [args.cc, 'cc'] if Path(args.cc).stem == 'zig' else [args.cc]

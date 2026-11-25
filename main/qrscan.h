@@ -52,10 +52,11 @@ void qrscan_last_frame_stats(uint8_t *min, uint8_t *max, uint8_t *mean, int *can
 void qrscan_dump_ascii(void);
 
 /*
- * Capture 40 frames, report luma statistics and dump the last frame.
+ * Return true after 40 good frames or an earlier successful decode. Reports
+ * capture errors and timeouts separately from a frame with no QR payload.
  *
  * quirc needs far more stack than the console task has, so this must run on a
  * task sized for it -- the UI worker. Calling it from the console task
  * overflows the stack and corrupts memory that only faults much later.
  */
-void qrscan_selftest(void);
+bool qrscan_selftest(void);

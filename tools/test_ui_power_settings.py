@@ -42,6 +42,7 @@ static esp_err_t reg_read(uint8_t reg, uint8_t *out) {
 }
 static int read_adc(uint8_t reg, int bits) { (void)reg; (void)bits; return adc; }
 ''' + source[start:end] + '''
+#define power_read read_pmic
 int main(void) {
     power_status_t out;
     assert(power_read(NULL) == ESP_ERR_INVALID_ARG && reads == 0);
@@ -82,6 +83,97 @@ int main(void) {
                         str(test), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
     print('PASS actual PMIC read errors, unknown telemetry and gauge fallback')
+
+
+def test_headless_sampling(cc: list[str]) -> None:
+    source = (ROOT / 'main/power.c').read_text()
+    start = source.index('static StaticSemaphore_t s_pmic_mutex_storage')
+    end = source.index('/* ---------------- discharge rate', start)
+    with tempfile.TemporaryDirectory(prefix='power-sampling-') as temp:
+        path = pathlib.Path(temp)
+        (path / 'esp_err.h').write_text(
+            '#pragma once\ntypedef int esp_err_t;\n'
+            'enum { ESP_OK, ESP_ERR_INVALID_ARG, ESP_ERR_INVALID_STATE, ESP_ERR_TIMEOUT, ESP_ERR_NO_MEM };\n')
+        test = path / 'test.c'
+        test.write_text('''
+#include <assert.h>
+#include <math.h>
+#include <setjmp.h>
+#include <stddef.h>
+#include <stdatomic.h>
+#include "power.h"
+typedef int StaticSemaphore_t, *SemaphoreHandle_t, portMUX_TYPE, StaticTask_t;
+typedef uint32_t TickType_t, StackType_t;
+#define portMUX_INITIALIZER_UNLOCKED 0
+#define portENTER_CRITICAL(p) ((void)(p))
+#define portEXIT_CRITICAL(p) ((void)(p))
+#define portMAX_DELAY 1000
+#define pdMS_TO_TICKS(n) (n)
+static int mutex_held, logs, reports, profiles, discharge, delays, temp_ok;
+static unsigned screen;
+static bool external, on_battery;
+static esp_err_t result;
+static int64_t now=1000;
+static power_status_t input;
+static jmp_buf stop_worker;
+static void (*worker)(void *);
+static SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *m) { return m; }
+static void xSemaphoreTake(SemaphoreHandle_t m,int wait) { assert(m && wait && !mutex_held++); }
+static void xSemaphoreGive(SemaphoreHandle_t m) { assert(m && mutex_held--==1); }
+static esp_err_t read_pmic(power_status_t *out) { assert(mutex_held); *out=input; return result; }
+bool power_esp_temp(float *out) { if(temp_ok) *out=35; return temp_ok; }
+static int64_t esp_timer_get_time(void) { return now; }
+static void power_log_note(const power_status_t *p,esp_err_t r,unsigned s) {
+    assert(p && r==result); ++logs; screen=s;
+}
+static void matter_note_power(const power_status_t *p,esp_err_t r) { assert(p && r==result); ++reports; }
+void power_note_sample(int pct,bool battery) { discharge=pct; on_battery=battery; }
+static void app_wifi_set_power_profile(bool usb) { ++profiles; external=usb; }
+static TickType_t xTaskGetTickCount(void) { return 0; }
+static void xTaskDelayUntil(TickType_t *next,TickType_t interval) {
+    assert(next && interval==10000);
+    if(delays++) longjmp(stop_worker,1);
+    now+=interval*1000;
+}
+typedef void *TaskHandle_t;
+#define DRAM_ATTR
+static void *xTaskCreateStatic(void (*fn)(void *), const char *name, size_t bytes,
+                               void *arg,int priority,StackType_t *stack,StaticTask_t *tcb) {
+    assert(name && bytes>=2048 && !arg && priority && stack && tcb); worker=fn; return tcb;
+}
+static unsigned uxTaskGetStackHighWaterMark(TaskHandle_t task) { assert(task); return 1234; }
+''' + source[start:end] + '''
+static void tick(void) {
+    delays=0;
+    if(!setjmp(stop_worker)) worker(NULL);
+}
+int main(void) {
+    power_status_t out; float temperature;
+    assert(power_cached(&out,NULL)==ESP_ERR_INVALID_STATE);
+    assert(power_task_stack_free()==0);
+    result=ESP_ERR_TIMEOUT;
+    assert(power_sampling_start()==ESP_OK && worker && power_task_stack_free()==1234);
+    assert(logs==1 && reports==1 && screen==0 && external && profiles==1);
+    assert(power_cached(&out,NULL)==ESP_ERR_TIMEOUT && discharge==-1);
+    result=ESP_OK; input.present=true; input.percent=81; temp_ok=1; tick();
+    assert(logs==2 && reports==2 && screen==0 && !external && profiles==2);
+    assert(power_cached(&out,&temperature)==ESP_OK && out.percent==81 && temperature==35);
+    assert(on_battery && discharge==81);
+    power_set_screen_percent(20); input.vbus=true; temp_ok=0; tick();
+    assert(screen==20 && external && !on_battery);
+    assert(power_cached(&out,&temperature)==ESP_OK && isnan(temperature));
+    now+=30000001; assert(power_cached(&out,NULL)==ESP_ERR_TIMEOUT);
+    result=ESP_ERR_INVALID_STATE; tick();
+    assert(profiles==3 && external && discharge==-1 && !on_battery);
+    assert(logs==4 && reports==4 && power_cached(&out,NULL)==result && !mutex_held);
+    return 0;
+}
+''')
+        exe = path / 'test.exe'
+        subprocess.run([*cc, '-std=c11', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(path), '-I', str(ROOT / 'main'), str(test), '-o', str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+    print('PASS headless polling, cached UI data, power-source changes and read failures')
 
 
 def test_discharge_history(cc: list[str]) -> None:
@@ -259,6 +351,7 @@ def main() -> None:
     command = [cc, "cc"] if pathlib.Path(cc).name.lower().startswith("zig") else [cc]
     test_actual_settings(command)
     test_actual_power(command)
+    test_headless_sampling(command)
     test_discharge_history(command)
     test_power_io(command)
 

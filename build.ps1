@@ -20,7 +20,17 @@ docker run --rm -e IDF_CCACHE_ENABLE=1 `
 if ($LASTEXITCODE -ne 0) { exit 1 }
 
 if ($Port) {
-    Push-Location "$PSScriptRoot/dist"
-    python -m esptool --chip esp32s3 -p $Port -b 460800 --before default_reset --after hard_reset write_flash "@flash_args"
-    Pop-Location
+    $toolPath = & python "$PSScriptRoot/tools/prepare_esptool.py" --target "$PSScriptRoot/build/host-tools" --standalone
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $callerPythonPath = $env:PYTHONPATH
+    Push-Location -LiteralPath "$PSScriptRoot/dist"
+    try {
+        $env:PYTHONPATH = (@($toolPath, $callerPythonPath) | Where-Object { $_ }) -join [IO.Path]::PathSeparator
+        python -m esptool --chip esp32s3 -p $Port -b 460800 --before default-reset --after hard-reset write-flash "@flash_args"
+        $flashStatus = $LASTEXITCODE
+    } finally {
+        $env:PYTHONPATH = $callerPythonPath
+        Pop-Location
+    }
+    exit $flashStatus
 }

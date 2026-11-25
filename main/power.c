@@ -19,16 +19,21 @@
 #include "power.h"
 
 #include <limits.h>
+#include <math.h>
 #include <stdatomic.h>
 
 #include "bsp/esp-bsp.h"
 #include "driver/i2c_master.h"
 #include "driver/temperature_sensor.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "matter.h"
+#include "power_log.h"
+#include "wifi_ctl.h"
 
 static const char *TAG = "power";
 
@@ -154,7 +159,7 @@ static int percent_from_mv(int mv)
     return 0;
 }
 
-esp_err_t power_read(power_status_t *out)
+static esp_err_t read_pmic(power_status_t *out)
 {
     if (out == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -271,6 +276,115 @@ bool power_esp_temp(float *celsius)
                     temperature_sensor_get_celsius(s_tsens, celsius) == ESP_OK;
     xSemaphoreGive(s_tsens_lock);
     return ok;
+}
+
+/* ---------------- display-independent telemetry ---------------- */
+
+static StaticSemaphore_t s_pmic_mutex_storage;
+static SemaphoreHandle_t s_pmic_mutex;
+static atomic_uint s_screen_percent; /* Zero on a headless boot. */
+static portMUX_TYPE s_sample_lock = portMUX_INITIALIZER_UNLOCKED;
+static power_status_t s_sample;
+static float s_die_temp = NAN;
+static int64_t s_sample_at;
+static esp_err_t s_sample_result = ESP_ERR_INVALID_STATE;
+static TaskHandle_t s_power_task;
+
+esp_err_t power_read(power_status_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_pmic_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_pmic_mutex, portMAX_DELAY);
+    esp_err_t result = read_pmic(out);
+    xSemaphoreGive(s_pmic_mutex);
+    return result;
+}
+
+void power_set_screen_percent(unsigned percent)
+{
+    atomic_store(&s_screen_percent, percent);
+}
+
+esp_err_t power_cached(power_status_t *out, float *esp_temp_c)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    portENTER_CRITICAL(&s_sample_lock);
+    *out = s_sample;
+    float temp = s_die_temp;
+    int64_t at = s_sample_at;
+    esp_err_t result = s_sample_result;
+    portEXIT_CRITICAL(&s_sample_lock);
+    if (esp_timer_get_time() - at > 30000000 && result == ESP_OK) {
+        result = ESP_ERR_TIMEOUT;
+    }
+    if (esp_temp_c) {
+        *esp_temp_c = result == ESP_OK ? temp : NAN;
+    }
+    return result;
+}
+
+static void sample_power(bool first)
+{
+    power_status_t ps = {0};
+    esp_err_t result = power_read(&ps);
+    float die_temp;
+    if (!power_esp_temp(&die_temp)) {
+        die_temp = NAN;
+    }
+    int64_t now = esp_timer_get_time();
+    portENTER_CRITICAL(&s_sample_lock);
+    s_sample = ps;
+    s_die_temp = die_temp;
+    s_sample_at = now;
+    s_sample_result = result;
+    portEXIT_CRITICAL(&s_sample_lock);
+
+    power_log_note(&ps, result, atomic_load(&s_screen_percent));
+    matter_note_power(&ps, result);
+    power_note_sample(result == ESP_OK ? ps.percent : -1,
+                      result == ESP_OK && ps.present && !ps.vbus && !ps.percent_estimated);
+    /* Assume mains if the boot read fails. Later failures retain the last
+     * known profile until a valid reading arrives. */
+    if (first || result == ESP_OK) {
+        app_wifi_set_power_profile(result != ESP_OK || ps.vbus);
+    }
+}
+
+static void power_task(void *arg)
+{
+    (void)arg;
+    TickType_t next = xTaskGetTickCount();
+    for (;;) {
+        xTaskDelayUntil(&next, pdMS_TO_TICKS(10000));
+        sample_power(false);
+    }
+}
+
+esp_err_t power_sampling_start(void)
+{
+    /* Reserve the task and its stack so sampling does not depend on internal
+     * heap availability after display/Wi-Fi initialization. IDF takes bytes.
+     * main/linker.lf moves this component's .bss to PSRAM; FreeRTOS requires
+     * an internal TCB, and the stack stays internal because this task drives
+     * I2C and esp_pm_configure(). */
+    static DRAM_ATTR StaticTask_t task_storage;
+    static DRAM_ATTR StackType_t stack[4096 / sizeof(StackType_t)];
+    s_pmic_mutex = xSemaphoreCreateMutexStatic(&s_pmic_mutex_storage);
+    sample_power(true);
+    s_power_task = xTaskCreateStatic(power_task, "power", sizeof(stack), NULL, 3, stack,
+                                     &task_storage);
+    return s_power_task ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+size_t power_task_stack_free(void)
+{
+    return s_power_task ? (size_t) uxTaskGetStackHighWaterMark(s_power_task) : 0;
 }
 
 /* ---------------- discharge rate ---------------- */

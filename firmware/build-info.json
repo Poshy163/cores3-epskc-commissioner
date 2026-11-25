@@ -1,87 +1,34 @@
 {
-  "schema": 1,
-  "version": "a24bb75",
-  "sdk": "6.1.1",
-  "matter": "1.6.1",
-  "build_purpose": "ESP32-H2 radio firmware with the ACK length fix, flashed by the S3 from rcp_fw; OpenThread/mDNS lock-order deadlock fixed",
-  "hardware_tested": true,
-  "deployed": true,
-  "note": "Hashes describe the locally built images flashed and verified on the bench device. CI rebuilds of the same commit differ in embedded build paths and timestamps.",
-  "deployment": {
-    "verified_on": "2026-11-21",
-    "method": "app and rcp_fw USB flash, chip held in the ROM loader from the first NVS read to the final reset",
-    "nvs_unchanged_across_flash": true,
-    "matter_nvs_unchanged_across_flash": true,
-    "partition_table_matches_device": true,
-    "running_version": "a24bb75",
-    "running_elf_matches_artifact": true,
-    "rcp_firmware": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 06:27:58 UTC",
-    "rcp_flashed_by_s3_ms": 11779,
-    "rcp_verified_after_restart": true,
-    "rcp_update_attempts_after_verify": 0,
-    "thread_dataset_preserved": true,
-    "home_assistant_fabric_preserved": true,
-    "home_assistant_available": true,
-    "home_assistant_reports_software_version": "a24bb75",
-    "border_agent_id_kept_after_epskc_self_fetch_and_reboot": true,
-    "epskc_self_fetch_seconds": 9.6,
-    "epskc_cipher_suite": "TLS-ECJPAKE-WITH-AES-128-CCM-8",
-    "camera_capture_passed": true,
-    "captured_rcp_failure_lines": 0,
-    "captured_panic_watchdog_lines": 0,
-    "internal_heap_free_bytes_after_boot": 50315,
-    "internal_heap_largest_block_bytes_after_boot": 19456
-  },
-  "esptool": "5.6.0",
+  "schema": 2,
+  "source_commit": "9a285259f3759849c8d2f313af9dc3f879171d6d",
+  "version": "9a28525",
+  "sdk": "v6.1.1",
+  "app_elf_sha256": "fbed446940caf7f4bb651f8a91db82772da49235acba344823bb84b750e94bb4",
   "artifacts": {
     "bootloader.bin": {
+      "offset": "0x0",
       "bytes": 22128,
-      "sha256": "9980809bcef157b94f66ee266b56ced39ed4236848169cbf9295ab45444d10f8",
-      "offset": "0x0"
+      "sha256": "a90973d0330bb4324611b34f73cd4cd785c35b4a4310a75d2a1f7bf24442df08"
     },
     "partition-table.bin": {
+      "offset": "0x8000",
       "bytes": 3072,
-      "sha256": "0617d1714dd72b1f9a2b776a5509029b5eb93ea0f8a71d8648a4b597cf512819",
-      "offset": "0x8000"
+      "sha256": "0617d1714dd72b1f9a2b776a5509029b5eb93ea0f8a71d8648a4b597cf512819"
     },
     "epskc-commissioner-app.bin": {
-      "bytes": 2970688,
-      "sha256": "8029c479dd2059f20aeb2223b25b1c4524e1fbad960e33517c8a3e57b6fc6a24",
-      "offset": "0x10000"
+      "offset": "0x10000",
+      "bytes": 3012816,
+      "sha256": "213974ec739b30559b6a0a1901fbc5b3adfa38eac82b72c1b458d07a376c2d3e"
     },
     "rcp-fw.bin": {
-      "bytes": 655360,
-      "sha256": "4c3b46f4d7a24006897f9e67e3a30f544b77e67f467cb665afb239772ea95298",
       "offset": "0x720000",
-      "content": "ESP32-H2 radio firmware image for the rcp_fw partition"
+      "bytes": 655360,
+      "sha256": "d771c9253e96ef15fa5d54c30d747444e7bb1c7217a0a3cac015f67c9ee687ab"
     },
     "cores3-epskc-commissioner.bin": {
-      "bytes": 8126464,
-      "sha256": "f7d91b4163a6eeb45d8ebebbbe4187b8b4b7257586a1f89fdd6c9d7f8da7e18a",
       "offset": "0x0",
-      "usage": "fresh-install only; do not use for an upgrade that preserves provisioning"
+      "bytes": 8126464,
+      "sha256": "b1ee693c8cf44148146ffd0988989b7bb8535a401e24d9c8408135b79b578637"
     }
-  },
-  "elf": {
-    "path": "build/idf6/epskc_commissioner.elf",
-    "bytes": 128981548,
-    "sha256": "804c1741bf789b4a64308e1d474189834b0a0cf4da3746f3e7c8a7055a8d20ac"
-  },
-  "rcp_elf": {
-    "path": "build/rcp/esp_ot_rcp.elf",
-    "bytes": 7414912,
-    "sha256": "6104e4a3f2c3976a3b11939b84852cd38b23c9f1ac3287e85f57a6751f135ac1",
-    "version": "openthread-esp32/051e4c4eb203-43cc05a9bcf7; esp32h2;  2026-11-21 06:27:58 UTC"
-  },
-  "validation": {
-    "native_build_passed": true,
-    "host_suite_passed": true,
-    "host_suite_entrypoints": 17,
-    "layout_check_passed": true,
-    "local_config_equals_fresh_ci_config": true,
-    "rcp_local_config_equals_fresh_ci_config": true,
-    "partition_table_unchanged": false,
-    "partition_table_change": "rcp_fw appended at 0x720000 after matter_nvs; every earlier offset unchanged",
-    "merged_ranges_match": true
   }
 }

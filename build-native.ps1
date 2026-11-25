@@ -56,6 +56,9 @@ try {
 
     Push-Location $PSScriptRoot
     try {
+        $toolPath = & $python tools/prepare_esptool.py --target build/host-tools
+        if ($LASTEXITCODE -ne 0) { throw "Could not prepare the project's esptool." }
+        $env:PYTHONPATH = (@($toolPath, $env:PYTHONPATH) | Where-Object { $_ }) -join [IO.Path]::PathSeparator
         if ($Clean) {
             & $python $idf -B $BuildDir fullclean
             if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -519,6 +519,23 @@ extern "C" esp_err_t matter_init(void)
         return s_started.load(std::memory_order_acquire) ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
+    /* Spinel's fatal callbacks can request a recovery boot. Make that decision
+     * before allocating a Matter node or starting its OpenThread radio task. */
+    const rcp_update_pins_t rcp_pins = {
+        .uart = kRcpUart,
+        .rx_pin = kRcpRxPin,
+        .tx_pin = kRcpTxPin,
+        .reset_pin = kRcpResetPin,
+        .boot_pin = kRcpBootPin,
+    };
+    esp_err_t error = rcp_update_prepare(&rcp_pins);
+    if (rcp_update_in_recovery()) {
+        return fail_init(ESP_ERR_INVALID_STATE, "H2 recovery: Matter and Thread suspended");
+    }
+    if (error != ESP_OK) {
+        ESP_LOGW(kTag, "radio firmware check skipped: %s", esp_err_to_name(error));
+    }
+
 #if CONFIG_ENABLE_CHIPOBLE
     s_ble_commissioning.store(settings_get()->ble_commissioning, std::memory_order_relaxed);
     if (!s_ble_commissioning.load(std::memory_order_relaxed)) {
@@ -534,7 +551,7 @@ extern "C" esp_err_t matter_init(void)
 #endif
     chip::Logging::SetLogRedirectCallback(log_chip_line);
 
-    esp_err_t error = validate_storage_configuration();
+    error = validate_storage_configuration();
     if (error != ESP_OK) {
         return fail_init(error, "invalid Matter storage configuration");
     }
@@ -606,20 +623,6 @@ extern "C" esp_err_t matter_init(void)
     error = set_openthread_platform_config(&openthread_config);
     if (error != ESP_OK) {
         return fail_init(error, "could not configure Matter-owned OpenThread");
-    }
-    /* Bring the H2 onto the bundled radio firmware while its UART is still
-     * free: OpenThread opens the port in esp_matter::start(). Failures leave
-     * the current firmware running and are not fatal here. */
-    const rcp_update_pins_t rcp_pins = {
-        .uart = kRcpUart,
-        .rx_pin = kRcpRxPin,
-        .tx_pin = kRcpTxPin,
-        .reset_pin = kRcpResetPin,
-        .boot_pin = kRcpBootPin,
-    };
-    error = rcp_update_prepare(&rcp_pins);
-    if (error != ESP_OK) {
-        ESP_LOGW(kTag, "radio firmware check skipped: %s", esp_err_to_name(error));
     }
     error = reset_rcp();
     if (error != ESP_OK) {

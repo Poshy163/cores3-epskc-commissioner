@@ -21,6 +21,8 @@ else
 fi
 
 cd /work
+esptool_path=$(python /host/tools/prepare_esptool.py --target /work/host-tools)
+export PYTHONPATH="$esptool_path${PYTHONPATH:+:$PYTHONPATH}"
 # sdkconfig only takes defaults into account when it is first generated. Stamp
 # both the selected files and their contents so editing sdkconfig.defaults (or
 # the debug overlay) invalidates the persistent Docker-volume configuration.

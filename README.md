@@ -31,6 +31,8 @@ The H2 runs OpenThread's radio co-processor (RCP) firmware built from `rcp/`: ES
 
 The S3 image carries the H2 build in the `rcp_fw` partition. At boot, before OpenThread opens the UART, `main/rcp_update.c` flashes the H2 when the bundled version is new to it, which takes about 12 seconds, then restarts the S3 so the radio comes up from a normal boot. It holds the H2's BOOT strap (GPIO18) and pulses RESET (GPIO7), as Espressif's M5Stack border router example does, so the H2's ROM bootloader is always reachable and an interrupted flash is retried on the next boot. After three attempts without a boot that shows the H2 running the bundled version, it stops; `rcp update` in the console requests another. The version string carries the time of `rcp/`'s last commit and fixed-length commit names, so CI and local builds of unchanged sources report the same version and never reflash the radio.
 
+If Spinel still cannot start the H2 after the automatic attempts, the S3 boots into radio recovery. Wi-Fi, the USB console and configured HTTP diagnostics remain available. Matter and Thread stay suspended. Run `rcp` to inspect the radio state, then `rcp update` to retry the bundled firmware after checking the hardware or installing a corrected image. On an installation without an `rcp_fw` image, this command in recovery retries the existing H2.
+
 ## Wi-Fi
 
 Two ways to get the device online:
@@ -95,15 +97,20 @@ The device serves the OTBR REST API on port 8081, so you can add it in Home Assi
 | `/logs` | GET (see [Logs over Wi-Fi](#logs-over-wi-fi)) |
 | `/power/history` | GET (see [Settings](#settings)) |
 
+A `PUT` of the dataset the device already runs, with its TLVs in any order, leaves the network alone: Thread stays attached and the stored network state, including the border router's ULA prefix and SLAAC secret, is kept. That covers Home Assistant re-sending its preferred dataset and a touchscreen ePSKc fetch from the device's own network. Any other dataset is applied in full, with the previous one restored if it fails.
+
 The `ba-epskc` endpoints follow [python-otbr-api #267](https://github.com/home-assistant-libs/python-otbr-api/pull/267). They can be switched off at **Settings > Thread > ePSKc over REST**, which *unregisters* them rather than returning an error, so the API becomes indistinguishable from a build without ePSKc support. That makes it easy to test both branches of a client.
 
 Plain HTTP with no authentication, exactly like ot-br-posix: anyone who can reach port 8081 can read the Active Operational Dataset, which contains the network key. Keep it on a trusted network.
 
 ### Optional remote management
 
-The packaged image and its validation/deployment status are recorded in
-[`firmware/build-info.json`](firmware/build-info.json), including whether it
-has been tested on hardware and deployed.
+Each published image set includes a [release manifest](firmware/build-info.json)
+with the source commit, embedded app ELF SHA-256, and the flash offset, byte
+size and SHA-256 of each binary. Run `python tools/release_manifest.py` to
+verify the downloaded files in `firmware/`. The
+[21 November bench record](firmware/bench-a24bb75.json) documents the exact
+locally flashed build of `a24bb75` and its hardware checks.
 
 Remote management adds a provisioning-preserving reboot and a health snapshot
 on the same port. It is **disabled by default** and uses a unique, randomly
@@ -302,9 +309,11 @@ port returns paged battery telemetry. `boot_id` identifies a boot, `seq` orders
 its samples, and `oldest_seq`/`latest_seq` expose retention bounds. Up to 8,640
 samples are buffered in PSRAM (24 hours at the normal 10-second interval).
 Reconnecting USB does not clear this log. Reboot or complete power loss does;
-the PC recorder provides durable storage. Logging follows the UI's power timer,
-including while the screen is asleep; a stalled UI or missing samples are
-visible through sample age and timestamps.
+the PC recorder provides durable storage. A dedicated power task takes every
+sample, independent of the display, so logging, Home Assistant's battery
+readings and the Wi-Fi/CPU power profile carry on with the screen asleep or a
+display that failed to start; missing samples are visible through sample age
+and timestamps.
 
 Run `tools/battery_record.py --url http://<device-ip>:8081 --output <path>.csv
 --keep-awake` using Python on Windows. It collects over Wi-Fi every 30 seconds,
@@ -344,16 +353,21 @@ Wi-Fi power management follows the power source. On USB the radio never dozes, w
 | `batt` | battery %, voltage, charge state |
 | `name <name>` | set the shared Matter/MeshCoP border-router name; republished immediately |
 | `matter [status\|code\|open [seconds]\|close\|ble on\|off]` | inspect, open or close Matter commissioning; switch Bluetooth pairing |
-| `camtest` | grab frames, print stats and ASCII art |
+| `camtest` | capture up to 40 frames, report QR decoding separately; fails on capture errors |
 | `rcp [update]` | ESP32-H2 radio firmware: running, bundled and last-flashed versions; `update` reflashes it on restart |
 | `reveal 1` | unmask the network key in output. It prints secrets, so leave it off |
 | `log [quiet\|<level> [tag]]` | console verbosity. Boots `quiet`: warnings and errors from every component, this firmware's own tags at info. `log info` restores everything, `log info OPENTHREAD` one tag |
 
-`status` also reports uptime, heap headroom, ESP-IDF version and the application ELF SHA-256 for matching crash symbols. `thread` prints the version string of the ESP32-H2 RCP firmware.
+`status` also reports uptime, heap headroom, the stack headroom of the display and power-sampling tasks, ESP-IDF version and the application ELF SHA-256 for matching crash symbols. `thread` prints the version string of the ESP32-H2 RCP firmware.
 
 If either NVS partition cannot initialize, boot preserves its contents instead of automatically erasing provisioning. Back up flash before an explicit recovery or factory reset.
 
 ## Building
+
+The native wrapper, Docker build and CI use the esptool release in
+`tools/requirements-esptool.txt` (5.7.0) for both ESP32 targets. Each build
+caches the package locally. The first build needs PyPI access or a wheel
+available through pip's normal offline configuration.
 
 See [CLION.md](CLION.md) for a local ESP-IDF setup. For day-to-day work `build-native.ps1` selects the installed v6.1.1 SDK, builds the H2 radio firmware in `build/rcp/`, then the app in `build/idf6/`, with ccache. Use `-IdfPath` for an alternate installation. The wrapper restores the caller's SDK environment afterwards, and earlier build output remains available for rollback. Its `-Port` writes the app and the radio firmware image (`rcp_fw`), which keeps Wi-Fi, Thread and Matter data; add `-Full` to write the bootloader and partition table too, or `-Monitor` to open the console afterwards:
 
@@ -406,8 +420,11 @@ CI builds `rcp/` before the app and publishes five files under `firmware/`:
 To preserve settings when flashing the published components manually, write the first four files at their listed offsets and do not run `erase-flash`:
 
 ```powershell
+$toolPath = python tools/prepare_esptool.py --target build/host-tools --standalone
+if ($LASTEXITCODE -ne 0) { throw "Could not prepare esptool." }
+$env:PYTHONPATH = (@($toolPath, $env:PYTHONPATH) | Where-Object { $_ }) -join [IO.Path]::PathSeparator
 python -m esptool --chip esp32s3 -p COM5 -b 460800 `
-  --before default_reset --after hard_reset write_flash `
+  --before default-reset --after hard-reset write-flash `
   0x0 .\firmware\bootloader.bin `
   0x8000 .\firmware\partition-table.bin `
   0x10000 .\firmware\epskc-commissioner-app.bin `
@@ -422,3 +439,11 @@ The merged image necessarily spans NVS and resets provisioning. Because it carri
 Wi-Fi failure paths and settings logic on a host. Use `--cc path/to/zig.exe` on
 Windows if Zig is your host compiler. These tests and the layout check also run
 in CI; they do not replace device commissioning, reconnect or camera tests.
+
+### Desktop commissioner
+
+Build the optional desktop client from the repository root with
+`docker build -t cores3-desktop-commissioner -f tools/Dockerfile tools`. The
+image builds Mbed TLS 3.6.8, checks the compiled DTLS and EC-JPAKE options,
+and installs `epskc_commissioner` in `/usr/local/bin`. ESP-IDF supplies the
+firmware's separate Mbed TLS implementation.

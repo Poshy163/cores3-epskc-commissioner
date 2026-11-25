@@ -1,4 +1,4 @@
-"""Check production camera ownership and normal/mirrored QR decoding.
+"""Check production camera capture, diagnostic results, ownership and QR decoding.
 
 The default checks need only a C compiler. --quirc-dir additionally exercises
 the production decode helper with real quirc and its bundled PGM fixture.
@@ -28,8 +28,11 @@ def main():
     compiler = [args.cc, 'cc'] if Path(args.cc).stem == 'zig' else [args.cc]
     source = (ROOT / 'main/qrscan.c').read_text()
     start = source.index('static quirc_decode_error_t decode_candidate(')
-    decode = source[start:source.index('bool qrscan_poll(', start)]
+    capture_start = source.index('static frame_result_t capture_frame(', start)
+    decode = source[start:capture_start]
     boot = (ROOT / 'main/main.c').read_text()
+    start = boot.index('static void do_camtest(')
+    console = boot[start:boot.index('static void do_apply_name(', start)]
     start = boot.index('static void do_camera_probe(')
     probe = boot[start:boot.index('void app_main(', start)]
     start = boot.index('    esp_err_t camera_probe_result = ESP_FAIL;')
@@ -37,6 +40,31 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix='epskc-camera-') as temporary:
         directory = Path(temporary)
+        start = source.index('#define BUF_COUNT')
+        globals_end = source.index('/*\n * esp_video_init', start)
+        start_selftest = source.index('bool qrscan_selftest(')
+        start_driver = source.index('esp_err_t qrscan_start(', start_selftest)
+        (directory / 'camera_under_test.inc').write_text(
+            source[start:globals_end] + source[start_selftest:start_driver] + decode + source[capture_start:])
+        (directory / 'camera_console_under_test.inc').write_text(console)
+        harness = (ROOT / 'tools/tests/camera_capture_harness.c').read_text()
+        test = directory / 'capture.c'
+        test.write_text(harness)
+        binary = directory / 'capture.exe'
+        subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
+                                   str(test), '-o', str(binary)], check=True)
+        for scenario, frames, decoded, error in [
+            ('good', 40, 0, None), ('qr', 1, 1, None),
+            ('dequeue', 3, 0, 'dequeue'), ('bad-index', 0, 0, 'invalid camera frame'),
+            ('short', 0, 0, 'invalid camera frame'), ('flag', 0, 0, 'invalid camera frame'),
+            ('requeue', 0, 0, 'requeue'), ('slow', 1, 1, 'deadline'),
+        ]:
+            report = subprocess.check_output([str(binary), scenario], text=True)
+            assert f'frames={frames} decoded={decoded}\n' in report, (scenario, report)
+            assert ('>>> camera OK <<<' in report) == (error is None), (scenario, report)
+            if error:
+                assert '>>> camera FAILED:' in report and error in report, (scenario, report)
+        print('PASS camera capture: no QR, decoded, dequeue, bad buffers, requeue and deadline')
         compile_run(compiler, r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -113,7 +141,10 @@ int main(void) {
         if args.quirc_dir:
             quirc = args.quirc_dir.resolve()
             library = quirc / 'quirc/lib'
-            pgm = (quirc / 'test/test_qrcode.pgm').read_bytes()
+            fixture_path = quirc / 'test_apps/main/test_qrcode.pgm'
+            if not fixture_path.exists():
+                fixture_path = quirc / 'test/test_qrcode.pgm'
+            pgm = fixture_path.read_bytes()
             magic, dimensions, maximum, image = pgm.split(b'\n', 3)
             assert magic == b'P5' and maximum == b'255'
             width, height = map(int, dimensions.split())

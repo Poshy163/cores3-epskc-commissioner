@@ -33,13 +33,15 @@ typedef struct {
     char flashed[RCP_UPDATE_VERSION_SIZE];  /* bundled version last written */
     uint8_t attempts;                       /* flashes since the last verified boot */
     bool forced;                            /* reflash requested for the next boot */
+    bool recovery;                          /* H2 startup suspended for this boot */
 } rcp_update_status_t;
 
 /* Call once, after the default NVS partition is up and before OpenThread
  * starts. Registers OpenThread's RCP-unusable callbacks and flashes the H2 if
- * the bundled image is new, requested, or never verified. Never fatal: on any
- * error the H2 keeps its current firmware. */
+ * the bundled image is new or requested. Check rcp_update_in_recovery()
+ * before starting the radio even when updater initialization fails. */
 esp_err_t rcp_update_prepare(const rcp_update_pins_t *pins);
+bool rcp_update_in_recovery(void);
 
 /* Call once OpenThread reports the running RCP version. A match proves the
  * bundled image works and clears the attempt count; a mismatch schedules a
@@ -48,8 +50,8 @@ void rcp_update_check_running(const char *running_version);
 
 esp_err_t rcp_update_get_status(rcp_update_status_t *out);
 
-/* Request a reflash on the next boot with a fresh attempt budget. The caller
- * restarts the device. */
+/* Leave recovery and request a reflash with a fresh attempt budget. Without a
+ * bundle, a device in recovery retries the existing H2 once. Caller reboots. */
 esp_err_t rcp_update_request(void);
 
 #ifdef __cplusplus

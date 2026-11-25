@@ -9,6 +9,7 @@
  */
 #include "ui.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -27,7 +28,6 @@
 #include "nvs.h"
 #include "otbr_rest.h"
 #include "power.h"
-#include "power_log.h"
 #include "qrscan.h"
 #include "settings.h"
 #include "thread.h"
@@ -65,7 +65,7 @@ static const char *TAG = "ui";
 #define COL_ERROR   0xF0798F
 
 typedef enum {
-    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_CAMERA_PREVIEW, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE, JOB_CAMTEST,
+    JOB_SCAN, JOB_JOIN, JOB_QR, JOB_CAMERA_PREVIEW, JOB_WIFI_SCAN, JOB_WIFI_JOIN, JOB_WIFI_LEAVE,
     JOB_FORM, JOB_BR_START, JOB_SHARE, JOB_SHARE_STOP, JOB_FORGET,
     JOB_FACTORY_RESET, JOB_CALL, JOB_RENAME
 } job_t;
@@ -141,8 +141,6 @@ static bool s_dimmed;
 static bool s_on_external_power = true; /* fail safe until the PMIC is read */
 static char s_ip_str[16] = "-";
 
-/* Signals the console task that the worker has finished the camera selftest. */
-static SemaphoreHandle_t s_camtest_done;
 static QueueHandle_t s_jobs;
 
 static lv_obj_t *panel_main, *panel_list, *panel_keypad, *panel_result, *panel_qr;
@@ -297,21 +295,10 @@ static void batt_timer_cb(lv_timer_t *t)
 {
     (void) t;
     power_status_t ps;
-    esp_err_t perr = power_read(&ps);
-    unsigned screen = s_asleep ? 0 : settings_get()->brightness;
-    if (s_dimmed && screen > 20) {
-        screen = 20;
-    }
-    power_log_note(&ps, perr, screen);
-    matter_note_power(&ps, perr);
+    esp_err_t perr = power_cached(&ps, NULL);
     if (perr == ESP_OK) {
         s_on_external_power = ps.vbus;
-        app_wifi_set_power_profile(ps.vbus);
     }
-    /* Call every poll: a brief USB connection or failed read must invalidate
-     * the run immediately. The sampler itself limits storage to once/minute. */
-    power_note_sample(perr == ESP_OK ? ps.percent : -1,
-                      perr == ESP_OK && ps.present && !ps.vbus && !ps.percent_estimated);
     if (s_asleep) {
         return;
     }
@@ -338,6 +325,15 @@ static void batt_timer_cb(lv_timer_t *t)
     lv_obj_set_style_bg_color(batt_fill, lv_color_hex(col), LV_PART_MAIN);
     int w = (BATT_INNER_W * ps.percent) / 100;
     lv_obj_set_width(batt_fill, w < 2 ? 2 : w);
+}
+
+static esp_err_t set_screen_brightness(unsigned percent)
+{
+    esp_err_t err = bsp_display_brightness_set(percent);
+    if (err == ESP_OK) {
+        power_set_screen_percent(percent);
+    }
+    return err;
 }
 
 /* Runs on the LVGL task (lock already held), so the role on screen tracks
@@ -395,7 +391,7 @@ static void role_timer_cb(lv_timer_t *t)
                !s_ui_job_busy && lv_display_get_inactive_time(NULL) > 30000;
     if (dim != s_dimmed) {
         int brightness = settings_get()->brightness;
-        if (bsp_display_brightness_set(dim && brightness > 20 ? 20 : brightness) == ESP_OK) {
+        if (set_screen_brightness(dim && brightness > 20 ? 20 : brightness) == ESP_OK) {
             s_dimmed = dim;
         }
     }
@@ -409,7 +405,7 @@ static void role_timer_cb(lv_timer_t *t)
         lv_obj_clear_flag(s_sleep_shield, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(s_sleep_shield, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(s_sleep_shield, on_wake, LV_EVENT_PRESSED, NULL);
-        bsp_display_brightness_set(0);
+        set_screen_brightness(0);
         s_asleep = true;
     }
 }
@@ -1574,9 +1570,6 @@ static void worker(void *arg)
             run_qr_job();
         } else if (job == JOB_CAMERA_PREVIEW) {
             run_camera_preview_job();
-        } else if (job == JOB_CAMTEST) {
-            qrscan_selftest();
-            xSemaphoreGive(s_camtest_done);
         } else if (job == JOB_SHARE) {
             const uint32_t lifetime_ms = msg.data.share.lifetime_ms;
             /* Retry means replace the previous one-shot key. */
@@ -1794,7 +1787,7 @@ static void on_wake(lv_event_t *e)
         refresh_power_info();
     }
     lv_refr_now(NULL);
-    bsp_display_brightness_set(settings_get()->brightness);
+    set_screen_brightness(settings_get()->brightness);
     /* Deleting the object from inside its own event is unsafe; defer it. */
     lv_obj_delete_async(s_sleep_shield);
     s_sleep_shield = NULL;
@@ -1807,7 +1800,7 @@ static void on_brightness(lv_event_t *e)
     lv_obj_t *sl = lv_event_get_target(e);
     int v = lv_slider_get_value(sl);
     settings_get()->brightness = (uint8_t) v;
-    bsp_display_brightness_set(v);
+    set_screen_brightness(v);
     s_dimmed = false;
     if (lv_event_get_code(e) == LV_EVENT_RELEASED) {
         settings_save();
@@ -1857,8 +1850,9 @@ static void refresh_power_info(void)
     power_status_t ps;
     char buf[320];
     size_t n = 0;
-    if (power_read(&ps) != ESP_OK) {
-        lv_label_set_text(lbl_power_info, "PMIC not reachable");
+    float die_temp;
+    if (power_cached(&ps, &die_temp) != ESP_OK) {
+        lv_label_set_text(lbl_power_info, "Power reading unavailable");
         return;
     }
     if (ps.present) {
@@ -1890,9 +1884,8 @@ static void refresh_power_info(void)
     } else {
         appendf(buf, sizeof(buf), &n, "Temp     PMIC unknown");
     }
-    float t;
-    if (power_esp_temp(&t)) {
-        appendf(buf, sizeof(buf), &n, "   ESP32 %.0f C", t);
+    if (isfinite(die_temp)) {
+        appendf(buf, sizeof(buf), &n, "   ESP32 %.0f C", die_temp);
     }
     appendf(buf, sizeof(buf), &n, "\n");
     float rate;
@@ -2910,7 +2903,7 @@ esp_err_t ui_init(void)
         return ESP_FAIL;
     }
     bsp_display_backlight_on();
-    bsp_display_brightness_set(settings_get()->brightness);
+    set_screen_brightness(settings_get()->brightness);
 
     s_jobs = xQueueCreate(4, sizeof(ui_job_msg_t));
     s_call_done = xSemaphoreCreateBinary();
@@ -3116,26 +3109,6 @@ bool ui_run_on_worker(ui_worker_fn fn, void *arg, uint32_t timeout_ms)
     }
     xSemaphoreGive(s_call_lock);
     return true;
-}
-
-bool ui_run_camtest(void)
-{
-    if (!s_ready || s_jobs == NULL) {
-        return false;
-    }
-    if (s_camtest_done == NULL) {
-        s_camtest_done = xSemaphoreCreateBinary();
-        if (s_camtest_done == NULL) {
-            return false;
-        }
-    }
-    ui_job_msg_t msg = { .type = JOB_CAMTEST };
-    if (xQueueSend(s_jobs, &msg, 0) != pdTRUE) {
-        return false;
-    }
-    /* The selftest captures 40 frames with a decode attempt on each, so it can
-     * legitimately take tens of seconds. */
-    return xSemaphoreTake(s_camtest_done, pdMS_TO_TICKS(120000)) == pdTRUE;
 }
 
 size_t ui_lvgl_stack_free(void)

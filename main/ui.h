@@ -24,13 +24,6 @@ void ui_show_dataset(const char *net_name, int channel, uint16_t panid);
 void ui_clear_dataset(void);
 
 /*
- * Run the camera self-test on the UI worker task and block until it finishes.
- * The console task's stack is far too small for quirc; the worker is already
- * sized for it. False if the UI (and therefore the worker) never started.
- */
-bool ui_run_camtest(void);
-
-/*
  * Start the border router on the UI worker instead of a new task. Spawning
  * an 8 KB task at the got-IP moment fails when internal RAM is fragmented,
  * and nothing retries, so the device silently never becomes a border router.

@@ -688,14 +688,37 @@ static void restore_border_agent_id(otInstance *ins, const otBorderAgentId *id)
     }
 }
 
+/* Called with the OpenThread lock held. A detached stack is already enabled
+ * and handles its own reattach attempts. Repeated imports must not interrupt
+ * a parent search or detach an attached router and its children. */
+static esp_err_t resume_active_dataset(otInstance *ins)
+{
+    if (otThreadGetDeviceRole(ins) != OT_DEVICE_ROLE_DISABLED) {
+        return ESP_OK;
+    }
+    bool ip6_was_up = otIp6IsEnabled(ins);
+    otError err = ip6_was_up ? OT_ERROR_NONE : otIp6SetEnabled(ins, true);
+    if (err == OT_ERROR_NONE) {
+        err = otThreadSetEnabled(ins, true);
+        if (err != OT_ERROR_NONE && !ip6_was_up) {
+            otIp6SetEnabled(ins, false);
+        }
+    }
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "could not resume active dataset (%d)", err);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
 esp_err_t thread_join(const uint8_t *tlvs, size_t len)
 {
     if (!s_ready) {
         ESP_LOGE(TAG, "stack not running");
         return ESP_FAIL;
     }
-    if (len == 0 || len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
-        ESP_LOGE(TAG, "dataset length %u out of range", (unsigned) len);
+    if (tlvs == NULL || len == 0 || len > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
+        ESP_LOGE(TAG, "invalid dataset buffer or length (%u)", (unsigned) len);
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -704,34 +727,36 @@ esp_err_t thread_join(const uint8_t *tlvs, size_t len)
     memcpy(ds.mTlvs, tlvs, len);
     ds.mLength = (uint8_t) len;
 
-    /* This OpenThread release validates TLV framing, values and duplicates in
-     * otDatasetParseTlvs(), but predates otDatasetIsValid(). Check the complete
-     * Active Dataset contract explicitly before touching the working network. */
-    otOperationalDataset parsed;
-    otError parse_err = otDatasetParseTlvs(&ds, &parsed);
-    const otOperationalDatasetComponents *c = &parsed.mComponents;
-    bool complete = parse_err == OT_ERROR_NONE &&
-                    c->mIsActiveTimestampPresent && c->mIsChannelPresent &&
-                    c->mIsChannelMaskPresent && c->mIsExtendedPanIdPresent &&
-                    c->mIsMeshLocalPrefixPresent && c->mIsNetworkKeyPresent &&
-                    c->mIsNetworkNamePresent && c->mIsPanIdPresent &&
-                    c->mIsPskcPresent && c->mIsSecurityPolicyPresent;
-    if (!complete) {
-        ESP_LOGE(TAG, "invalid operational dataset (%d)", parse_err);
+    if (!otDatasetIsValid(&ds, true)) {
+        ESP_LOGE(TAG, "invalid active operational dataset");
         return ESP_ERR_INVALID_ARG;
     }
 
     esp_openthread_lock_acquire(portMAX_DELAY);
     otInstance *ins = esp_openthread_get_instance();
-    otMeshDiagCancel(ins);
-    topology_reset(THREAD_TOPOLOGY_NEVER);
-
     /* Keep an in-memory rollback copy. WIFI_STORAGE_FLASH has an equivalent
      * safeguard in app_wifi_join(); Thread replacement should be no easier to
      * strand than Wi-Fi replacement. */
     otOperationalDatasetTlvs previous;
-    bool had_previous = otDatasetGetActiveTlvs(ins, &previous) == OT_ERROR_NONE &&
-                        previous.mLength > 0;
+    otError read_err = otDatasetGetActiveTlvs(ins, &previous);
+    if (read_err != OT_ERROR_NONE && read_err != OT_ERROR_NOT_FOUND) {
+        esp_openthread_lock_release();
+        ESP_LOGE(TAG, "could not read current dataset (%d)", read_err);
+        return ESP_FAIL;
+    }
+    bool had_previous = read_err == OT_ERROR_NONE && previous.mLength > 0;
+    /* Compare all TLV types and values, including the timestamp and optional
+     * TLVs. Their serialization order can differ across commissioners. */
+    if (had_previous && otDatasetTlvsCompare(&ds, &previous)) {
+        esp_err_t err = resume_active_dataset(ins);
+        esp_openthread_lock_release();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "dataset unchanged; keeping the current network");
+        }
+        return err;
+    }
+    otMeshDiagCancel(ins);
+    topology_reset(THREAD_TOPOLOGY_NEVER);
     otBorderAgentId ba_id;
     bool had_ba_id = otBorderAgentGetId(ins, &ba_id) == OT_ERROR_NONE;
 
@@ -1266,6 +1291,9 @@ static int hex_nibble(char c)
 
 esp_err_t thread_set_dataset_hex(const char *hex)
 {
+    if (hex == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
     size_t len = strlen(hex);
     if (len == 0 || (len % 2) != 0 || len / 2 > OT_OPERATIONAL_DATASET_MAX_LENGTH) {
         return ESP_ERR_INVALID_ARG;

@@ -48,6 +48,10 @@ If you ever need to redo it, source the export script and copy what it sets:
 $env:IDF_PATH = 'C:\Espressif\frameworks\esp-idf-v6.1.1'
 Remove-Item Env:\IDF_PYTHON_ENV_PATH -ErrorAction SilentlyContinue
 . C:\Espressif\frameworks\esp-idf-v6.1.1\export.ps1
+$idfPython = Join-Path $env:IDF_PYTHON_ENV_PATH "Scripts/python.exe"
+$toolPath = & $idfPython tools/prepare_esptool.py --target build/host-tools
+if ($LASTEXITCODE -ne 0) { throw "Could not prepare esptool." }
+$env:PYTHONPATH = (@($toolPath, $env:PYTHONPATH) | Where-Object { $_ }) -join [IO.Path]::PathSeparator
 ```
 
 Environment changes only reach newly started processes, so restart CLion (fully,
@@ -112,10 +116,9 @@ that preserve uptime.
 
 ## The Docker build still works
 
-`build.ps1` is what CI uses and stays reproducible regardless of what is
-installed locally. It compiles inside a Docker volume and drops the flashable
-artifacts in `dist/`, so it never writes into `build/` and won't fight CLion's
-CMake cache.
+`build.ps1` uses the same ESP-IDF and esptool releases as CI. It compiles
+inside a Docker volume and copies flashable artifacts to `dist/`. With
+`-Port`, the host caches its Python flash tool under `build/host-tools/`.
 
 ```
 .\build.ps1 -Port COM5

@@ -254,10 +254,7 @@ static void reconnect_timer_cb(void *arg)
 /*
  * Belt and braces for the ladder itself: an event lost, a timer that failed to
  * arm, esp_wifi_connect() accepted and then silently dropped. Runs on its own
- * periodic esp_timer rather than on the UI's battery timer, because app_main
- * deliberately tolerates ui_init() failing and continues headless -- hanging
- * the supervisor's only safety net off the display stack would make recovery
- * contingent on the most failure-prone part of boot.
+ * periodic esp_timer so the supervisor also works on headless boots.
  *
  * Being on the esp_timer task rather than the LVGL task, this can also read
  * the driver's real configuration instead of trusting a cached flag, so
@@ -375,11 +372,9 @@ static int cmd_log(int argc, char **argv)
  * at 80 MHz. On battery the clock still drops to 80 MHz when nothing needs
  * more, and Wi-Fi modem sleep is on.
  *
- * The UI's battery poll calls this before Wi-Fi is initialized, and
- * app_main() calls it again after esp_wifi_start(); the mutex keeps the two
- * callers' applied state consistent.
+ * The power sampler applies the first profile after esp_wifi_start(), then
+ * its task applies subsequent changes when the PMIC reports a new source.
  */
-static SemaphoreHandle_t s_power_profile_lock;
 
 void app_wifi_set_power_profile(bool external_power)
 {
@@ -387,9 +382,6 @@ void app_wifi_set_power_profile(bool external_power)
     static int s_ps_applied = -1;
     const int wanted = external_power ? 1 : 0;
 
-    if (s_power_profile_lock) {
-        xSemaphoreTake(s_power_profile_lock, portMAX_DELAY);
-    }
     if (wanted != s_cpu_applied) {
         const esp_pm_config_t pm = {
             .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
@@ -412,13 +404,8 @@ void app_wifi_set_power_profile(bool external_power)
             ESP_LOGI(TAG, "Wi-Fi power save %s",
                      external_power ? "off (external power)" : "on (battery)");
         } else if (err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED) {
-            /* Before Wi-Fi starts, app_main()'s call after esp_wifi_start()
-             * applies it; only a failure after that is worth a warning. */
             ESP_LOGW(TAG, "could not change Wi-Fi power save: %s", esp_err_to_name(err));
         }
-    }
-    if (s_power_profile_lock) {
-        xSemaphoreGive(s_power_profile_lock);
     }
 }
 
@@ -888,6 +875,7 @@ static int cmd_status(int argc, char **argv)
            (unsigned) matter_get_thread_border_router_endpoint_id(),
            matter_is_commissioning_window_open() ? "open" : "closed");
     printf("lvgl st: %u bytes free (min)\n", (unsigned) ui_lvgl_stack_free());
+    printf("power st: %u bytes free (min)\n", (unsigned) power_task_stack_free());
     printf("heap   : internal %u free, largest %u, min ever %u; PSRAM %u free\n",
            (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
@@ -997,23 +985,24 @@ static int cmd_reboot(int argc, char **argv)
 
 static int cmd_rcp(int argc, char **argv)
 {
+    rcp_update_status_t status;
+    if (rcp_update_get_status(&status) != ESP_OK) {
+        printf("radio firmware status unavailable\n");
+        return 1;
+    }
     if (argc >= 2 && strcmp(argv[1], "update") == 0) {
         esp_err_t err = rcp_update_request();
         if (err != ESP_OK) {
             printf("cannot schedule a radio firmware update: %s\n", esp_err_to_name(err));
             return 1;
         }
-        printf("radio firmware will be reflashed on restart; rebooting\n");
+        printf("%s; rebooting\n", status.bundled[0] ? "radio firmware update scheduled" :
+               "retrying the existing H2");
         app_reboot();
         return 0;
     }
     if (argc >= 2) {
         printf("usage: rcp [update]\n");
-        return 1;
-    }
-    rcp_update_status_t status;
-    if (rcp_update_get_status(&status) != ESP_OK) {
-        printf("radio firmware status unavailable\n");
         return 1;
     }
     char running[RCP_UPDATE_VERSION_SIZE];
@@ -1022,6 +1011,10 @@ static int cmd_rcp(int argc, char **argv)
     printf("flashed : %s\n", status.flashed[0] ? status.flashed : "(never by this firmware)");
     printf("attempts: %u since the last verified boot%s\n", (unsigned) status.attempts,
            status.forced ? ", reflash requested" : "");
+    if (status.recovery) {
+        printf("recovery: radio suspended; use 'rcp update' to %s\n",
+               status.bundled[0] ? "reflash the bundled image" : "retry the existing H2");
+    }
     return 0;
 }
 
@@ -1434,6 +1427,11 @@ static int cmd_forget(int argc, char **argv)
     return 0;
 }
 
+static void do_camtest(void *arg)
+{
+    *(bool *)arg = qrscan_selftest();
+}
+
 static int cmd_camtest(int argc, char **argv)
 {
     (void) argc; (void) argv;
@@ -1449,7 +1447,7 @@ static int cmd_camtest(int argc, char **argv)
     /* The UI's QR job may own the camera. Driving it from here as well tears
      * the decoder down under an in-flight poll, so report its stats instead. */
     if (qrscan_active()) {
-        printf("UI scan in progress - observing, not driving\n");
+        printf("UI scan in progress - observing; rerun camtest after the scan\n");
         for (int i = 0; i < 10; i++) {
             uint8_t mn, mx, mean;
             int cand;
@@ -1458,7 +1456,7 @@ static int cmd_camtest(int argc, char **argv)
                    mn, mx, mean, cand);
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
-        return 0;
+        return 1;   /* The observer did not run the self-test. */
     }
 
     /*
@@ -1466,11 +1464,12 @@ static int cmd_camtest(int argc, char **argv)
      * dedicated task is not an option: internal RAM is exhausted enough that
      * the largest free block is ~11 KB, well under what the decoder wants.
      */
-    if (!ui_run_camtest()) {
-        printf("camtest unavailable (UI worker not running)\n");
+    bool passed = false;
+    if (!ui_run_on_worker(do_camtest, &passed, 120000)) {
+        printf("camtest unavailable (UI worker busy or unavailable)\n");
         return 1;
     }
-    return 0;
+    return passed ? 0 : 1;
 }
 
 static void do_apply_name(void *arg)
@@ -1891,7 +1890,7 @@ static void register_commands(void)
         { .command = "share", .help = "share [stop|state] - ePSKc code so a commissioner can pull our credentials", .func = cmd_share },
         { .command = "batt", .help = "battery %, voltage and charge state", .func = cmd_batt },
         { .command = "name", .help = "name <name> - set the Matter/MeshCoP border-router name", .func = cmd_name },
-        { .command = "camtest", .help = "start the camera and try 30 frames", .func = cmd_camtest },
+        { .command = "camtest", .help = "test capture over up to 40 frames and report QR decoding", .func = cmd_camtest },
         { .command = "thread", .help = "thread [scan] - activity and best-effort mesh topology", .func = cmd_thread },
         { .command = "matter", .help = "matter [status|code|open [seconds]|close|ble on|off]", .func = cmd_matter },
         { .command = "forget", .help = "erase stored Thread credentials", .func = cmd_forget },
@@ -1939,7 +1938,6 @@ void app_main(void)
         .light_sleep_enable = false,
     };
     ESP_ERROR_CHECK(esp_pm_configure(&pm));
-    s_power_profile_lock = xSemaphoreCreateMutex();
 
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
@@ -2010,12 +2008,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH)); /* reuse saved creds */
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Modem sleep adds a DTIM interval of latency to every packet, which is
-     * the wrong trade for a border router other devices route through. Keep
-     * the radio awake on USB power; the UI's battery timer switches profiles
-     * as the power source changes. Without a PMIC reading, assume mains. */
-    power_status_t boot_power;
-    app_wifi_set_power_profile(power_read(&boot_power) != ESP_OK || boot_power.vbus);
+    if (power_sampling_start() != ESP_OK) {
+        ESP_LOGE(TAG, "periodic power telemetry unavailable");
+    }
 
     /* Cache availability for link diagnostics; the timer watchdog refreshes
      * this from the driver without holding the display lock. */
@@ -2061,7 +2056,7 @@ void app_main(void)
     }
 
     /* Adopt Matter's OpenThread instance; never launch a second radio task. */
-    if (thread_init() != ESP_OK) {
+    if (!rcp_update_in_recovery() && thread_init() != ESP_OK) {
         ESP_LOGW(TAG, "OpenThread unavailable - credential retrieval still works");
     }
     thread_set_prefer_router(settings_get()->prefer_router);
@@ -2127,6 +2122,11 @@ void app_main(void)
         ESP_LOGE(TAG, "REST lifecycle task unavailable");
     }
 
-    ui_set_status(UI_STATE_IDLE, "Ready");
-    ESP_LOGI(TAG, "Thread 1.4 ePSKc commissioner ready");
+    if (rcp_update_in_recovery()) {
+        ui_set_status(UI_STATE_ERROR, "H2 recovery - see USB console");
+        ESP_LOGW(TAG, "H2 recovery ready; run 'rcp' on the USB console");
+    } else {
+        ui_set_status(UI_STATE_IDLE, "Ready");
+        ESP_LOGI(TAG, "Thread 1.4 ePSKc commissioner ready");
+    }
 }

@@ -4,7 +4,7 @@ name: build
 
 on:
   push:
-    branches: [main]
+    branches: [main, "ci/**"]
     paths-ignore:
       - "firmware/**"
       - "README.md"
@@ -34,6 +34,9 @@ jobs:
       - name: Check display layout
         run: python3 -B tools/layout_check.py "$RUNNER_TEMP/layout.svg"
 
+      - name: Test release image verification
+        run: python3 -B tools/test_release_manifest.py
+
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
@@ -46,6 +49,8 @@ jobs:
           # not reflash its radio for a rebuild.
           command: |
             set -e
+            esptool_path=$(python tools/prepare_esptool.py --target /tmp/commissioner-host-tools)
+            export PYTHONPATH="$esptool_path${PYTHONPATH:+:$PYTHONPATH}"
             RCP_EPOCH=$(git log -1 --format=%ct -- rcp)
             RCP_EPOCH=${RCP_EPOCH:-$(git log -1 --format=%ct)}
             SOURCE_DATE_EPOCH=$RCP_EPOCH IDF_TARGET=esp32h2 idf.py -C rcp -B "$PWD/build-rcp" -D SDKCONFIG="$PWD/build-rcp/sdkconfig" -D RCP_SOURCE_DATE_EPOCH=$RCP_EPOCH build
@@ -55,14 +60,15 @@ jobs:
             cp build/partition_table/partition-table.bin firmware/partition-table.bin
             cp build/epskc_commissioner.bin firmware/epskc-commissioner-app.bin
             cp build/rcp_fw.bin firmware/rcp-fw.bin
-            cd build
-            python -m esptool --chip esp32s3 merge_bin -o ../firmware/cores3-epskc-commissioner.bin @flash_args
+            (cd build && python -m esptool --chip esp32s3 merge-bin -o ../firmware/cores3-epskc-commissioner.bin @flash_args)
+            python tools/release_manifest.py --write "$(git rev-parse HEAD)" --elf build/epskc_commissioner.elf
 
       - name: Publish firmware images
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add \
+            firmware/build-info.json \
             firmware/bootloader.bin \
             firmware/partition-table.bin \
             firmware/epskc-commissioner-app.bin \

@@ -10,6 +10,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -38,7 +39,17 @@ typedef struct {
     uint8_t raw_st2; /* reg 0x01 */
 } power_status_t;
 
-/* Safe to call from any task; the I2C driver serialises bus access. */
+/* Start once from app_main after Wi-Fi starts. Takes the first sample before
+ * returning; subsequent samples are independent of display and Matter startup. */
+esp_err_t power_sampling_start(void);
+void power_set_screen_percent(unsigned percent);
+/* Latest PMIC sample. Returns an error for a failed/missing/stale reading.
+ * Optional die temperature is NAN when unavailable. No peripheral I/O. */
+esp_err_t power_cached(power_status_t *out, float *esp_temp_c);
+/* Lowest free stack of the sampling task so far, in bytes; 0 before it runs. */
+size_t power_task_stack_free(void);
+
+/* Synchronous USB diagnostics, available after power_sampling_start(). */
 esp_err_t power_read(power_status_t *out);
 
 /* ESP32-S3 internal temperature sensor. False if it could not be installed. */

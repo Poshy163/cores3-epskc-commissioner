@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "freertos/FreeRTOS.h"
@@ -22,8 +23,10 @@
 
 #include "bsp/esp-bsp.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_video_device.h"   /* ESP_VIDEO_DVP_DEVICE_NAME, used by BSP_CAMERA_DEVICE */
 #include "esp_video_init.h"
+#include "esp_video_ioctl.h"
 #include "linux/videodev2.h"
 #include "quirc.h"
 
@@ -31,6 +34,18 @@ static const char *TAG = "qrscan";
 
 /* Three buffers, so the sensor always has somewhere to write while we work. */
 #define BUF_COUNT 3
+#define SELFTEST_FRAMES 40
+#define SELFTEST_TIMEOUT_US (60LL * 1000000)
+
+typedef enum {
+    FRAME_CAPTURED,
+    FRAME_DECODED,
+    FRAME_DEQUEUE_FAILED,
+    FRAME_INVALID,
+    FRAME_REQUEUE_FAILED,
+} frame_result_t;
+
+static frame_result_t capture_frame(char *out, size_t cap, uint16_t *preview_rgb565);
 
 static int s_fd = -1;
 static uint8_t *s_buf[BUF_COUNT];
@@ -127,38 +142,65 @@ static void qrscan_teardown(void)
     s_running = false;
 }
 
-void qrscan_selftest(void)
+bool qrscan_selftest(void)
 {
     if (qrscan_start() != ESP_OK) {
         printf(">>> camera FAILED to start (see errors above) <<<\n");
-        return;
+        return false;
     }
     printf("camera started: %dx%d\n", qrscan_width(), qrscan_height());
 
     char payload[256];
-    int decoded = 0, frames = 0;
-    for (int i = 0; i < 40; i++) {
-        frames++;
-        if (qrscan_poll(payload, sizeof(payload), NULL)) {
-            printf("decoded: %s\n", payload);
-            decoded = 1;
+    bool decoded = false;
+    int frames = 0;
+    const int64_t deadline = esp_timer_get_time() + SELFTEST_TIMEOUT_US;
+    const char *failure = NULL;
+    while (frames < SELFTEST_FRAMES && !decoded) {
+        if (esp_timer_get_time() >= deadline) {
+            failure = "capture deadline reached";
             break;
         }
-        if ((i % 10) == 9) {
+        frame_result_t result = capture_frame(payload, sizeof(payload), NULL);
+        if (result == FRAME_DEQUEUE_FAILED) {
+            failure = "frame dequeue failed or timed out";
+        } else if (result == FRAME_INVALID) {
+            failure = "incomplete or invalid camera frame";
+        } else if (result == FRAME_REQUEUE_FAILED) {
+            failure = "frame requeue failed";
+        } else {
+            frames++;
+            decoded = result == FRAME_DECODED;
+            if (esp_timer_get_time() >= deadline) {
+                failure = "capture deadline reached";
+            }
+        }
+        if (failure) {
+            break;
+        }
+        if (frames % 10 == 0) {
             uint8_t mn, mx, mean;
             int cand;
             qrscan_last_frame_stats(&mn, &mx, &mean, &cand);
             printf("  frame %2d: luma min=%3u max=%3u mean=%3u  qr_candidates=%d\n",
                    frames, mn, mx, mean, cand);
         }
-        vTaskDelay(pdMS_TO_TICKS(10));   /* let other tasks breathe */
+        if (!decoded && frames < SELFTEST_FRAMES) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
     printf("frames=%d decoded=%d\n", frames, decoded);
-    qrscan_dump_ascii();
+    if (frames > 0) {
+        qrscan_dump_ascii();
+    }
     qrscan_stop();
     printf("selftest stack headroom: %u bytes\n",
            (unsigned) uxTaskGetStackHighWaterMark(NULL));
+    if (failure) {
+        printf(">>> camera FAILED: %s <<<\n", failure);
+        return false;
+    }
     printf(">>> camera OK <<<\n");
+    return true;
 }
 
 esp_err_t qrscan_start(void)
@@ -211,6 +253,14 @@ esp_err_t qrscan_start(void)
     if (s_fd < 0) {
         ESP_LOGE(TAG, "open %s failed", BSP_CAMERA_DEVICE);
         return ESP_FAIL;
+    }
+
+    /* esp_video defaults to waiting forever when the sensor stops delivering
+     * frames. This timeout persists across STREAMOFF/STREAMON on this fd. */
+    struct timeval timeout = { .tv_sec = 1 };
+    if (ioctl(s_fd, VIDIOC_S_DQBUF_TIMEOUT, &timeout) != 0) {
+        ESP_LOGE(TAG, "setting camera dequeue timeout failed");
+        goto fail;
     }
 
     struct v4l2_format fmt = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
@@ -311,13 +361,13 @@ static quirc_decode_error_t decode_candidate(struct quirc_code *code,
     return error;
 }
 
-bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
+static frame_result_t capture_frame(char *out, size_t cap, uint16_t *preview_rgb565)
 {
     /* A decoded payload needs a destination and room for its NUL terminator.
      * Checking this before capture also keeps invalid callers from consuming a
      * frame that a valid caller could have used. */
     if (!s_running || out == NULL || cap == 0) {
-        return false;
+        return FRAME_INVALID;
     }
 
     struct v4l2_buffer buf = {
@@ -325,13 +375,21 @@ bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
         .memory = V4L2_MEMORY_MMAP,
     };
     if (ioctl(s_fd, VIDIOC_DQBUF, &buf) != 0) {
-        return false;
+        return FRAME_DEQUEUE_FAILED;
     }
 
+    if (buf.index >= BUF_COUNT || !s_buf[buf.index]) {
+        return FRAME_INVALID;
+    }
+    const size_t px = (size_t) s_w * s_h;
+    const size_t frame_bytes = px * (s_fourcc == V4L2_PIX_FMT_GREY ? 1 : 2);
+    if ((buf.flags & V4L2_BUF_FLAG_ERROR) || buf.bytesused < frame_bytes ||
+        buf.bytesused > s_buf_len) {
+        return ioctl(s_fd, VIDIOC_QBUF, &buf) == 0 ? FRAME_INVALID : FRAME_REQUEUE_FAILED;
+    }
     const uint8_t *src = s_buf[buf.index];
     int qw = s_w, qh = s_h;
     uint8_t *grey = quirc_begin(s_quirc, &qw, &qh);
-    const size_t px = (size_t) s_w * s_h;
 
     if (s_fourcc == V4L2_PIX_FMT_GREY) {
         memcpy(grey, src, px);
@@ -351,6 +409,12 @@ bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
             }
             grey[i] = rgb565_luma(p);
         }
+    }
+
+    /* The pixels now belong to quirc. Give the DVP its buffer back before
+     * decoding and only publish the preview/statistics after a good requeue. */
+    if (ioctl(s_fd, VIDIOC_QBUF, &buf) != 0) {
+        return FRAME_REQUEUE_FAILED;
     }
 
     /*
@@ -395,14 +459,6 @@ bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
         memcpy(s_last_grey, grey, px);
     }
 
-    /*
-     * Hand the buffer back BEFORE decoding. quirc takes hundreds of
-     * milliseconds on a 320x240 frame, and holding the buffer across that
-     * starves the DVP of somewhere to write -- which stalls capture and makes
-     * the preview freeze in bursts.
-     */
-    ioctl(s_fd, VIDIOC_QBUF, &buf);
-
     quirc_end(s_quirc);
 
     bool got = false;
@@ -421,5 +477,10 @@ bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
         }
     }
 
-    return got;
+    return got ? FRAME_DECODED : FRAME_CAPTURED;
+}
+
+bool qrscan_poll(char *out, size_t cap, uint16_t *preview_rgb565)
+{
+    return capture_frame(out, cap, preview_rgb565) == FRAME_DECODED;
 }
